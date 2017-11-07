@@ -607,9 +607,14 @@ status_t CameraClient::setParameters(const String8& params) {
     Mutex::Autolock lock(mLock);
     status_t result = checkPidAndHardware();
     if (result != NO_ERROR) return result;
-
     mLatestSetParameters = CameraParameters(params);
     CameraParameters p(params);
+   String16 vtPackageName("com.mediatek.camera");
+    if(mClientPackageName.compare(vtPackageName)!=0)
+	{
+	p.set(CameraParameters::KEY_PREVIEW_FPS_RANGE,"5000,30000");
+	mLatestSetParameters.set(CameraParameters::KEY_PREVIEW_FPS_RANGE,"5000,30000");
+    }
     return mHardware->setParameters(p);
 }
 
