@@ -296,6 +296,10 @@ typedef struct
     /* Spectrum Analyzer parameters Control */
     LVM_PSA_Mode_en             PSA_Enable;
     LVM_PSA_DecaySpeed_en       PSA_PeakDecayRate;      /* Peak value decay rate*/
+#ifdef SUPPORT_MC
+    LVM_INT32                   NrChannels;
+    LVM_INT32                   ChMask;
+#endif
 
 } LVM_ControlParams_t;
 
@@ -514,11 +518,19 @@ LVM_ReturnStatus_en LVM_SetControlParameters(LVM_Handle_t           hInstance,
 /*      STEREO              the number of sample pairs in the block                     */
 /*                                                                                      */
 /****************************************************************************************/
+#ifdef BUILD_FLOAT
+LVM_ReturnStatus_en LVM_Process(LVM_Handle_t                hInstance,
+                                const LVM_FLOAT             *pInData,
+                                LVM_FLOAT                      *pOutData,
+                                LVM_UINT16                  NumSamples,
+                                LVM_UINT32                  AudioTime);
+#else
 LVM_ReturnStatus_en LVM_Process(LVM_Handle_t                hInstance,
                                 const LVM_INT16             *pInData,
                                 LVM_INT16                   *pOutData,
                                 LVM_UINT16                  NumSamples,
                                 LVM_UINT32                  AudioTime);
+#endif
 
 
 /****************************************************************************************/

@@ -1,9 +1,4 @@
 /*
-* Copyright (C) 2014 MediaTek Inc.
-* Modification based on code covered by the mentioned copyright
-* and/or permission notice(s).
-*/
-/*
  * Copyright (C) 2006-2011 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,12 +18,9 @@
 //#define LOG_NDEBUG 0
 
 #include <utils/Log.h>
-#ifdef MTK_AUDIO
-#include <hardware/audio_mtk.h>
-#else
-#include <hardware/audio.h>
-#endif
+
 #include <media/AudioParameter.h>
+#include <system/audio.h>
 
 namespace android {
 
@@ -40,29 +32,25 @@ const char * const AudioParameter::keyChannels = AUDIO_PARAMETER_STREAM_CHANNELS
 const char * const AudioParameter::keyFrameCount = AUDIO_PARAMETER_STREAM_FRAME_COUNT;
 const char * const AudioParameter::keyInputSource = AUDIO_PARAMETER_STREAM_INPUT_SOURCE;
 const char * const AudioParameter::keyScreenState = AUDIO_PARAMETER_KEY_SCREEN_STATE;
-
-#ifdef MTK_AUDIO
-const char * const AudioParameter::keyTimestretch = AUDIO_PARAMETER_KEY_TIME_STRETCH;
-const char * const AudioParameter::keyBessurroundOnOff = AUDIO_PARAMETER_KEY_BESSURROUND_ONOFF;
-const char * const AudioParameter::keyBessurroundMode = AUDIO_PARAMETER_KEY_BESSURROUND_MODE;
-const char * const AudioParameter::keyHDMIBitwidth = AUDIO_PARAMETER_KEY_HDMI_BITWIDCH;
-const char * const AudioParameter::keyHDMIChannel = AUDIO_PARAMETER_KEY_HDMI_CHANNEL;
-const char * const AudioParameter::keyHDMIMaxSamplerate = AUDIO_PARAMETER_KEY_HDMI_MAXSAMPLERATE;
-//LosslessBT related
-const char * const AudioParameter::keyLosslessBTVolumeSatisfied = AUDIO_PARAMETER_KEY_LOSSLESS_BT_VOLUME_SATISFIED;
-const char * const AudioParameter::keyLosslessBTPcmPlaying = AUDIO_PARAMETER_KEY_LOSSLESS_BT_PCM_PLAYING;
-const char * const AudioParameter::keyLosslessBTOffloadPlaying = AUDIO_PARAMETER_KEY_LOSSLESS_BT_OFFLOAD_PLAYING;
-const char * const AudioParameter::keyLosslessBTDoStandybyWhenMute = AUDIO_PARAMETER_KEY_LOSSLESS_BT_STANDBY_WHEN_MUTE;
-const char * const AudioParameter::keyLosslessBTOffloadSupport = AUDIO_PARAMETER_KEY_LOSSLESS_BT_OFFLOAD_SUPPORT;
-const char * const AudioParameter::keyLosslessBTStatus = AUDIO_PARAMETER_KEY_LOSSLESS_BT_STATUS;
-const char * const AudioParameter::keyLosslessBTWorking = AUDIO_PARAMETER_KEY_LOSSLESS_BT_WORKING;
-const char * const AudioParameter::keyLosslessBTAbsoluteVolume = AUDIO_PARAMETER_KEY_LOSSLESS_BT_ABSOLUTE_VOLUME;
-const char * const AudioParameter::keyRoutingToNone = AUDIO_PARAMETER_KEY_ROUTING_TO_NONE;
-const char * const AudioParameter::keyFmDirectControl = AUDIO_PARAMETER_KEY_FM_DIRECT_CONTROL;
-//Offload Audio Playback Usage
-const char * const AudioParameter::keyOffloadAudioDoStandybyWhenMute = AUDIO_PARAMETER_KEY_OFFLOAD_AUDIO_STANDBY_WHEN_MUTE;
-
-#endif
+const char * const AudioParameter::keyBtNrec = AUDIO_PARAMETER_KEY_BT_NREC;
+const char * const AudioParameter::keyHwAvSync = AUDIO_PARAMETER_HW_AV_SYNC;
+const char * const AudioParameter::keyPresentationId = AUDIO_PARAMETER_STREAM_PRESENTATION_ID;
+const char * const AudioParameter::keyProgramId = AUDIO_PARAMETER_STREAM_PROGRAM_ID;
+const char * const AudioParameter::keyAudioLanguagePreferred =
+        AUDIO_PARAMETER_KEY_AUDIO_LANGUAGE_PREFERRED;
+const char * const AudioParameter::keyMonoOutput = AUDIO_PARAMETER_MONO_OUTPUT;
+const char * const AudioParameter::keyStreamHwAvSync = AUDIO_PARAMETER_STREAM_HW_AV_SYNC;
+const char * const AudioParameter::keyStreamConnect = AUDIO_PARAMETER_DEVICE_CONNECT;
+const char * const AudioParameter::keyStreamDisconnect = AUDIO_PARAMETER_DEVICE_DISCONNECT;
+const char * const AudioParameter::keyStreamSupportedFormats = AUDIO_PARAMETER_STREAM_SUP_FORMATS;
+const char * const AudioParameter::keyStreamSupportedChannels = AUDIO_PARAMETER_STREAM_SUP_CHANNELS;
+const char * const AudioParameter::keyStreamSupportedSamplingRates =
+        AUDIO_PARAMETER_STREAM_SUP_SAMPLING_RATES;
+const char * const AudioParameter::valueOn = AUDIO_PARAMETER_VALUE_ON;
+const char * const AudioParameter::valueOff = AUDIO_PARAMETER_VALUE_OFF;
+const char * const AudioParameter::valueListSeparator = AUDIO_PARAMETER_VALUE_LIST_SEPARATOR;
+const char * const AudioParameter::keyReconfigA2dp = AUDIO_PARAMETER_RECONFIG_A2DP;
+const char * const AudioParameter::keyReconfigA2dpSupported = AUDIO_PARAMETER_A2DP_RECONFIG_SUPPORTED;
 
 AudioParameter::AudioParameter(const String8& keyValuePairs)
 {
@@ -101,15 +89,17 @@ AudioParameter::~AudioParameter()
     mParameters.clear();
 }
 
-String8 AudioParameter::toString()
+String8 AudioParameter::toStringImpl(bool useValues) const
 {
     String8 str = String8("");
 
     size_t size = mParameters.size();
     for (size_t i = 0; i < size; i++) {
         str += mParameters.keyAt(i);
-        str += "=";
-        str += mParameters.valueAt(i);
+        if (useValues) {
+            str += "=";
+            str += mParameters.valueAt(i);
+        }
         if (i < (size - 1)) str += ";";
     }
     return str;
@@ -124,6 +114,11 @@ status_t AudioParameter::add(const String8& key, const String8& value)
         mParameters.replaceValueFor(key, value);
         return ALREADY_EXISTS;
     }
+}
+
+status_t AudioParameter::addKey(const String8& key)
+{
+    return add(key, String8());
 }
 
 status_t AudioParameter::addInt(const String8& key, const int value)
@@ -158,7 +153,7 @@ status_t AudioParameter::remove(const String8& key)
     }
 }
 
-status_t AudioParameter::get(const String8& key, String8& value)
+status_t AudioParameter::get(const String8& key, String8& value) const
 {
     if (mParameters.indexOfKey(key) >= 0) {
         value = mParameters.valueFor(key);
@@ -168,7 +163,7 @@ status_t AudioParameter::get(const String8& key, String8& value)
     }
 }
 
-status_t AudioParameter::getInt(const String8& key, int& value)
+status_t AudioParameter::getInt(const String8& key, int& value) const
 {
     String8 str8;
     status_t result = get(key, str8);
@@ -184,7 +179,7 @@ status_t AudioParameter::getInt(const String8& key, int& value)
     return result;
 }
 
-status_t AudioParameter::getFloat(const String8& key, float& value)
+status_t AudioParameter::getFloat(const String8& key, float& value) const
 {
     String8 str8;
     status_t result = get(key, str8);
@@ -200,7 +195,17 @@ status_t AudioParameter::getFloat(const String8& key, float& value)
     return result;
 }
 
-status_t AudioParameter::getAt(size_t index, String8& key, String8& value)
+status_t AudioParameter::getAt(size_t index, String8& key) const
+{
+    if (mParameters.size() > index) {
+        key = mParameters.keyAt(index);
+        return NO_ERROR;
+    } else {
+        return BAD_VALUE;
+    }
+}
+
+status_t AudioParameter::getAt(size_t index, String8& key, String8& value) const
 {
     if (mParameters.size() > index) {
         key = mParameters.keyAt(index);

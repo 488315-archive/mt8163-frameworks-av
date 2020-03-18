@@ -37,17 +37,23 @@ void *WebmFrameThread::wrap(void *arg) {
 }
 
 status_t WebmFrameThread::start() {
+    status_t err = OK;
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
-    pthread_create(&mThread, &attr, WebmFrameThread::wrap, this);
+    if ((err = pthread_create(&mThread, &attr, WebmFrameThread::wrap, this))) {
+        mThread = 0;
+    }
     pthread_attr_destroy(&attr);
-    return OK;
+    return err;
 }
 
 status_t WebmFrameThread::stop() {
-    void *status;
-    pthread_join(mThread, &status);
+    void *status = nullptr;
+    if (mThread) {
+        pthread_join(mThread, &status);
+        mThread = 0;
+    }
     return (status_t)(intptr_t)status;
 }
 
@@ -72,6 +78,7 @@ WebmFrameSinkThread::WebmFrameSinkThread(
       mVideoFrames(videoThread->mSink),
       mAudioFrames(audioThread->mSink),
       mCues(cues),
+      mStartOffsetTimecode(UINT64_MAX),
       mDone(true) {
 }
 
@@ -86,6 +93,7 @@ WebmFrameSinkThread::WebmFrameSinkThread(
       mVideoFrames(videoSource),
       mAudioFrames(audioSource),
       mCues(cues),
+      mStartOffsetTimecode(UINT64_MAX),
       mDone(true) {
 }
 
@@ -118,7 +126,7 @@ void WebmFrameSinkThread::initCluster(
 
 void WebmFrameSinkThread::writeCluster(List<sp<WebmElement> >& children) {
     // children must contain at least one simpleblock and its timecode
-    CHECK_GE(children.size(), 2);
+    CHECK_GE(children.size(), 2u);
 
     uint64_t size;
     sp<WebmElement> cluster = new WebmMaster(kMkvCluster, children);
@@ -149,7 +157,7 @@ void WebmFrameSinkThread::flushFrames(List<const sp<WebmFrame> >& frames, bool l
         // flushing the second to last frame before we check its type. A audio frame
         // should precede the aforementioned video key frame in the next sequence, a video
         // frame should be the last frame in the current (to-be-flushed) sequence.
-        CHECK_GE(n, 2);
+        CHECK_GE(n, 2u);
         n -= 2;
     }
 
@@ -207,6 +215,11 @@ void WebmFrameSinkThread::run() {
         const sp<WebmFrame> audioFrame = mAudioFrames.peek();
         ALOGV("a frame: %p", audioFrame.get());
 
+        if (mStartOffsetTimecode == UINT64_MAX) {
+            mStartOffsetTimecode =
+                    std::min(audioFrame->getAbsTimecode(), videoFrame->getAbsTimecode());
+        }
+
         if (videoFrame->mEos && audioFrame->mEos) {
             break;
         }
@@ -214,10 +227,12 @@ void WebmFrameSinkThread::run() {
         if (*audioFrame < *videoFrame) {
             ALOGV("take a frame");
             mAudioFrames.take();
+            audioFrame->updateAbsTimecode(audioFrame->getAbsTimecode() - mStartOffsetTimecode);
             outstandingFrames.push_back(audioFrame);
         } else {
             ALOGV("take v frame");
             mVideoFrames.take();
+            videoFrame->updateAbsTimecode(videoFrame->getAbsTimecode() - mStartOffsetTimecode);
             outstandingFrames.push_back(videoFrame);
             if (videoFrame->mKey)
                 numVideoKeyFrames++;
@@ -331,7 +346,7 @@ void WebmFrameMediaSourceThread::run() {
     mStartTimeUs = kUninitialized;
 
     status_t err = OK;
-    MediaBuffer *buffer;
+    MediaBufferBase *buffer;
     while (!mDone && (err = mSource->read(&buffer, NULL)) == OK) {
         if (buffer->range_length() == 0) {
             buffer->release();
@@ -339,12 +354,11 @@ void WebmFrameMediaSourceThread::run() {
             continue;
         }
 
-        sp<MetaData> md = buffer->meta_data();
-        CHECK(md->findInt64(kKeyTime, &timestampUs));
+        MetaDataBase &md = buffer->meta_data();
+        CHECK(md.findInt64(kKeyTime, &timestampUs));
         if (mStartTimeUs == kUninitialized) {
             mStartTimeUs = timestampUs;
         }
-        timestampUs -= mStartTimeUs;
 
         if (mPaused && !mResumed) {
             lastDurationUs = timestampUs - lastTimestampUs;
@@ -358,17 +372,17 @@ void WebmFrameMediaSourceThread::run() {
         // adjust time-stamps after pause/resume
         if (mResumed) {
             int64_t durExcludingEarlierPausesUs = timestampUs - previousPausedDurationUs;
-            CHECK_GE(durExcludingEarlierPausesUs, 0ll);
+            CHECK_GE(durExcludingEarlierPausesUs, 0LL);
             int64_t pausedDurationUs = durExcludingEarlierPausesUs - mTrackDurationUs;
             CHECK_GE(pausedDurationUs, lastDurationUs);
             previousPausedDurationUs += pausedDurationUs - lastDurationUs;
             mResumed = false;
         }
         timestampUs -= previousPausedDurationUs;
-        CHECK_GE(timestampUs, 0ll);
+        CHECK_GE(timestampUs, 0LL);
 
         int32_t isSync = false;
-        md->findInt32(kKeyIsSyncFrame, &isSync);
+        md.findInt32(kKeyIsSyncFrame, &isSync);
         const sp<WebmFrame> f = new WebmFrame(
             mType,
             isSync,

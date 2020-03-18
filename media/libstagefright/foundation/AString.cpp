@@ -14,6 +14,9 @@
  * limitations under the License.
  */
 
+#define LOG_TAG "AString"
+#include <utils/Log.h>
+
 #include <ctype.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -28,7 +31,7 @@
 namespace android {
 
 // static
-const char *AString::kEmptyString = "";
+constexpr const char *AString::kEmptyString;
 
 AString::AString()
     : mData((char *)kEmptyString),
@@ -40,14 +43,24 @@ AString::AString(const char *s)
     : mData(NULL),
       mSize(0),
       mAllocSize(1) {
-    setTo(s);
+    if (!s) {
+        ALOGW("ctor got NULL, using empty string instead");
+        clear();
+    } else {
+        setTo(s);
+    }
 }
 
 AString::AString(const char *s, size_t size)
     : mData(NULL),
       mSize(0),
       mAllocSize(1) {
-    setTo(s, size);
+    if (!s) {
+        ALOGW("ctor got NULL, using empty string instead");
+        clear();
+    } else {
+        setTo(s, size);
+    }
 }
 
 AString::AString(const String8 &from)
@@ -112,12 +125,10 @@ void AString::setTo(const AString &from, size_t offset, size_t n) {
 }
 
 void AString::clear() {
-    if (mData && mData != kEmptyString) {
+    if (mData != kEmptyString) {
         free(mData);
-        mData = NULL;
+        mData = (char *)kEmptyString;
     }
-
-    mData = (char *)kEmptyString;
     mSize = 0;
     mAllocSize = 1;
 }
@@ -354,6 +365,8 @@ bool AString::endsWithIgnoreCase(const char *suffix) const {
 // static
 AString AString::FromParcel(const Parcel &parcel) {
     size_t size = static_cast<size_t>(parcel.readInt32());
+    // The static analyzer incorrectly reports a false-positive here in c++17.
+    // https://bugs.llvm.org/show_bug.cgi?id=38176 . NOLINTNEXTLINE
     return AString(static_cast<const char *>(parcel.readInplace(size)), size);
 }
 

@@ -30,11 +30,11 @@ enum {
 };
 
 struct BpMediaHTTPService : public BpInterface<IMediaHTTPService> {
-    BpMediaHTTPService(const sp<IBinder> &impl)
+    explicit BpMediaHTTPService(const sp<IBinder> &impl)
         : BpInterface<IMediaHTTPService>(impl) {
     }
 
-    virtual sp<IMediaHTTPConnection> makeHTTPConnection() {
+    virtual sp<MediaHTTPConnection> makeHTTPConnection() {
         Parcel data, reply;
         data.writeInterfaceToken(
                 IMediaHTTPService::getInterfaceDescriptor());

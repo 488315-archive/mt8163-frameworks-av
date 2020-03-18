@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2012 The Android Open Source Project
+ * Copyright (C) 2012-2018 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -55,7 +55,7 @@ void CallbackProcessor::onFrameAvailable(const BufferItem& /*item*/) {
 }
 
 status_t CallbackProcessor::setCallbackWindow(
-        sp<Surface> callbackWindow) {
+        const sp<Surface>& callbackWindow) {
     ATRACE_CALL();
     status_t res;
 
@@ -121,18 +121,17 @@ status_t CallbackProcessor::updateStream(const Parameters &params) {
 
     if (mCallbackStreamId != NO_STREAM) {
         // Check if stream parameters have to change
-        uint32_t currentWidth, currentHeight, currentFormat;
-        res = device->getStreamInfo(mCallbackStreamId,
-                &currentWidth, &currentHeight, &currentFormat, 0);
+        CameraDeviceBase::StreamInfo streamInfo;
+        res = device->getStreamInfo(mCallbackStreamId, &streamInfo);
         if (res != OK) {
             ALOGE("%s: Camera %d: Error querying callback output stream info: "
                     "%s (%d)", __FUNCTION__, mId,
                     strerror(-res), res);
             return res;
         }
-        if (currentWidth != (uint32_t)params.previewWidth ||
-                currentHeight != (uint32_t)params.previewHeight ||
-                currentFormat != (uint32_t)callbackFormat) {
+        if (streamInfo.width != (uint32_t)params.previewWidth ||
+                streamInfo.height != (uint32_t)params.previewHeight ||
+                !streamInfo.matchFormat((uint32_t)callbackFormat)) {
             // Since size should only change while preview is not running,
             // assuming that all existing use of old callback stream is
             // completed.
@@ -155,7 +154,8 @@ status_t CallbackProcessor::updateStream(const Parameters &params) {
                 callbackFormat, params.previewFormat);
         res = device->createStream(mCallbackWindow,
                 params.previewWidth, params.previewHeight, callbackFormat,
-                HAL_DATASPACE_JFIF, CAMERA3_STREAM_ROTATION_0, &mCallbackStreamId);
+                HAL_DATASPACE_V0_JFIF, CAMERA3_STREAM_ROTATION_0, &mCallbackStreamId,
+                String8());
         if (res != OK) {
             ALOGE("%s: Camera %d: Can't create output stream for callbacks: "
                     "%s (%d)", __FUNCTION__, mId,

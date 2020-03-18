@@ -23,6 +23,7 @@
 
 #include "NuPlayerRenderer.h"
 
+#include <media/MediaCodecBuffer.h>
 #include <media/stagefright/foundation/ADebug.h>
 #include <media/stagefright/foundation/AMessage.h>
 
@@ -31,6 +32,7 @@ namespace android {
 NuPlayer::DecoderBase::DecoderBase(const sp<AMessage> &notify)
     :  mNotify(notify),
        mBufferGeneration(0),
+       mPaused(false),
        mStats(new AMessage),
        mRequestInputBuffersPending(false) {
     // Every decoder has its own looper because MediaCodec operations
@@ -41,8 +43,7 @@ NuPlayer::DecoderBase::DecoderBase(const sp<AMessage> &notify)
 }
 
 NuPlayer::DecoderBase::~DecoderBase() {
-    mDecoderLooper->unregisterHandler(id());
-    mDecoderLooper->stop();
+    stopLooper();
 }
 
 static
@@ -71,6 +72,11 @@ void NuPlayer::DecoderBase::init() {
     mDecoderLooper->registerHandler(this);
 }
 
+void NuPlayer::DecoderBase::stopLooper() {
+    mDecoderLooper->unregisterHandler(id());
+    mDecoderLooper->stop();
+}
+
 void NuPlayer::DecoderBase::setParameters(const sp<AMessage> &params) {
     sp<AMessage> msg = new AMessage(kWhatSetParameters, this);
     msg->setMessage("params", params);
@@ -83,12 +89,11 @@ void NuPlayer::DecoderBase::setRenderer(const sp<Renderer> &renderer) {
     msg->post();
 }
 
-status_t NuPlayer::DecoderBase::getInputBuffers(Vector<sp<ABuffer> > *buffers) const {
-    sp<AMessage> msg = new AMessage(kWhatGetInputBuffers, this);
-    msg->setPointer("buffers", buffers);
+void NuPlayer::DecoderBase::pause() {
+    sp<AMessage> msg = new AMessage(kWhatPause, this);
 
     sp<AMessage> response;
-    return PostAndAwaitResponse(msg, &response);
+    PostAndAwaitResponse(msg, &response);
 }
 
 void NuPlayer::DecoderBase::signalFlush() {
@@ -115,7 +120,7 @@ void NuPlayer::DecoderBase::onRequestInputBuffers() {
         mRequestInputBuffersPending = true;
 
         sp<AMessage> msg = new AMessage(kWhatRequestInputBuffers, this);
-        msg->post(10 * 1000ll);
+        msg->post(10 * 1000LL);
     }
 }
 
@@ -146,15 +151,12 @@ void NuPlayer::DecoderBase::onMessageReceived(const sp<AMessage> &msg) {
             break;
         }
 
-        case kWhatGetInputBuffers:
+        case kWhatPause:
         {
             sp<AReplyToken> replyID;
             CHECK(msg->senderAwaitsResponse(&replyID));
 
-            Vector<sp<ABuffer> > *dstBuffers;
-            CHECK(msg->findPointer("buffers", (void **)&dstBuffers));
-
-            onGetInputBuffers(dstBuffers);
+            mPaused = true;
 
             (new AMessage)->postReply(replyID);
             break;

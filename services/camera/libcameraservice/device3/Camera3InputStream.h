@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2013 The Android Open Source Project
+ * Copyright (C) 2013-2018 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -34,7 +34,8 @@ namespace camera3 {
  * buffers by feeding them into the HAL, as well as releasing the buffers back
  * the buffers once the HAL is done with them.
  */
-class Camera3InputStream : public Camera3IOStreamBase {
+class Camera3InputStream : public Camera3IOStreamBase,
+                           public BufferItemConsumer::BufferFreedListener {
   public:
     /**
      * Set up a stream for formats that have fixed size, such as RAW and YUV.
@@ -52,6 +53,8 @@ class Camera3InputStream : public Camera3IOStreamBase {
     sp<IGraphicBufferProducer> mProducer;
     Vector<BufferItem> mBuffersInFlight;
 
+    static const String8 DUMMY_ID;
+
     /**
      * Camera3IOStreamBase
      */
@@ -59,6 +62,7 @@ class Camera3InputStream : public Camera3IOStreamBase {
             const camera3_stream_buffer &buffer,
             nsecs_t timestamp,
             bool output,
+            const std::vector<size_t>& surface_ids,
             /*out*/
             sp<Fence> *releaseFenceOut);
 
@@ -75,7 +79,12 @@ class Camera3InputStream : public Camera3IOStreamBase {
 
     virtual status_t configureQueueLocked();
 
-    virtual status_t getEndpointUsage(uint32_t *usage) const;
+    virtual status_t getEndpointUsage(uint64_t *usage) const;
+
+    /**
+     * BufferItemConsumer::BufferFreedListener interface
+     */
+    virtual void onBufferFreed(const wp<GraphicBuffer>&) override;
 
 }; // class Camera3InputStream
 

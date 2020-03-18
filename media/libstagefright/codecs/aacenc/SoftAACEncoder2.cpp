@@ -1,9 +1,4 @@
 /*
-* Copyright (C) 2014 MediaTek Inc.
-* Modification based on code covered by the mentioned copyright
-* and/or permission notice(s).
-*/
-/*
  * Copyright (C) 2012 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,13 +16,16 @@
 
 //#define LOG_NDEBUG 0
 #define LOG_TAG "SoftAACEncoder2"
+#include <log/log.h>
 #include <utils/Log.h>
 
 #include "SoftAACEncoder2.h"
 #include <OMX_AudioExt.h>
+#include <OMX_IndexExt.h>
 
 #include <media/stagefright/foundation/ADebug.h>
 #include <media/stagefright/foundation/hexdump.h>
+#include <utils/misc.h>
 
 namespace android {
 
@@ -39,6 +37,14 @@ static void InitOMXParams(T *params) {
     params->nVersion.s.nRevision = 0;
     params->nVersion.s.nStep = 0;
 }
+
+static const OMX_U32 kSupportedProfiles[] = {
+    OMX_AUDIO_AACObjectLC,
+    OMX_AUDIO_AACObjectHE,
+    OMX_AUDIO_AACObjectHE_PS,
+    OMX_AUDIO_AACObjectLD,
+    OMX_AUDIO_AACObjectELD,
+};
 
 SoftAACEncoder2::SoftAACEncoder2(
         const char *name,
@@ -56,11 +62,9 @@ SoftAACEncoder2::SoftAACEncoder2(
       mSentCodecSpecificData(false),
       mInputSize(0),
       mInputFrame(NULL),
-      mInputTimeUs(-1ll),
+      mAllocatedFrameSize(0),
+      mInputTimeUs(-1LL),
       mSawInputEOS(false),
-#ifdef MTK_AOSP_ENHANCEMENT
-      mEOSHaveNoData(false),
-#endif
       mSignalledError(false) {
     initPorts();
     CHECK_EQ(initEncoder(), (status_t)OK);
@@ -70,8 +74,7 @@ SoftAACEncoder2::SoftAACEncoder2(
 SoftAACEncoder2::~SoftAACEncoder2() {
     aacEncClose(&mAACEncoder);
 
-    delete[] mInputFrame;
-    mInputFrame = NULL;
+    onReset();
 }
 
 void SoftAACEncoder2::initPorts() {
@@ -125,7 +128,7 @@ status_t SoftAACEncoder2::initEncoder() {
 
 OMX_ERRORTYPE SoftAACEncoder2::internalGetParameter(
         OMX_INDEXTYPE index, OMX_PTR params) {
-    switch (index) {
+    switch ((OMX_U32) index) {
         case OMX_IndexParamAudioPortFormat:
         {
             OMX_AUDIO_PARAM_PORTFORMATTYPE *formatParams =
@@ -240,6 +243,29 @@ OMX_ERRORTYPE SoftAACEncoder2::internalGetParameter(
             return OMX_ErrorNone;
         }
 
+        case OMX_IndexParamAudioProfileQuerySupported:
+        {
+            OMX_AUDIO_PARAM_ANDROID_PROFILETYPE *profileParams =
+                (OMX_AUDIO_PARAM_ANDROID_PROFILETYPE *)params;
+
+            if (!isValidOMXParam(profileParams)) {
+                return OMX_ErrorBadParameter;
+            }
+
+            if (profileParams->nPortIndex != 1) {
+                return OMX_ErrorUndefined;
+            }
+
+            if (profileParams->nProfileIndex >= NELEM(kSupportedProfiles)) {
+                return OMX_ErrorNoMore;
+            }
+
+            profileParams->eProfile =
+                kSupportedProfiles[profileParams->nProfileIndex];
+
+            return OMX_ErrorNone;
+        }
+
         default:
             return SimpleSoftOMXComponent::internalGetParameter(index, params);
     }
@@ -277,10 +303,6 @@ OMX_ERRORTYPE SoftAACEncoder2::internalSetParameter(
 
             if (formatParams->nPortIndex > 1) {
                 return OMX_ErrorUndefined;
-            }
-
-            if (formatParams->nIndex > 0) {
-                return OMX_ErrorNoMore;
             }
 
             if ((formatParams->nPortIndex == 0
@@ -486,6 +508,15 @@ void SoftAACEncoder2::onQueueFilled(OMX_U32 /* portIndex */) {
 
         BufferInfo *outInfo = *outQueue.begin();
         OMX_BUFFERHEADERTYPE *outHeader = outInfo->mHeader;
+
+        if (outHeader->nOffset + encInfo.confSize > outHeader->nAllocLen) {
+            ALOGE("b/34617444");
+            android_errorWriteLog(0x534e4554,"34617444");
+            notify(OMX_EventError, OMX_ErrorUndefined, 0, NULL);
+            mSignalledError = true;
+            return;
+        }
+
         outHeader->nFilledLen = encInfo.confSize;
         outHeader->nFlags = OMX_BUFFERFLAG_CODECCONFIG;
 
@@ -532,6 +563,15 @@ void SoftAACEncoder2::onQueueFilled(OMX_U32 /* portIndex */) {
 
             if (mInputFrame == NULL) {
                 mInputFrame = new int16_t[numBytesPerInputFrame / sizeof(int16_t)];
+                mAllocatedFrameSize = numBytesPerInputFrame;
+            } else if (mAllocatedFrameSize != numBytesPerInputFrame) {
+                ALOGE("b/34621073: changed size from %d to %d",
+                        (int)mAllocatedFrameSize, (int)numBytesPerInputFrame);
+                android_errorWriteLog(0x534e4554,"34621073");
+                delete mInputFrame;
+                mInputFrame = new int16_t[numBytesPerInputFrame / sizeof(int16_t)];
+                mAllocatedFrameSize = numBytesPerInputFrame;
+
             }
 
             if (mInputSize == 0) {
@@ -547,7 +587,7 @@ void SoftAACEncoder2::onQueueFilled(OMX_U32 /* portIndex */) {
             // "Time" on the input buffer has in effect advanced by the
             // number of audio frames we just advanced nOffset by.
             inHeader->nTimeStamp +=
-                (copy * 1000000ll / mSampleRate)
+                (copy * 1000000LL / mSampleRate)
                     / (mNumChannels * sizeof(int16_t));
 
             if (inHeader->nFilledLen == 0) {
@@ -558,12 +598,6 @@ void SoftAACEncoder2::onQueueFilled(OMX_U32 /* portIndex */) {
                     memset((uint8_t *)mInputFrame + mInputSize,
                            0,
                            numBytesPerInputFrame - mInputSize);
-#ifdef MTK_AOSP_ENHANCEMENT
-                    if (mInputSize == 0)
-                    {
-                        mEOSHaveNoData = true;
-                    }
-#endif
 
                     mInputSize = numBytesPerInputFrame;
                 }
@@ -661,12 +695,6 @@ void SoftAACEncoder2::onQueueFilled(OMX_U32 /* portIndex */) {
         if (mSawInputEOS) {
             // We also tag this output buffer with EOS if it corresponds
             // to the final input buffer.
-#ifdef MTK_AOSP_ENHANCEMENT
-            if (mEOSHaveNoData)
-            {
-                outHeader->nFilledLen = 0;
-            }
-#endif
             outHeader->nFlags = OMX_BUFFERFLAG_EOS;
         }
 
@@ -688,6 +716,18 @@ void SoftAACEncoder2::onQueueFilled(OMX_U32 /* portIndex */) {
 
         mInputSize = 0;
     }
+}
+
+void SoftAACEncoder2::onReset() {
+    delete[] mInputFrame;
+    mInputFrame = NULL;
+    mInputSize = 0;
+    mAllocatedFrameSize = 0;
+
+    mSentCodecSpecificData = false;
+    mInputTimeUs = -1LL;
+    mSawInputEOS = false;
+    mSignalledError = false;
 }
 
 }  // namespace android

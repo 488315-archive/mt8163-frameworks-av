@@ -130,7 +130,7 @@ status_t MediaMetadataRetriever::setDataSource(int fd, int64_t offset, int64_t l
 }
 
 status_t MediaMetadataRetriever::setDataSource(
-    const sp<IDataSource>& dataSource)
+    const sp<IDataSource>& dataSource, const char *mime)
 {
     ALOGV("setDataSource(IDataSource)");
     Mutex::Autolock _l(mLock);
@@ -138,18 +138,59 @@ status_t MediaMetadataRetriever::setDataSource(
         ALOGE("retriever is not initialized");
         return INVALID_OPERATION;
     }
-    return mRetriever->setDataSource(dataSource);
+    return mRetriever->setDataSource(dataSource, mime);
 }
 
-sp<IMemory> MediaMetadataRetriever::getFrameAtTime(int64_t timeUs, int option)
+sp<IMemory> MediaMetadataRetriever::getFrameAtTime(
+        int64_t timeUs, int option, int colorFormat, bool metaOnly)
 {
-    ALOGV("getFrameAtTime: time(%" PRId64 " us) option(%d)", timeUs, option);
+    ALOGV("getFrameAtTime: time(%" PRId64 " us) option(%d) colorFormat(%d) metaOnly(%d)",
+            timeUs, option, colorFormat, metaOnly);
     Mutex::Autolock _l(mLock);
     if (mRetriever == 0) {
         ALOGE("retriever is not initialized");
         return NULL;
     }
-    return mRetriever->getFrameAtTime(timeUs, option);
+    return mRetriever->getFrameAtTime(timeUs, option, colorFormat, metaOnly);
+}
+
+sp<IMemory> MediaMetadataRetriever::getImageAtIndex(
+        int index, int colorFormat, bool metaOnly, bool thumbnail) {
+    ALOGV("getImageAtIndex: index(%d) colorFormat(%d) metaOnly(%d) thumbnail(%d)",
+            index, colorFormat, metaOnly, thumbnail);
+    Mutex::Autolock _l(mLock);
+    if (mRetriever == 0) {
+        ALOGE("retriever is not initialized");
+        return NULL;
+    }
+    return mRetriever->getImageAtIndex(index, colorFormat, metaOnly, thumbnail);
+}
+
+sp<IMemory> MediaMetadataRetriever::getImageRectAtIndex(
+        int index, int colorFormat, int left, int top, int right, int bottom) {
+    ALOGV("getImageRectAtIndex: index(%d) colorFormat(%d) rect {%d, %d, %d, %d}",
+            index, colorFormat, left, top, right, bottom);
+    Mutex::Autolock _l(mLock);
+    if (mRetriever == 0) {
+        ALOGE("retriever is not initialized");
+        return NULL;
+    }
+    return mRetriever->getImageRectAtIndex(
+            index, colorFormat, left, top, right, bottom);
+}
+
+status_t MediaMetadataRetriever::getFrameAtIndex(
+        std::vector<sp<IMemory> > *frames,
+        int frameIndex, int numFrames, int colorFormat, bool metaOnly) {
+    ALOGV("getFrameAtIndex: frameIndex(%d), numFrames(%d), colorFormat(%d) metaOnly(%d)",
+            frameIndex, numFrames, colorFormat, metaOnly);
+    Mutex::Autolock _l(mLock);
+    if (mRetriever == 0) {
+        ALOGE("retriever is not initialized");
+        return INVALID_OPERATION;
+    }
+    return mRetriever->getFrameAtIndex(
+            frames, frameIndex, numFrames, colorFormat, metaOnly);
 }
 
 const char* MediaMetadataRetriever::extractMetadata(int keyCode)

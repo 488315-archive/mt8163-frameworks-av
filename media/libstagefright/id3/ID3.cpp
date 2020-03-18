@@ -1,9 +1,4 @@
 /*
-* Copyright (C) 2014 MediaTek Inc.
-* Modification based on code covered by the mentioned copyright
-* and/or permission notice(s).
-*/
-/*
  * Copyright (C) 2010 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,9 +20,11 @@
 
 #include "../include/ID3.h"
 
+#include <media/DataSource.h>
+#include <media/MediaExtractorPluginApi.h>
+#include <media/MediaExtractorPluginHelper.h>
 #include <media/stagefright/foundation/ADebug.h>
-#include <media/stagefright/DataSource.h>
-#include <media/stagefright/Utils.h>
+#include <media/stagefright/foundation/ByteUtils.h>
 #include <utils/String8.h>
 #include <byteswap.h>
 
@@ -35,7 +32,7 @@ namespace android {
 
 static const size_t kMaxMetadataSize = 3 * 1024 * 1024;
 
-struct MemorySource : public DataSource {
+struct MemorySource : public DataSourceBase {
     MemorySource(const uint8_t *data, size_t size)
         : mData(data),
           mSize(size) {
@@ -46,7 +43,7 @@ struct MemorySource : public DataSource {
     }
 
     virtual ssize_t readAt(off64_t offset, void *data, size_t size) {
-        off64_t available = (offset >= (off64_t)mSize) ? 0ll : mSize - offset;
+        off64_t available = (offset >= (off64_t)mSize) ? 0LL : mSize - offset;
 
         size_t copy = (available > (off64_t)size) ? size : available;
         memcpy(data, mData + offset, copy);
@@ -61,7 +58,56 @@ private:
     DISALLOW_EVIL_CONSTRUCTORS(MemorySource);
 };
 
-ID3::ID3(const sp<DataSource> &source, bool ignoreV1, off64_t offset)
+class DataSourceUnwrapper : public DataSourceBase {
+
+public:
+    explicit DataSourceUnwrapper(DataSourceHelper *sourcehelper) {
+        mSource = sourcehelper;
+    }
+    virtual status_t initCheck() const { return OK; }
+
+    // Returns the number of bytes read, or -1 on failure. It's not an error if
+    // this returns zero; it just means the given offset is equal to, or
+    // beyond, the end of the source.
+    virtual ssize_t readAt(off64_t offset, void *data, size_t size) {
+        return mSource->readAt(offset, data, size);
+    }
+
+    // May return ERROR_UNSUPPORTED.
+    virtual status_t getSize(off64_t *size) {
+        return mSource->getSize(size);
+    }
+
+    virtual bool getUri(char * /*uriString*/, size_t /*bufferSize*/) {
+        return false;
+    }
+
+    virtual uint32_t flags() {
+        return 0;
+    }
+
+    virtual void close() {};
+private:
+    DataSourceHelper *mSource;
+};
+
+
+ID3::ID3(DataSourceHelper *sourcehelper, bool ignoreV1, off64_t offset)
+    : mIsValid(false),
+      mData(NULL),
+      mSize(0),
+      mFirstFrameOffset(0),
+      mVersion(ID3_UNKNOWN),
+      mRawSize(0) {
+    DataSourceUnwrapper source(sourcehelper);
+    mIsValid = parseV2(&source, offset);
+
+    if (!mIsValid && !ignoreV1) {
+        mIsValid = parseV1(&source);
+    }
+}
+
+ID3::ID3(DataSourceBase *source, bool ignoreV1, off64_t offset)
     : mIsValid(false),
       mData(NULL),
       mSize(0),
@@ -71,15 +117,7 @@ ID3::ID3(const sp<DataSource> &source, bool ignoreV1, off64_t offset)
     mIsValid = parseV2(source, offset);
 
     if (!mIsValid && !ignoreV1) {
-#ifdef MTK_AOSP_ENHANCEMENT
-        if(source->flags() & DataSource::kIsCachingDataSource){
-        ALOGD("Streaming playback don't use ID3V1!");
-        }else{
         mIsValid = parseV1(source);
-            }
-#else
-        mIsValid = parseV1(source);
-#endif
     }
 }
 
@@ -90,7 +128,7 @@ ID3::ID3(const uint8_t *data, size_t size, bool ignoreV1)
       mFirstFrameOffset(0),
       mVersion(ID3_UNKNOWN),
       mRawSize(0) {
-    sp<MemorySource> source = new (std::nothrow) MemorySource(data, size);
+    MemorySource *source = new (std::nothrow) MemorySource(data, size);
 
     if (source == NULL)
         return;
@@ -100,6 +138,7 @@ ID3::ID3(const uint8_t *data, size_t size, bool ignoreV1)
     if (!mIsValid && !ignoreV1) {
         mIsValid = parseV1(source);
     }
+    delete source;
 }
 
 ID3::~ID3() {
@@ -131,7 +170,7 @@ bool ID3::ParseSyncsafeInteger(const uint8_t encoded[4], size_t *x) {
     return true;
 }
 
-bool ID3::parseV2(const sp<DataSource> &source, off64_t offset) {
+bool ID3::parseV2(DataSourceBase *source, off64_t offset) {
 struct id3_header {
     char id[3];
     uint8_t version_major;
@@ -341,12 +380,25 @@ struct id3_header {
 }
 
 void ID3::removeUnsynchronization() {
-    for (size_t i = 0; i + 1 < mSize; ++i) {
-        if (mData[i] == 0xff && mData[i + 1] == 0x00) {
-            memmove(&mData[i + 1], &mData[i + 2], mSize - i - 2);
-            --mSize;
+
+    // This file has "unsynchronization", so we have to replace occurrences
+    // of 0xff 0x00 with just 0xff in order to get the real data.
+
+    size_t writeOffset = 1;
+    for (size_t readOffset = 1; readOffset < mSize; ++readOffset) {
+        if (mData[readOffset - 1] == 0xff && mData[readOffset] == 0x00) {
+            continue;
         }
+        // Only move data if there's actually something to move.
+        // This handles the special case of the data being only [0xff, 0x00]
+        // which should be converted to just 0xff if unsynchronization is on.
+        mData[writeOffset++] = mData[readOffset];
     }
+
+    if (writeOffset < mSize) {
+        mSize = writeOffset;
+    }
+
 }
 
 static void WriteSyncsafeInteger(uint8_t *dst, size_t x) {
@@ -372,15 +424,9 @@ bool ID3::removeUnsynchronizationV2_4(bool iTunesHack) {
             return false;
         }
 
-#ifdef MTK_AOSP_ENHANCEMENT
-        if ((dataSize > mSize - 10 - offset) || (dataSize == 0)) {
-            return false;
-        }
-#else
         if (dataSize > mSize - 10 - offset) {
             return false;
         }
-#endif
 
         uint16_t flags = U16_AT(&mData[offset + 8]);
         uint16_t prevFlags = flags;
@@ -398,7 +444,7 @@ bool ID3::removeUnsynchronizationV2_4(bool iTunesHack) {
             flags &= ~1;
         }
 
-        if (flags & 2) {
+        if ((flags & 2) && (dataSize >= 2)) {
             // This file has "unsynchronization", so we have to replace occurrences
             // of 0xff 0x00 with just 0xff in order to get the real data.
 
@@ -407,24 +453,27 @@ bool ID3::removeUnsynchronizationV2_4(bool iTunesHack) {
             for (size_t i = 0; i + 1 < dataSize; ++i) {
                 if (mData[readOffset - 1] == 0xff
                         && mData[readOffset] == 0x00) {
-#ifdef MTK_AOSP_ENHANCEMENT
-                    if((i + 2) >= dataSize){
-                        ALOGE("The last two bytes of this ID3 frame are 0xff00");
-                        return false;
-                    }
-#endif
                     ++readOffset;
                     --mSize;
                     --dataSize;
                 }
-                mData[writeOffset++] = mData[readOffset++];
+                if (i + 1 < dataSize) {
+                    // Only move data if there's actually something to move.
+                    // This handles the special case of the data being only [0xff, 0x00]
+                    // which should be converted to just 0xff if unsynchronization is on.
+                    mData[writeOffset++] = mData[readOffset++];
+                }
             }
             // move the remaining data following this frame
-            memmove(&mData[writeOffset], &mData[readOffset], oldSize - readOffset);
+            if (readOffset <= oldSize) {
+                memmove(&mData[writeOffset], &mData[readOffset], oldSize - readOffset);
+            } else {
+                ALOGE("b/34618607 (%zu %zu %zu %zu)", readOffset, writeOffset, oldSize, mSize);
+                android_errorWriteLog(0x534e4554, "34618607");
+            }
 
-            flags &= ~2;
         }
-
+        flags &= ~2;
         if (flags != prevFlags || iTunesHack) {
             WriteSyncsafeInteger(&mData[offset + 4], dataSize);
             mData[offset + 8] = flags >> 8;
@@ -516,6 +565,7 @@ void ID3::Iterator::getID(String8 *id) const {
     }
 }
 
+
 // the 2nd argument is used to get the data following the \0 in a comment field
 void ID3::Iterator::getString(String8 *id, String8 *comment) const {
     getstring(id, false);
@@ -541,7 +591,7 @@ void ID3::Iterator::getstring(String8 *id, bool otherdata) const {
         if (mOffset == 126 || mOffset == 127) {
             // Special treatment for the track number and genre.
             char tmp[16];
-            sprintf(tmp, "%d", (int)*frameData);
+            snprintf(tmp, sizeof(tmp), "%d", (int)*frameData);
 
             id->setTo(tmp);
             return;
@@ -558,6 +608,9 @@ void ID3::Iterator::getstring(String8 *id, bool otherdata) const {
     }
     size_t n = mFrameSize - getHeaderLength() - 1;
     if (otherdata) {
+        if (n < 5) {
+            return;
+        }
         // skip past the encoding, language, and the 0 separator
         frameData += 4;
         int32_t i = n - 4;
@@ -575,9 +628,6 @@ void ID3::Iterator::getstring(String8 *id, bool otherdata) const {
 
     if (encoding == 0x00) {
         // supposedly ISO 8859-1
-#ifdef MTK_AOSP_ENHANCEMENT
-        ALOGV("framesize = %zu in ISO8859-1",mFrameSize);
-#endif
         id->setTo((const char*)frameData + 1, n);
     } else if (encoding == 0x03) {
         // supposedly UTF-8
@@ -608,11 +658,10 @@ void ID3::Iterator::getstring(String8 *id, bool otherdata) const {
         // UCS-2
         // API wants number of characters, not number of bytes...
         int len = n / 2;
-        const char16_t *framedata = (const char16_t *) (frameData + 1);
-#ifdef MTK_AOSP_ENHANCEMENT
-        if((*framedata!=0xfffe)&&(*framedata!=0xfeff))
+        if (len == 0) {
             return;
-#endif
+        }
+        const char16_t *framedata = (const char16_t *) (frameData + 1);
         char16_t *framedatacopy = NULL;
         if (*framedata == 0xfffe) {
             // endianness marker != host endianness, convert & skip
@@ -638,12 +687,6 @@ void ID3::Iterator::getstring(String8 *id, bool otherdata) const {
             framedata++;
             len--;
         }
-#ifdef MTK_AOSP_ENHANCEMENT
-        while(*framedata == 0xfeff && len>0) {
-            framedata++;
-            len--;
-        }
-#endif
 
         // check if the resulting data consists entirely of 8-bit values
         bool eightBit = true;
@@ -679,6 +722,11 @@ const uint8_t *ID3::Iterator::getData(size_t *length) const {
     *length = 0;
 
     if (mFrameData == NULL) {
+        return NULL;
+    }
+
+    // Prevent integer underflow
+    if (mFrameSize < getHeaderLength()) {
         return NULL;
     }
 
@@ -897,6 +945,9 @@ ID3::getAlbumArt(size_t *length, String8 *mime) const {
     while (!it.done()) {
         size_t size;
         const uint8_t *data = it.getData(&size);
+        if (!data) {
+            return NULL;
+        }
 
         if (mVersion == ID3_V2_3 || mVersion == ID3_V2_4) {
             uint8_t encoding = data[0];
@@ -977,7 +1028,7 @@ ID3::getAlbumArt(size_t *length, String8 *mime) const {
     return NULL;
 }
 
-bool ID3::parseV1(const sp<DataSource> &source) {
+bool ID3::parseV1(DataSourceBase *source) {
     const size_t V1_TAG_SIZE = 128;
 
     off64_t size;

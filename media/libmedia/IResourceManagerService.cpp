@@ -19,7 +19,7 @@
 #define LOG_TAG "IResourceManagerService"
 #include <utils/Log.h>
 
-#include "media/IResourceManagerService.h"
+#include <media/IResourceManagerService.h>
 
 #include <binder/Parcel.h>
 
@@ -58,7 +58,7 @@ static void readFromParcel(const Parcel &data, Vector<T> *items) {
 class BpResourceManagerService : public BpInterface<IResourceManagerService>
 {
 public:
-    BpResourceManagerService(const sp<IBinder> &impl)
+    explicit BpResourceManagerService(const sp<IBinder> &impl)
         : BpInterface<IResourceManagerService>(impl)
     {
     }
@@ -132,6 +132,9 @@ status_t BnResourceManagerService::onTransact(
             int64_t clientId = data.readInt64();
             sp<IResourceManagerClient> client(
                     interface_cast<IResourceManagerClient>(data.readStrongBinder()));
+            if (client == NULL) {
+                return NO_ERROR;
+            }
             Vector<MediaResource> resources;
             readFromParcel(data, &resources);
             addResource(pid, clientId, client, resources);

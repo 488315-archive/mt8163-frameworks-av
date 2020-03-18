@@ -18,6 +18,7 @@
 #define ANDROID_AUDIO_FAST_MIXER_DUMP_STATE_H
 
 #include <stdint.h>
+#include <audio_utils/TimestampVerifier.h>
 #include "Configuration.h"
 #include "FastThreadDumpState.h"
 #include "FastMixerState.h"
@@ -35,7 +36,7 @@ enum FastTrackUnderrunStatus {
 // This packed representation is used to keep the information atomic.
 union FastTrackUnderruns {
     FastTrackUnderruns() { mAtomic = 0;
-            COMPILE_TIME_ASSERT_FUNCTION_SCOPE(sizeof(FastTrackUnderruns) == sizeof(uint32_t)); }
+            static_assert(sizeof(FastTrackUnderruns) == sizeof(uint32_t), "FastTrackUnderrun"); }
     FastTrackUnderruns(const FastTrackUnderruns& copyFrom) : mAtomic(copyFrom.mAtomic) { }
     FastTrackUnderruns& operator=(const FastTrackUnderruns& rhs)
             { if (this != &rhs) mAtomic = rhs.mAtomic; return *this; }
@@ -57,6 +58,7 @@ struct FastTrackDump {
     /*virtual*/ ~FastTrackDump() { }
     FastTrackUnderruns  mUnderruns;
     size_t              mFramesReady;        // most recent value only; no long-term statistics kept
+    int64_t             mFramesWritten;      // last value from track
 };
 
 struct FastMixerDumpState : FastThreadDumpState {
@@ -65,6 +67,7 @@ struct FastMixerDumpState : FastThreadDumpState {
 
     void dump(int fd) const;    // should only be called on a stable copy, not the original
 
+    double   mLatencyMs = 0.;   // measured latency, default of 0 if no valid timestamp read.
     uint32_t mWriteSequence;    // incremented before and after each write()
     uint32_t mFramesWritten;    // total number of frames written successfully
     uint32_t mNumTracks;        // total number of active fast tracks
@@ -73,6 +76,9 @@ struct FastMixerDumpState : FastThreadDumpState {
     size_t   mFrameCount;
     uint32_t mTrackMask;        // mask of active tracks
     FastTrackDump   mTracks[FastMixerState::kMaxFastTracks];
+
+    // For timestamp statistics.
+    TimestampVerifier<int64_t /* frame count */, int64_t /* time ns */> mTimestampVerifier;
 };
 
 }   // android

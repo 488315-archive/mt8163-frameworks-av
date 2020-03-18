@@ -81,7 +81,7 @@ extern "C" {
 #define LVM_TE_MIN_EFFECTLEVEL          0         /*TE Minimum EffectLevel*/
 #define LVM_TE_MAX_EFFECTLEVEL          15        /*TE Maximum Effect level*/
 
-#define LVM_VC_MIN_EFFECTLEVEL          -96       /*VC Minimum EffectLevel*/
+#define LVM_VC_MIN_EFFECTLEVEL          (-96)     /*VC Minimum EffectLevel*/
 #define LVM_VC_MAX_EFFECTLEVEL          0         /*VC Maximum Effect level*/
 
 #define LVM_BE_MIN_EFFECTLEVEL          0         /*BE Minimum EffectLevel*/
@@ -89,7 +89,7 @@ extern "C" {
 
 #define LVM_EQNB_MIN_BAND_FREQ          20        /*EQNB Minimum Band Frequency*/
 #define LVM_EQNB_MAX_BAND_FREQ          24000     /*EQNB Maximum Band Frequency*/
-#define LVM_EQNB_MIN_BAND_GAIN          -15       /*EQNB Minimum Band Frequency*/
+#define LVM_EQNB_MIN_BAND_GAIN          (-15)     /*EQNB Minimum Band Frequency*/
 #define LVM_EQNB_MAX_BAND_GAIN          15        /*EQNB Maximum Band Frequency*/
 #define LVM_EQNB_MIN_QFACTOR            25        /*EQNB Minimum Q Factor*/
 #define LVM_EQNB_MAX_QFACTOR            1200      /*EQNB Maximum Q Factor*/
@@ -101,9 +101,12 @@ extern "C" {
 #define LVM_CS_MAX_REVERB_LEVEL         100       /*CS Maximum Reverb Level*/
 #define LVM_VIRTUALIZER_MAX_REVERB_LEVEL 100      /*Vitrualizer Maximum Reverb Level*/
 
-#define LVM_VC_MIXER_TIME              100       /*VC mixer time*/
+//<MTK_AUDIO_FIX_DEFAULT_DEFECT
+// android default is 100
+#define LVM_VC_MIXER_TIME              10        /*VC mixer time*/
+//MTK_AUDIO_FIX_DEFAULT_DEFECT>
 #define LVM_VC_BALANCE_MAX             96        /*VC balance max value*/
-#define LVM_VC_BALANCE_MIN             -96       /*VC balance min value*/
+#define LVM_VC_BALANCE_MIN             (-96)     /*VC balance min value*/
 
 /* Algorithm masks */
 #define LVM_CS_MASK                     1
@@ -138,6 +141,30 @@ typedef struct
 
 
 /* Buffer Management */
+#ifdef BUILD_FLOAT
+typedef struct
+{
+    LVM_FLOAT               *pScratch;          /* Bundle scratch buffer */
+
+    LVM_INT16               BufferState;        /* Buffer status */
+#ifdef SUPPORT_MC
+    LVM_FLOAT               InDelayBuffer[3 * LVM_MAX_CHANNELS * MIN_INTERNAL_BLOCKSIZE];
+#else
+    LVM_FLOAT               InDelayBuffer[6 * MIN_INTERNAL_BLOCKSIZE]; /* Input buffer delay line, \
+                                                                           left and right */
+#endif
+    LVM_INT16               InDelaySamples;     /* Number of samples in the input delay buffer */
+#ifdef SUPPORT_MC
+    LVM_FLOAT               OutDelayBuffer[LVM_MAX_CHANNELS * MIN_INTERNAL_BLOCKSIZE];
+#else
+    LVM_FLOAT               OutDelayBuffer[2 * MIN_INTERNAL_BLOCKSIZE]; /* Output buffer delay \
+                                                                                      line */
+#endif
+    LVM_INT16               OutDelaySamples;    /* Number of samples in the output delay buffer, \
+                                                                             left and right */
+    LVM_INT16               SamplesToOutput;    /* Samples to write to the output */
+} LVM_Buffer_t;
+#else
 typedef struct
 {
     LVM_INT16               *pScratch;          /* Bundle scratch buffer */
@@ -150,21 +177,27 @@ typedef struct
     LVM_INT16               OutDelaySamples;    /* Number of samples in the output delay buffer, left and right */
     LVM_INT16               SamplesToOutput;    /* Samples to write to the output */
 } LVM_Buffer_t;
-
+#endif
 
 /* Filter taps */
 typedef struct
 {
+#ifdef BUILD_FLOAT
+    Biquad_2I_Order1_FLOAT_Taps_t TrebleBoost_Taps;   /* Treble boost Taps */
+#else
     Biquad_2I_Order1_Taps_t TrebleBoost_Taps;   /* Treble boost Taps */
+#endif
 } LVM_TE_Data_t;
-
 
 /* Coefficients */
 typedef struct
 {
+#ifdef BUILD_FLOAT
+    Biquad_FLOAT_Instance_t       TrebleBoost_State;  /* State for the treble boost filter */
+#else
     Biquad_Instance_t       TrebleBoost_State;  /* State for the treble boost filter */
+#endif
 } LVM_TE_Coefs_t;
-
 
 typedef struct
 {
@@ -181,15 +214,24 @@ typedef struct
     LVM_INT16               InternalBlockSize;  /* Maximum internal block size */
     LVM_Buffer_t            *pBufferManagement; /* Buffer management variables */
     LVM_INT16               SamplesToProcess;   /* Input samples left to process */
+#ifdef BUILD_FLOAT
+    LVM_FLOAT               *pInputSamples;     /* External input sample pointer */
+    LVM_FLOAT               *pOutputSamples;    /* External output sample pointer */
+#else
     LVM_INT16               *pInputSamples;     /* External input sample pointer */
     LVM_INT16               *pOutputSamples;    /* External output sample pointer */
+#endif
 
     /* Configuration number */
     LVM_INT32               ConfigurationNumber;
     LVM_INT32               BlickSizeMultiple;
 
     /* DC removal */
+#ifdef BUILD_FLOAT
+    Biquad_FLOAT_Instance_t       DC_RemovalInstance; /* DC removal filter instance */
+#else
     Biquad_Instance_t       DC_RemovalInstance; /* DC removal filter instance */
+#endif
 
     /* Concert Sound */
     LVCS_Handle_t           hCSInstance;        /* Concert Sound instance handle */
@@ -209,8 +251,16 @@ typedef struct
     LVM_INT16               DBE_Active;         /* Control flag */
 
     /* Volume Control */
+#ifdef BUILD_FLOAT
+    LVMixer3_1St_FLOAT_st   VC_Volume;          /* Volume scaler */
+#else
     LVMixer3_1St_st         VC_Volume;          /* Volume scaler */
+#endif
+#ifdef BUILD_FLOAT
+    LVMixer3_2St_FLOAT_st         VC_BalanceMix;      /* VC balance mixer */
+#else
     LVMixer3_2St_st         VC_BalanceMix;      /* VC balance mixer */
+#endif
     LVM_INT16               VC_VolumedB;        /* Gain in dB */
     LVM_INT16               VC_Active;          /* Control flag */
     LVM_INT16               VC_AVLFixedVolume;  /* AVL fixed volume */
@@ -234,9 +284,18 @@ typedef struct
     LVPSA_ControlParams_t   PSA_ControlParams;  /* Spectrum Analyzer control parameters */
     LVM_INT16               PSA_GainOffset;     /* Tone control flag */
     LVM_Callback            CallBack;
+#ifdef BUILD_FLOAT
+    LVM_FLOAT               *pPSAInput;         /* PSA input pointer */
+#else
     LVM_INT16               *pPSAInput;         /* PSA input pointer */
+#endif
 
     LVM_INT16              NoSmoothVolume;      /* Enable or disable smooth volume changes*/
+
+#ifdef SUPPORT_MC
+    LVM_INT16              NrChannels;
+    LVM_INT32              ChMask;
+#endif
 
 } LVM_Instance_t;
 
@@ -261,16 +320,28 @@ LVM_INT32    LVM_VCCallBack(void*   pBundleHandle,
 
 void    LVM_SetHeadroom(    LVM_Instance_t         *pInstance,
                             LVM_ControlParams_t    *pParams);
-
+#ifdef BUILD_FLOAT
+void    LVM_BufferIn(   LVM_Handle_t      hInstance,
+                        const LVM_FLOAT   *pInData,
+                        LVM_FLOAT         **pToProcess,
+                        LVM_FLOAT         **pProcessed,
+                        LVM_UINT16        *pNumSamples);
+#else
 void    LVM_BufferIn(   LVM_Handle_t      hInstance,
                         const LVM_INT16   *pInData,
                         LVM_INT16         **pToProcess,
                         LVM_INT16         **pProcessed,
                         LVM_UINT16        *pNumSamples);
-
+#endif
+#ifdef BUILD_FLOAT
+void    LVM_BufferOut(  LVM_Handle_t     hInstance,
+                        LVM_FLOAT        *pOutData,
+                        LVM_UINT16       *pNumSamples);
+#else
 void    LVM_BufferOut(  LVM_Handle_t     hInstance,
                         LVM_INT16        *pOutData,
                         LVM_UINT16       *pNumSamples);
+#endif
 
 LVM_INT32 LVM_AlgoCallBack(     void          *pBundleHandle,
                                 void          *pData,

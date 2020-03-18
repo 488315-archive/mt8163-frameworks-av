@@ -14,13 +14,20 @@
  * limitations under the License.
  */
 
+#define LOG_TAG "FastMixerState"
+//#define LOG_NDEBUG 0
+
+#include <cutils/properties.h>
 #include "FastMixerState.h"
 
 namespace android {
 
 FastTrack::FastTrack() :
     mBufferProvider(NULL), mVolumeProvider(NULL),
-    mChannelMask(AUDIO_CHANNEL_OUT_STEREO), mFormat(AUDIO_FORMAT_INVALID), mGeneration(0)
+    mChannelMask(AUDIO_CHANNEL_OUT_STEREO), mFormat(AUDIO_FORMAT_INVALID), mGeneration(0),
+// <MTK_AUDIOMIXER_ENABLE_DRC // ALPS04408933 low latency support drc
+    mStreamType(AUDIO_STREAM_DEFAULT), mOutputDevice(AUDIO_DEVICE_NONE)
+// MTK_AUDIOMIXER_ENABLE_DRC>
 {
 }
 
@@ -31,13 +38,30 @@ FastTrack::~FastTrack()
 FastMixerState::FastMixerState() : FastThreadState(),
     // mFastTracks
     mFastTracksGen(0), mTrackMask(0), mOutputSink(NULL), mOutputSinkGen(0),
-    mFrameCount(0), mTeeSink(NULL)
+    mFrameCount(0),
+// <MTK_AUDIOMIXER_ENABLE_DRC // ALPS04408933 low latency support drc
+    mDRCEnable(false),
+    mDRCEnableGen(0),
+    mUpdateACFHCFParamGen(0),
+    mCustomScene(String8("")),
+    mUpdateCustomSceneParamGen(0)
+// MTK_AUDIOMIXER_ENABLE_DRC>
 {
+    int ok = pthread_once(&sMaxFastTracksOnce, sMaxFastTracksInit);
+    if (ok != 0) {
+        ALOGE("%s pthread_once failed: %d", __func__, ok);
+    }
 }
 
 FastMixerState::~FastMixerState()
 {
 }
+
+// static
+unsigned FastMixerState::sMaxFastTracks = kDefaultFastTracks;
+
+// static
+pthread_once_t FastMixerState::sMaxFastTracksOnce = PTHREAD_ONCE_INIT;
 
 // static
 const char *FastMixerState::commandToString(Command command)
@@ -52,6 +76,20 @@ const char *FastMixerState::commandToString(Command command)
     case FastMixerState::MIX_WRITE: return "MIX_WRITE";
     }
     LOG_ALWAYS_FATAL("%s", __func__);
+}
+
+// static
+void FastMixerState::sMaxFastTracksInit()
+{
+    char value[PROPERTY_VALUE_MAX];
+    if (property_get("ro.audio.max_fast_tracks", value, NULL) > 0) {
+        char *endptr;
+        unsigned long ul = strtoul(value, &endptr, 0);
+        if (*endptr == '\0' && kMinFastTracks <= ul && ul <= kMaxFastTracks) {
+            sMaxFastTracks = (unsigned) ul;
+        }
+    }
+    ALOGI("sMaxFastTracks = %u", sMaxFastTracks);
 }
 
 }   // namespace android

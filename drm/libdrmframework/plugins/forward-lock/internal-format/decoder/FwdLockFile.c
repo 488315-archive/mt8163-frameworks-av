@@ -260,7 +260,11 @@ int FwdLockFile_attach(int fileDesc) {
     if (sessionId >= 0) {
         FwdLockFile_Session_t *pSession = sessionPtrs[sessionId];
         int isSuccess = FALSE;
-        if (read(fileDesc, pSession->topHeader, TOP_HEADER_SIZE) == TOP_HEADER_SIZE &&
+        lseek64(fileDesc, 0, SEEK_SET);
+        int readbytes = read(fileDesc, pSession->topHeader, TOP_HEADER_SIZE);
+        ALOGD("readBytes[%d] FileHeader[%s]", readbytes, pSession->topHeader);
+
+        if (readbytes == TOP_HEADER_SIZE &&
                 memcmp(pSession->topHeader, topHeaderTemplate, sizeof topHeaderTemplate) == 0) {
             pSession->contentTypeLength = pSession->topHeader[CONTENT_TYPE_LENGTH_POS];
             assert(pSession->contentTypeLength <= UCHAR_MAX); // Untaint scalar for code checkers.

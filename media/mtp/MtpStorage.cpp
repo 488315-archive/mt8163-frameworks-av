@@ -17,7 +17,6 @@
 #define LOG_TAG "MtpStorage"
 
 #include "MtpDebug.h"
-#include "MtpDatabase.h"
 #include "MtpStorage.h"
 
 #include <sys/types.h>
@@ -30,26 +29,18 @@
 #include <stdio.h>
 #include <limits.h>
 
-// switch log level for user build
-#ifdef MTK_USER_BUILD
-#undef ALOGD
-#define ALOGD ALOGV
-#endif
-
 namespace android {
 
 MtpStorage::MtpStorage(MtpStorageID id, const char* filePath,
-        const char* description, uint64_t reserveSpace,
-        bool removable, uint64_t maxFileSize)
+        const char* description, bool removable, uint64_t maxFileSize)
     :   mStorageID(id),
         mFilePath(filePath),
         mDescription(description),
         mMaxCapacity(0),
         mMaxFileSize(maxFileSize),
-        mReserveSpace(reserveSpace),
         mRemovable(removable)
 {
-    ALOGD("MtpStorage id: %d path: %s\n", id, filePath);
+    ALOGV("MtpStorage id: %d path: %s\n", id, filePath);
 }
 
 MtpStorage::~MtpStorage() {
@@ -74,8 +65,6 @@ uint64_t MtpStorage::getMaxCapacity() {
             return -1;
         mMaxCapacity = (uint64_t)stat.f_blocks * (uint64_t)stat.f_bsize;
     }
-
-    ALOGD("MtpStorage mMaxCapacity = %lld \n", mMaxCapacity);
     return mMaxCapacity;
 }
 
@@ -83,22 +72,11 @@ uint64_t MtpStorage::getFreeSpace() {
     struct statfs   stat;
     if (statfs(getPath(), &stat))
         return -1;
-    uint64_t freeSpace = (uint64_t)stat.f_bavail * (uint64_t)stat.f_bsize;
-
-    ALOGD("MtpStorage freeSpace = %lld, mReserveSpace = %lld \n", freeSpace, mReserveSpace);
-    return (freeSpace > mReserveSpace ? freeSpace - mReserveSpace : 0);
+    return (uint64_t)stat.f_bavail * (uint64_t)stat.f_bsize;
 }
 
 const char* MtpStorage::getDescription() const {
     return (const char *)mDescription;
-}
-
-bool MtpStorage::setDescription(const char* description) {
-    ALOGV("MtpStorage description = %s \n", description);
-
-    mDescription.clear();
-    mDescription.setTo(description);
-    return true;
 }
 
 }  // namespace android

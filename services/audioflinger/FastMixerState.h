@@ -19,9 +19,10 @@
 
 #include <audio_utils/minifloat.h>
 #include <system/audio.h>
+#include <media/AudioMixer.h>
 #include <media/ExtendedAudioBufferProvider.h>
 #include <media/nbaio/NBAIO.h>
-#include <media/nbaio/NBLog.h>
+#include <media/nblog/NBLog.h>
 #include "FastThreadState.h"
 
 namespace android {
@@ -47,6 +48,13 @@ struct FastTrack {
     audio_channel_mask_t    mChannelMask;    // AUDIO_CHANNEL_OUT_MONO or AUDIO_CHANNEL_OUT_STEREO
     audio_format_t          mFormat;         // track format
     int                     mGeneration;     // increment when any field is assigned
+    bool                    mHapticPlaybackEnabled = false; // haptic playback is enabled or not
+    AudioMixer::haptic_intensity_t mHapticIntensity = AudioMixer::HAPTIC_SCALE_MUTE; // intensity of
+                                                                                     // haptic data
+// <MTK_AUDIOMIXER_ENABLE_DRC // ALPS04408933 low latency support drc
+    audio_stream_type_t     mStreamType;
+    audio_devices_t         mOutputDevice;
+// MTK_AUDIOMIXER_ENABLE_DRC>
 };
 
 // Represents a single state of the fast mixer
@@ -54,7 +62,13 @@ struct FastMixerState : FastThreadState {
                 FastMixerState();
     /*virtual*/ ~FastMixerState();
 
-    static const unsigned kMaxFastTracks = 8;   // must be between 2 and 32 inclusive
+    // These are the minimum, maximum, and default values for maximum number of fast tracks
+    static const unsigned kMinFastTracks = 2;
+    static const unsigned kMaxFastTracks = 32;
+    static const unsigned kDefaultFastTracks = 8;
+
+    static unsigned sMaxFastTracks;             // Configured maximum number of fast tracks
+    static pthread_once_t sMaxFastTracksOnce;   // Protects initializer for sMaxFastTracks
 
     // all pointer fields use raw pointers; objects are owned and ref-counted by the normal mixer
     FastTrack   mFastTracks[kMaxFastTracks];
@@ -63,6 +77,9 @@ struct FastMixerState : FastThreadState {
     NBAIO_Sink* mOutputSink;    // HAL output device, must already be negotiated
     int         mOutputSinkGen; // increment when mOutputSink is assigned
     size_t      mFrameCount;    // number of frames per fast mix buffer
+    audio_channel_mask_t mSinkChannelMask; // If not AUDIO_CHANNEL_NONE, specifies sink channel
+                                           // mask when it cannot be directly calculated from
+                                           // channel count
 
     // Extends FastThreadState::Command
     static const Command
@@ -71,11 +88,20 @@ struct FastMixerState : FastThreadState {
         WRITE = 0x10,           // write to output sink
         MIX_WRITE = 0x18;       // mix tracks and write to output sink
 
-    // This might be a one-time configuration rather than per-state
-    NBAIO_Sink* mTeeSink;       // if non-NULL, then duplicate write()s to this non-blocking sink
-
     // never returns NULL; asserts if command is invalid
     static const char *commandToString(Command command);
+
+    // initialize sMaxFastTracks
+    static void sMaxFastTracksInit();
+// <MTK_AUDIOMIXER_ENABLE_DRC // ALPS04408933 low latency support drc
+    bool        mDRCEnable;
+    int         mDRCEnableGen;
+
+    int         mUpdateACFHCFParamGen;
+
+    String8     mCustomScene;
+    int         mUpdateCustomSceneParamGen;
+// MTK_AUDIOMIXER_ENABLE_DRC>
 };  // struct FastMixerState
 
 }   // namespace android

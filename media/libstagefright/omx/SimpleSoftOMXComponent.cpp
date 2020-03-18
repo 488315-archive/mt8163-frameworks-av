@@ -18,8 +18,7 @@
 #define LOG_TAG "SimpleSoftOMXComponent"
 #include <utils/Log.h>
 
-#include "include/SimpleSoftOMXComponent.h"
-
+#include <media/stagefright/omx/SimpleSoftOMXComponent.h>
 #include <media/stagefright/foundation/ADebug.h>
 #include <media/stagefright/foundation/ALooper.h>
 #include <media/stagefright/foundation/AMessage.h>
@@ -35,14 +34,15 @@ SimpleSoftOMXComponent::SimpleSoftOMXComponent(
       mLooper(new ALooper),
       mHandler(new AHandlerReflector<SimpleSoftOMXComponent>(this)),
       mState(OMX_StateLoaded),
-      mTargetState(OMX_StateLoaded) {
+      mTargetState(OMX_StateLoaded),
+      mFrameConfig(false) {
     mLooper->setName(name);
     mLooper->registerHandler(mHandler);
 
     mLooper->start(
             false, // runOnCallingThread
             false, // canCallJava
-            ANDROID_PRIORITY_FOREGROUND);
+            ANDROID_PRIORITY_VIDEO);
 }
 
 void SimpleSoftOMXComponent::prepareForDestruction() {
@@ -77,19 +77,34 @@ bool SimpleSoftOMXComponent::isSetParameterAllowed(
     switch (index) {
         case OMX_IndexParamPortDefinition:
         {
-            portIndex = ((OMX_PARAM_PORTDEFINITIONTYPE *)params)->nPortIndex;
+            const OMX_PARAM_PORTDEFINITIONTYPE *portDefs =
+                    (const OMX_PARAM_PORTDEFINITIONTYPE *) params;
+            if (!isValidOMXParam(portDefs)) {
+                return false;
+            }
+            portIndex = portDefs->nPortIndex;
             break;
         }
 
         case OMX_IndexParamAudioPcm:
         {
-            portIndex = ((OMX_AUDIO_PARAM_PCMMODETYPE *)params)->nPortIndex;
+            const OMX_AUDIO_PARAM_PCMMODETYPE *pcmMode =
+                    (const OMX_AUDIO_PARAM_PCMMODETYPE *) params;
+            if (!isValidOMXParam(pcmMode)) {
+                return false;
+            }
+            portIndex = pcmMode->nPortIndex;
             break;
         }
 
         case OMX_IndexParamAudioAac:
         {
-            portIndex = ((OMX_AUDIO_PARAM_AACPROFILETYPE *)params)->nPortIndex;
+            const OMX_AUDIO_PARAM_AACPROFILETYPE *aacMode =
+                    (const OMX_AUDIO_PARAM_AACPROFILETYPE *) params;
+            if (!isValidOMXParam(aacMode)) {
+                return false;
+            }
+            portIndex = aacMode->nPortIndex;
             break;
         }
 
@@ -190,6 +205,21 @@ OMX_ERRORTYPE SimpleSoftOMXComponent::internalSetParameter(
     }
 }
 
+OMX_ERRORTYPE SimpleSoftOMXComponent::internalSetConfig(
+        OMX_INDEXTYPE index, const OMX_PTR params, bool *frameConfig) {
+    return OMX_ErrorUndefined;
+}
+
+OMX_ERRORTYPE SimpleSoftOMXComponent::setConfig(
+        OMX_INDEXTYPE index, const OMX_PTR params) {
+    bool frameConfig = mFrameConfig;
+    OMX_ERRORTYPE err = internalSetConfig(index, params, &frameConfig);
+    if (err == OMX_ErrorNone) {
+        mFrameConfig = frameConfig;
+    }
+    return err;
+}
+
 OMX_ERRORTYPE SimpleSoftOMXComponent::useBuffer(
         OMX_BUFFERHEADERTYPE **header,
         OMX_U32 portIndex,
@@ -198,6 +228,13 @@ OMX_ERRORTYPE SimpleSoftOMXComponent::useBuffer(
         OMX_U8 *ptr) {
     Mutex::Autolock autoLock(mLock);
     CHECK_LT(portIndex, mPorts.size());
+
+    PortInfo *port = &mPorts.editItemAt(portIndex);
+    if (size < port->mDef.nBufferSize) {
+        ALOGE("b/63522430, Buffer size is too small.");
+        android_errorWriteLog(0x534e4554, "63522430");
+        return OMX_ErrorBadParameter;
+    }
 
     *header = new OMX_BUFFERHEADERTYPE;
     (*header)->nSize = sizeof(OMX_BUFFERHEADERTYPE);
@@ -220,8 +257,6 @@ OMX_ERRORTYPE SimpleSoftOMXComponent::useBuffer(
     (*header)->nFlags = 0;
     (*header)->nOutputPortIndex = portIndex;
     (*header)->nInputPortIndex = portIndex;
-
-    PortInfo *port = &mPorts.editItemAt(portIndex);
 
     CHECK(mState == OMX_StateLoaded || port->mDef.bEnabled == OMX_FALSE);
 
@@ -317,6 +352,10 @@ OMX_ERRORTYPE SimpleSoftOMXComponent::emptyThisBuffer(
         OMX_BUFFERHEADERTYPE *buffer) {
     sp<AMessage> msg = new AMessage(kWhatEmptyThisBuffer, mHandler);
     msg->setPointer("header", buffer);
+    if (mFrameConfig) {
+        msg->setInt32("frame-config", mFrameConfig);
+        mFrameConfig = false;
+    }
     msg->post();
 
     return OMX_ErrorNone;
@@ -359,6 +398,10 @@ void SimpleSoftOMXComponent::onMessageReceived(const sp<AMessage> &msg) {
         {
             OMX_BUFFERHEADERTYPE *header;
             CHECK(msg->findPointer("header", (void **)&header));
+            int32_t frameConfig;
+            if (!msg->findInt32("frame-config", &frameConfig)) {
+                frameConfig = 0;
+            }
 
             CHECK(mState == OMX_StateExecuting && mTargetState == mState);
 
@@ -374,6 +417,7 @@ void SimpleSoftOMXComponent::onMessageReceived(const sp<AMessage> &msg) {
                     CHECK(!buffer->mOwnedByUs);
 
                     buffer->mOwnedByUs = true;
+                    buffer->mFrameConfig = (bool)frameConfig;
 
                     CHECK((msgType == kWhatEmptyThisBuffer
                             && port->mDef.eDir == OMX_DirInput)
@@ -426,7 +470,7 @@ void SimpleSoftOMXComponent::onSendCommand(
 }
 
 void SimpleSoftOMXComponent::onChangeState(OMX_STATETYPE state) {
-#ifdef MTK_AOSP_ENHANCEMENT
+// Fix AOSP timing issue +++
     // Timing issue.
     // If binder die comes, When freeBuffer do not complete.
     // But onChangeState() called by freeNode() is called after all buffer freed.
@@ -436,19 +480,26 @@ void SimpleSoftOMXComponent::onChangeState(OMX_STATETYPE state) {
         ALOGE("Warnning: state==mState, mState = %d, mTargetState=%d", state, mTargetState);
         return;
     }
+// Fix AOSP timing issue ---
+    ALOGV("%p requesting change from %d to %d", this, mState, state);
+    // We shouldn't be in a state transition already.
 
-    // If binder die comes, when freeBuffer do not complete.
-    // At this time, mState == OMX_StateIdle, but mTargetState == OMX_StateLoaded.
-    // So if there is no need to CHECK_EQ((int)mState, (int)mTargetState);
+    if (mState == OMX_StateLoaded
+            && mTargetState == OMX_StateIdle
+            && state == OMX_StateLoaded) {
+        // OMX specifically allows "canceling" a state transition from loaded
+        // to idle. Pretend we made it to idle, and go back to loaded
+        ALOGV("load->idle canceled");
+        mState = mTargetState = OMX_StateIdle;
+        state = OMX_StateLoaded;
+    }
+
     if (mState != mTargetState) {
-        ALOGE("Warnning: mState != mTargetState, mState = %d, mTargetState = %d, state=%d",
-                      mState, mTargetState, state);
+        ALOGE("State change to state %d requested while still transitioning from state %d to %d",
+                state, mState, mTargetState);
+        notify(OMX_EventError, OMX_ErrorUndefined, 0, NULL);
         return;
     }
-#else
-    // We shouldn't be in a state transition already.
-    CHECK_EQ((int)mState, (int)mTargetState);
-#endif
 
     switch (mState) {
         case OMX_StateLoaded:
@@ -627,6 +678,7 @@ void SimpleSoftOMXComponent::checkTransitions() {
         }
 
         if (transitionComplete) {
+            ALOGV("state transition from %d to %d complete", mState, mTargetState);
             mState = mTargetState;
 
             if (mState == OMX_StateLoaded) {
@@ -634,6 +686,8 @@ void SimpleSoftOMXComponent::checkTransitions() {
             }
 
             notify(OMX_EventCmdComplete, OMX_CommandStateSet, mState, NULL);
+        } else {
+            ALOGV("state transition from %d to %d not yet complete", mState, mTargetState);
         }
     }
 

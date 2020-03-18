@@ -1,9 +1,4 @@
 /*
-* Copyright (C) 2014 MediaTek Inc.
-* Modification based on code covered by the mentioned copyright
-* and/or permission notice(s).
-*/
-/*
  * Copyright (C) 2010 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -35,6 +30,11 @@
 #include <media/stagefright/MediaErrors.h>
 #include <media/stagefright/MetaData.h>
 #include <media/stagefright/MediaDefs.h>
+#include <media/stagefright/Utils.h>
+
+// default buffer prepare/ready/underflow marks
+static const int kReadyMarkMs     = 5000;  // 5 seconds
+static const int kPrepareMarkMs   = 1500;  // 1.5 seconds
 
 namespace android {
 
@@ -53,6 +53,8 @@ NuPlayer::HTTPLiveSource::HTTPLiveSource(
       mFetchMetaDataGeneration(0),
       mHasMetadata(false),
       mMetadataSelected(false) {
+    mBufferingSettings.mInitialMarkMs = kPrepareMarkMs;
+    mBufferingSettings.mResumePlaybackMarkMs = kReadyMarkMs;
     if (headers) {
         mExtraHeaders = *headers;
 
@@ -80,6 +82,23 @@ NuPlayer::HTTPLiveSource::~HTTPLiveSource() {
     }
 }
 
+status_t NuPlayer::HTTPLiveSource::getBufferingSettings(
+            BufferingSettings* buffering /* nonnull */) {
+    *buffering = mBufferingSettings;
+
+    return OK;
+}
+
+status_t NuPlayer::HTTPLiveSource::setBufferingSettings(const BufferingSettings& buffering) {
+    mBufferingSettings = buffering;
+
+    if (mLiveSession != NULL) {
+        mLiveSession->setBufferingSettings(mBufferingSettings);
+    }
+
+    return OK;
+}
+
 void NuPlayer::HTTPLiveSource::prepareAsync() {
     if (mLiveLooper == NULL) {
         mLiveLooper = new ALooper;
@@ -98,6 +117,7 @@ void NuPlayer::HTTPLiveSource::prepareAsync() {
 
     mLiveLooper->registerHandler(mLiveSession);
 
+    mLiveSession->setBufferingSettings(mBufferingSettings);
     mLiveSession->connectAsync(
             mURL.c_str(), mExtraHeaders.isEmpty() ? NULL : &mExtraHeaders);
 }
@@ -105,21 +125,38 @@ void NuPlayer::HTTPLiveSource::prepareAsync() {
 void NuPlayer::HTTPLiveSource::start() {
 }
 
+sp<MetaData> NuPlayer::HTTPLiveSource::getFormatMeta(bool audio) {
+    sp<MetaData> meta;
+    if (mLiveSession != NULL) {
+        mLiveSession->getStreamFormatMeta(
+                audio ? LiveSession::STREAMTYPE_AUDIO
+                      : LiveSession::STREAMTYPE_VIDEO,
+                &meta);
+    }
+
+    return meta;
+}
+
 sp<AMessage> NuPlayer::HTTPLiveSource::getFormat(bool audio) {
-    if (mLiveSession == NULL) {
-        return NULL;
+    sp<MetaData> meta;
+    status_t err = -EWOULDBLOCK;
+    if (mLiveSession != NULL) {
+        err = mLiveSession->getStreamFormatMeta(
+                audio ? LiveSession::STREAMTYPE_AUDIO
+                      : LiveSession::STREAMTYPE_VIDEO,
+                &meta);
     }
 
     sp<AMessage> format;
-    status_t err = mLiveSession->getStreamFormat(
-            audio ? LiveSession::STREAMTYPE_AUDIO
-                  : LiveSession::STREAMTYPE_VIDEO,
-            &format);
-
-    if (err != OK) {
-        return NULL;
+    if (err == -EWOULDBLOCK) {
+        format = new AMessage();
+        format->setInt32("err", err);
+        return format;
     }
 
+    if (err != OK || convertMetaDataToMessage(meta, &format) != OK) {
+        return NULL;
+    }
     return format;
 }
 
@@ -201,15 +238,12 @@ status_t NuPlayer::HTTPLiveSource::selectTrack(size_t trackIndex, bool select, i
     return (err == OK || err == BAD_VALUE) ? (status_t)OK : err;
 }
 
-status_t NuPlayer::HTTPLiveSource::seekTo(int64_t seekTimeUs) {
-#ifdef MTK_AOSP_ENHANCEMENT
-    // HLS does not support seek
-    // ignore this and return OK
-    if (!mLiveSession->isSeekable()) {
-        return OK;
+status_t NuPlayer::HTTPLiveSource::seekTo(int64_t seekTimeUs, MediaPlayerSeekMode mode) {
+    if (mLiveSession->isSeekable()) {
+        return mLiveSession->seekTo(seekTimeUs, mode);
+    } else {
+        return INVALID_OPERATION;
     }
-#endif
-    return mLiveSession->seekTo(seekTimeUs);
 }
 
 void NuPlayer::HTTPLiveSource::pollForRawData(
@@ -237,10 +271,10 @@ void NuPlayer::HTTPLiveSource::pollForRawData(
 
         if (fetchType == LiveSession::STREAMTYPE_SUBTITLES) {
             notify->post();
-            msg->post(delayUs > 0ll ? delayUs : 0ll);
+            msg->post(delayUs > 0LL ? delayUs : 0LL);
             return;
         } else if (fetchType == LiveSession::STREAMTYPE_METADATA) {
-            if (delayUs < -1000000ll) { // 1 second
+            if (delayUs < -1000000LL) { // 1 second
                 continue;
             }
             notify->post();
@@ -252,7 +286,7 @@ void NuPlayer::HTTPLiveSource::pollForRawData(
     }
 
     // try again in 1 second
-    msg->post(1000000ll);
+    msg->post(1000000LL);
 }
 
 void NuPlayer::HTTPLiveSource::onMessageReceived(const sp<AMessage> &msg) {
@@ -311,15 +345,9 @@ void NuPlayer::HTTPLiveSource::onSessionNotify(const sp<AMessage> &msg) {
                 notifyVideoSizeChanged();
             }
 
-#ifdef MTK_AOSP_ENHANCEMENT
             uint32_t flags = 0;
-#else
-            uint32_t flags = FLAG_CAN_PAUSE;
-#endif
             if (mLiveSession->isSeekable()) {
-#ifdef MTK_AOSP_ENHANCEMENT
                 flags |= FLAG_CAN_PAUSE;
-#endif
                 flags |= FLAG_CAN_SEEK;
                 flags |= FLAG_CAN_SEEK_BACKWARD;
                 flags |= FLAG_CAN_SEEK_FORWARD;
@@ -352,10 +380,7 @@ void NuPlayer::HTTPLiveSource::onSessionNotify(const sp<AMessage> &msg) {
 
             bool audio = changedMask & LiveSession::STREAMTYPE_AUDIO;
             bool video = changedMask & LiveSession::STREAMTYPE_VIDEO;
-#ifdef MTK_AOSP_ENHANCEMENT
-            ALOGI("receive LiveSession::kWhatStreamsChanged,queue Decoder Shutdown for %s,%s",\
-                audio?"audio":"",video?"video":"");
-#endif
+
             sp<AMessage> reply;
             CHECK(msg->findMessage("reply", &reply));
 
@@ -399,26 +424,6 @@ void NuPlayer::HTTPLiveSource::onSessionNotify(const sp<AMessage> &msg) {
         case LiveSession::kWhatMetadataDetected:
         {
             if (!mHasMetadata) {
-#ifdef MTK_AOSP_ENHANCEMENT
-                sp<ABuffer> metaBuffer;
-                CHECK(msg->findBuffer("buffer", &metaBuffer));
-
-                AString mimeType;
-                sp<ABuffer> buffer;
-
-                CHECK(metaBuffer->meta()->findString("mime", &mimeType));
-                ALOGD("mime %s", mimeType.c_str());
-
-                if(!strncasecmp(mimeType.c_str(), "image/jpeg", 10)){
-                    ALOGD("image/jpeg, size %zu", metaBuffer->size());
-                    if(mMetaData == NULL){
-                        mMetaData = new MetaData;
-                    }
-                    mMetaData->setCString(kKeyAlbumArtMIME, mimeType.c_str());
-                    mMetaData->setData(kKeyAlbumArt, MetaData::TYPE_NONE, metaBuffer->data(), metaBuffer->size());
-
-                }
-#endif
                 mHasMetadata = true;
 
                 sp<AMessage> notify = dupNotify();
@@ -433,16 +438,11 @@ void NuPlayer::HTTPLiveSource::onSessionNotify(const sp<AMessage> &msg) {
         {
             break;
         }
+
         default:
             TRESPASS();
     }
 }
 
-#ifdef MTK_AOSP_ENHANCEMENT
-NuPlayer::Source::DataSourceType NuPlayer::HTTPLiveSource::getDataSourceType() {
-    ALOGD("rock, getDataSourceType");
-    return NuPlayer::Source::SOURCE_HttpLive;
-}
-#endif
 }  // namespace android
 

@@ -1,9 +1,4 @@
 /*
-* Copyright (C) 2014 MediaTek Inc.
-* Modification based on code covered by the mentioned copyright
-* and/or permission notice(s).
-*/
-/*
  * Copyright (C) 2010 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,9 +19,13 @@
 #define ES_QUEUE_H_
 
 #include <media/stagefright/foundation/ABase.h>
+#include <media/stagefright/foundation/AMessage.h>
 #include <utils/Errors.h>
 #include <utils/List.h>
 #include <utils/RefBase.h>
+#include <vector>
+
+#include "HlsSampleDecryptor.h"
 
 namespace android {
 
@@ -35,19 +34,12 @@ class MetaData;
 
 struct ElementaryStreamQueue {
     enum Mode {
+        INVALID = 0,
         H264,
         AAC,
-#ifdef MTK_AOSP_ENHANCEMENT
-        HEVC,
-        PSLPCM,           //mtk02420
-        VORBIS_AUDIO,
-        LPCM,
-        BDLPCM,
-        VC1_VIDEO,
-        SUBTITLE,
-        EC3,
-#endif
         AC3,
+        EAC3,
+        AC4,
         MPEG_AUDIO,
         MPEG_VIDEO,
         MPEG4_VIDEO,
@@ -58,25 +50,49 @@ struct ElementaryStreamQueue {
     enum Flags {
         // Data appended to the queue is always at access unit boundaries.
         kFlag_AlignedData = 1,
+        kFlag_ScrambledData = 2,
+        kFlag_SampleEncryptedData = 4,
     };
-    ElementaryStreamQueue(Mode mode, uint32_t flags = 0);
+    explicit ElementaryStreamQueue(Mode mode, uint32_t flags = 0);
 
-    status_t appendData(const void *data, size_t size, int64_t timeUs);
+    status_t appendData(const void *data, size_t size,
+            int64_t timeUs, int32_t payloadOffset = 0,
+            uint32_t pesScramblingControl = 0);
+
+    void appendScrambledData(
+            const void *data, size_t size,
+            size_t leadingClearBytes,
+            int32_t keyId, bool isSync,
+            sp<ABuffer> clearSizes, sp<ABuffer> encSizes);
+
     void signalEOS();
     void clear(bool clearFormat);
 
     sp<ABuffer> dequeueAccessUnit();
 
     sp<MetaData> getFormat();
-#ifdef MTK_AOSP_ENHANCEMENT
 
-    sp<ABuffer> dequeueAccessUnitDDP();
-#endif
+    bool isScrambled() const;
+
+    void setCasInfo(int32_t systemId, const std::vector<uint8_t> &sessionId);
+
+    void signalNewSampleAesKey(const sp<AMessage> &keyItem);
+
 private:
     struct RangeInfo {
         int64_t mTimestampUs;
         size_t mLength;
-        bool mInvalidTimestamp;
+        int32_t mPesOffset;
+        uint32_t mPesScramblingControl;
+    };
+
+    struct ScrambledRangeInfo {
+        size_t mLength;
+        size_t mLeadingClearBytes;
+        int32_t mKeyId;
+        int32_t mIsSync;
+        sp<ABuffer> mClearSizes;
+        sp<ABuffer> mEncSizes;
     };
 
     Mode mMode;
@@ -86,11 +102,24 @@ private:
     sp<ABuffer> mBuffer;
     List<RangeInfo> mRangeInfos;
 
+    sp<ABuffer> mScrambledBuffer;
+    List<ScrambledRangeInfo> mScrambledRangeInfos;
+    int32_t mCASystemId;
+    std::vector<uint8_t> mCasSessionId;
+
     sp<MetaData> mFormat;
+
+    sp<HlsSampleDecryptor> mSampleDecryptor;
+    int mAUIndex;
+
+    bool isSampleEncrypted() const {
+        return (mFlags & kFlag_SampleEncryptedData) != 0;
+    }
 
     sp<ABuffer> dequeueAccessUnitH264();
     sp<ABuffer> dequeueAccessUnitAAC();
-    sp<ABuffer> dequeueAccessUnitAC3();
+    sp<ABuffer> dequeueAccessUnitEAC3();
+    sp<ABuffer> dequeueAccessUnitAC4();
     sp<ABuffer> dequeueAccessUnitMPEGAudio();
     sp<ABuffer> dequeueAccessUnitMPEGVideo();
     sp<ABuffer> dequeueAccessUnitMPEG4Video();
@@ -99,50 +128,13 @@ private:
 
     // consume a logical (compressed) access unit of size "size",
     // returns its timestamp in us (or -1 if no time information).
-    int64_t fetchTimestamp(size_t size
-#ifdef MTK_AOSP_ENHANCEMENT
-    , bool* pfgInvalidPTS = NULL
-#endif
-    );
+    int64_t fetchTimestamp(size_t size,
+            int32_t *pesOffset = NULL,
+            int32_t *pesScramblingControl = NULL);
+
+    sp<ABuffer> dequeueScrambledAccessUnit();
 
     DISALLOW_EVIL_CONSTRUCTORS(ElementaryStreamQueue);
-#ifdef MTK_AOSP_ENHANCEMENT
-public:
-    void setFormat(uint32_t key, const char *value);
-    void setSeeking(bool h264UsePPs = false);
-    void setSearchSCOptimize(bool fgEnable);
-    sp<ABuffer> dequeueAccessUnit1();//cherry
-private:
-    List<sp<ABuffer> > accessUnits;    //[qian] H264: a nal is a AU
-    bool mSeeking;
-    int64_t mAudioFrameDuration;
-    int32_t mMP3Header;
-    int8_t mVorbisStatus;
-    struct PCM_Header {
-        char sub_stream_id;
-        char number_of_frame_header;
-        int reserved:7;
-        int audio_emphasis_flag:1;
-        int number_of_audio_channel:3;
-        int audio_sampling_frequency:3;
-        int quantization_word_length:2;
-    };
-    bool mfgSearchStartCodeOptimize;
-    bool mH264UsePPs;
-    bool mfgFirstFrmAfterSeek;  //start to send AU at I frame with valid PTS after seek
-    int64_t mLastTimeUs;
-    sp<ABuffer> dequeueAccessUnitHEVC();
-    sp<ABuffer> dequeueAccessUnitH264_mtk();//cherry
-    sp<ABuffer> dequeueAccessUnitPSLPCM();
-    sp<ABuffer> dequeueAccessUnitVORBISAudio();
-    sp<ABuffer> dequeueAccessUnitLPCM();
-    sp<ABuffer> dequeueAccessUnitBDLPCM();
-    sp<ABuffer> dequeueAccessUnitMetadata_mtk();//cherry
-    bool IsIFrame(uint8_t *nalStart, size_t nalSize);
-    sp<ABuffer> dequeueAccessUnitVC1Video();
-    //sp<ABuffer> dequeueAccessUnitPESMetaData();
-    sp<ABuffer> dequeueAccessUnitDvbSubtitle();
-#endif
 };
 
 }  // namespace android

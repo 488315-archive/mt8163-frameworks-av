@@ -1,9 +1,4 @@
 /*
-* Copyright (C) 2014 MediaTek Inc.
-* Modification based on code covered by the mentioned copyright
-* and/or permission notice(s).
-*/
-/*
  * Copyright (C) 2010 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,9 +18,9 @@
 
 #define NU_CACHED_SOURCE_2_H_
 
+#include <media/DataSource.h>
 #include <media/stagefright/foundation/ABase.h>
 #include <media/stagefright/foundation/AHandlerReflector.h>
-#include <media/stagefright/DataSource.h>
 
 namespace android {
 
@@ -42,19 +37,26 @@ struct NuCachedSource2 : public DataSource {
 
     virtual ssize_t readAt(off64_t offset, void *data, size_t size);
 
+    virtual void close();
+
     virtual void disconnect();
 
     virtual status_t getSize(off64_t *size);
     virtual uint32_t flags();
 
     virtual sp<DecryptHandle> DrmInitialization(const char* mime);
-    virtual void getDrmInfo(sp<DecryptHandle> &handle, DrmManagerClient **client);
     virtual String8 getUri();
 
     virtual String8 getMIMEType() const;
 
+    virtual String8 toString() {
+        return mName;
+    }
+
+    status_t getAvailableSize(off64_t offset, off64_t *size);
+
     ////////////////////////////////////////////////////////////////////////////
-#ifndef  MTK_AOSP_ENHANCEMENT
+
     size_t cachedSize();
     size_t approxDataRemaining(status_t *finalStatus) const;
 
@@ -65,7 +67,6 @@ struct NuCachedSource2 : public DataSource {
     // is returned.
     status_t getEstimatedBandwidthKbps(int32_t *kbps);
     status_t setCacheStatCollectFreq(int32_t freqMs);
-#endif
 
     static void RemoveCacheSpecificHeaders(
             KeyedVector<String8, String8> *headers,
@@ -81,11 +82,7 @@ private:
     NuCachedSource2(
             const sp<DataSource> &source,
             const char *cacheConfig,
-            bool disconnectAtHighwatermark
-#ifdef MTK_AOSP_ENHANCEMENT
-            ,off64_t cacheOffset = 0
-#endif
-            );
+            bool disconnectAtHighwatermark);
 
     enum {
         kPageSize                       = 65536,
@@ -100,9 +97,6 @@ private:
     enum {
         kWhatFetchMore  = 'fetc',
         kWhatRead       = 'read',
-#ifdef MTK_AOSP_ENHANCEMENT
-        kWhatRestartCache = 'rstc',
-#endif
     };
 
     enum {
@@ -112,6 +106,7 @@ private:
     sp<DataSource> mSource;
     sp<AHandlerReflector<NuCachedSource2> > mReflector;
     sp<ALooper> mLooper;
+    String8 mName;
 
     Mutex mSerializer;
     mutable Mutex mLock;
@@ -144,7 +139,7 @@ private:
     ssize_t readInternal(off64_t offset, void *data, size_t size);
     status_t seekInternal_l(off64_t offset);
 
-    size_t approxDataRemaining_l(status_t *finalStatus) const;
+    size_t approxDataRemaining_l(off64_t offset, status_t *finalStatus) const;
 
     void restartPrefetcherIfNecessary_l(
             bool ignoreLowWaterThreshold = false, bool force = false);
@@ -152,50 +147,8 @@ private:
     void updateCacheParamsFromSystemProperty();
     void updateCacheParamsFromString(const char *s);
 
+    void showBW();  // mtk add
     DISALLOW_EVIL_CONSTRUCTORS(NuCachedSource2);
-#ifdef MTK_AOSP_ENHANCEMENT
-
-public:
-    NuCachedSource2();
-    // [Feature:non-interleave]
-    virtual size_t cachedSize();
-    virtual size_t approxDataRemaining(status_t *finalStatus) const;
-
-    virtual void resumeFetchingIfNecessary();
-
-    virtual void resumeFetchingIfNecessary2();
-    // The following methods are supported only if the
-    // data source is HTTP-based; otherwise, ERROR_UNSUPPORTED
-    // is returned.
-    virtual status_t getEstimatedBandwidthKbps(int32_t *kbps);
-    virtual status_t setCacheStatCollectFreq(int32_t freqMs);
-    bool estimateBandwidth(int32_t *kbps);
-    int64_t getMaxCacheSize();
-    status_t getRealFinalStatus() {return mFinalStatus;};
-    void finishCache() { mDying = true; };
-    void setInterleaveMode(bool isInterleave, double factor);
-    void setOffsetLimit(off64_t limit);
-    bool disconnectAtHighwatermark() {return mDisconnectAtHighwatermark;};
-    String8 getConfigStr() {return mConfigStr;};
-
-private:
-    struct {
-    bool mCacheMissing;
-    off64_t mMissingOffset;
-    size_t mMissingSize;
-    } mTryReadState;
-
-    String8 mConfigStr;
-    bool mDying;  // interrupt operations for quick resetting when it is set true
-    bool mInterleave;  // indicate whether non-interleave mode or not
-    off64_t mOffsetLimit;
-    bool mIsCacheMissed;     // used for approxDataRemaining_l
-    void onRestartCache(const sp<AMessage> &msg);   // restart the cache offset
-    ssize_t tryRead_l(off64_t offset, size_t size);
-    void checkTryReadState();
-    void showBW();
-    void init(const char *cacheConfig, off64_t cacheOffset);
-#endif
 };
 
 }  // namespace android

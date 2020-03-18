@@ -1,10 +1,4 @@
 /*
-* Copyright (C) 2014 MediaTek Inc.
-* Modification based on code covered by the mentioned copyright
-* and/or permission notice(s).
-*/
-
-/*
  * Copyright (C) 2010 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -28,13 +22,13 @@
 
 #include <fcntl.h>
 
+#include <media/MediaSource.h>
 #include <media/stagefright/foundation/ABuffer.h>
 #include <media/stagefright/foundation/ADebug.h>
 #include <media/stagefright/foundation/AMessage.h>
 #include <media/stagefright/foundation/hexdump.h>
 #include <media/stagefright/MediaBuffer.h>
 #include <media/stagefright/MediaDefs.h>
-#include <media/stagefright/MediaSource.h>
 #include <media/stagefright/MetaData.h>
 #include <utils/ByteOrder.h>
 
@@ -119,12 +113,8 @@ bool ARTPWriter::reachedEOS() {
     Mutex::Autolock autoLock(mLock);
     return (mFlags & kFlagEOS) != 0;
 }
-#ifndef MTK_AOSP_ENHANCEMENT
-status_t ARTPWriter::start(MetaData * /* params */)
-#else
-status_t ARTPWriter::start(MetaData *params)
-#endif
-{
+
+status_t ARTPWriter::start(MetaData * /* params */) {
     Mutex::Autolock autoLock(mLock);
     if (mFlags & kFlagStarted) {
         return INVALID_OPERATION;
@@ -148,10 +138,6 @@ status_t ARTPWriter::start(MetaData *params)
         mMode = H264;
     } else if (!strcasecmp(mime, MEDIA_MIMETYPE_VIDEO_H263)) {
         mMode = H263;
-#ifdef MTK_AOSP_ENHANCEMENT
-    } else if (!strcasecmp(mime, MEDIA_MIMETYPE_VIDEO_MPEG4)) {
-        mMode = MPEG_4_SP;
-#endif // #ifdef MTK_AOSP_ENHANCEMENT
     } else if (!strcasecmp(mime, MEDIA_MIMETYPE_AUDIO_AMR_NB)) {
         mMode = AMR_NB;
     } else if (!strcasecmp(mime, MEDIA_MIMETYPE_AUDIO_AMR_WB)) {
@@ -159,10 +145,6 @@ status_t ARTPWriter::start(MetaData *params)
     } else {
         TRESPASS();
     }
-
-#ifdef MTK_AOSP_ENHANCEMENT
-    parseParams(params);
-#endif // #ifdef MTK_AOSP_ENHANCEMENT
 
     (new AMessage(kWhatStart, mReflector))->post();
 
@@ -191,7 +173,7 @@ status_t ARTPWriter::pause() {
     return OK;
 }
 
-static void StripStartcode(MediaBuffer *buffer) {
+static void StripStartcode(MediaBufferBase *buffer) {
     if (buffer->range_length() < 4) {
         return;
     }
@@ -213,7 +195,7 @@ void ARTPWriter::onMessageReceived(const sp<AMessage> &msg) {
 
 #if 0
             if (mMode == H264) {
-                MediaBuffer *buffer;
+                MediaBufferBase *buffer;
                 CHECK_EQ(mSource->read(&buffer), (status_t)OK);
 
                 StripStartcode(buffer);
@@ -283,7 +265,7 @@ void ARTPWriter::onMessageReceived(const sp<AMessage> &msg) {
 }
 
 void ARTPWriter::onRead(const sp<AMessage> &msg) {
-    MediaBuffer *mediaBuf;
+    MediaBufferBase *mediaBuf;
     status_t err = mSource->read(&mediaBuf);
 
     if (err != OK) {
@@ -302,10 +284,6 @@ void ARTPWriter::onRead(const sp<AMessage> &msg) {
             sendAVCData(mediaBuf);
         } else if (mMode == H263) {
             sendH263Data(mediaBuf);
-#ifdef MTK_AOSP_ENHANCEMENT
-        } else if (mMode == MPEG_4_SP) {
-            sendMPEG4Data(mediaBuf);
-#endif // #ifdef MTK_AOSP_ENHANCEMENT
         } else if (mMode == AMR_NB || mMode == AMR_WB) {
             sendAMRData(mediaBuf);
         }
@@ -336,14 +314,7 @@ void ARTPWriter::send(const sp<ABuffer> &buffer, bool isRTCP) {
             (const struct sockaddr *)(isRTCP ? &mRTCPAddr : &mRTPAddr),
             sizeof(mRTCPAddr));
 
-#ifdef MTK_AOSP_ENHANCEMENT
-    if (n != (ssize_t)buffer->size()) {
-        ALOGE("sendto failed %d vs %d, errno %d", (int)n, (int)buffer->size(), errno);
-        return;
-    }
-#else
     CHECK_EQ(n, (ssize_t)buffer->size());
-#endif // #ifdef MTK_AOSP_ENHANCEMENT
 
 #if LOG_TO_FILES
     int fd = isRTCP ? mRTCPFd : mRTPFd;
@@ -429,8 +400,10 @@ void ARTPWriter::addSDES(const sp<ABuffer> &buffer) {
         switch (count) {
             case 3:
                 data[offset++] = 0;
+                [[fallthrough]];
             case 2:
                 data[offset++] = 0;
+                [[fallthrough]];
             case 1:
                 data[offset++] = 0;
         }
@@ -447,10 +420,10 @@ void ARTPWriter::addSDES(const sp<ABuffer> &buffer) {
 uint64_t ARTPWriter::GetNowNTP() {
     uint64_t nowUs = ALooper::GetNowUs();
 
-    nowUs += ((70ll * 365 + 17) * 24) * 60 * 60 * 1000000ll;
+    nowUs += ((70LL * 365 + 17) * 24) * 60 * 60 * 1000000LL;
 
-    uint64_t hi = nowUs / 1000000ll;
-    uint64_t lo = ((1ll << 32) * (nowUs % 1000000ll)) / 1000000ll;
+    uint64_t hi = nowUs / 1000000LL;
+    uint64_t lo = ((1LL << 32) * (nowUs % 1000000LL)) / 1000000LL;
 
     return (hi << 32) | lo;
 }
@@ -552,7 +525,7 @@ void ARTPWriter::dumpSessionDesc() {
     ALOGI("%s", sdp.c_str());
 }
 
-void ARTPWriter::makeH264SPropParamSets(MediaBuffer *buffer) {
+void ARTPWriter::makeH264SPropParamSets(MediaBufferBase *buffer) {
     static const char kStartCode[] = "\x00\x00\x00\x01";
 
     const uint8_t *data =
@@ -596,14 +569,14 @@ void ARTPWriter::sendBye() {
     send(buffer, true /* isRTCP */);
 }
 
-void ARTPWriter::sendAVCData(MediaBuffer *mediaBuf) {
+void ARTPWriter::sendAVCData(MediaBufferBase *mediaBuf) {
     // 12 bytes RTP header + 2 bytes for the FU-indicator and FU-header.
     CHECK_GE(kMaxPacketSize, 12u + 2u);
 
     int64_t timeUs;
-    CHECK(mediaBuf->meta_data()->findInt64(kKeyTime, &timeUs));
+    CHECK(mediaBuf->meta_data().findInt64(kKeyTime, &timeUs));
 
-    uint32_t rtpTime = mRTPTimeBase + (timeUs * 9 / 100ll);
+    uint32_t rtpTime = mRTPTimeBase + (timeUs * 9 / 100LL);
 
     const uint8_t *mediaData =
         (const uint8_t *)mediaBuf->data() + mediaBuf->range_offset();
@@ -692,13 +665,13 @@ void ARTPWriter::sendAVCData(MediaBuffer *mediaBuf) {
     mLastNTPTime = GetNowNTP();
 }
 
-void ARTPWriter::sendH263Data(MediaBuffer *mediaBuf) {
+void ARTPWriter::sendH263Data(MediaBufferBase *mediaBuf) {
     CHECK_GE(kMaxPacketSize, 12u + 2u);
 
     int64_t timeUs;
-    CHECK(mediaBuf->meta_data()->findInt64(kKeyTime, &timeUs));
+    CHECK(mediaBuf->meta_data().findInt64(kKeyTime, &timeUs));
 
-    uint32_t rtpTime = mRTPTimeBase + (timeUs * 9 / 100ll);
+    uint32_t rtpTime = mRTPTimeBase + (timeUs * 9 / 100LL);
 
     const uint8_t *mediaData =
         (const uint8_t *)mediaBuf->data() + mediaBuf->range_offset();
@@ -770,7 +743,7 @@ static size_t getFrameSize(bool isWide, unsigned FT) {
     return frameSize;
 }
 
-void ARTPWriter::sendAMRData(MediaBuffer *mediaBuf) {
+void ARTPWriter::sendAMRData(MediaBufferBase *mediaBuf) {
     const uint8_t *mediaData =
         (const uint8_t *)mediaBuf->data() + mediaBuf->range_offset();
 
@@ -781,7 +754,7 @@ void ARTPWriter::sendAMRData(MediaBuffer *mediaBuf) {
     const bool isWide = (mMode == AMR_WB);
 
     int64_t timeUs;
-    CHECK(mediaBuf->meta_data()->findInt64(kKeyTime, &timeUs));
+    CHECK(mediaBuf->meta_data().findInt64(kKeyTime, &timeUs));
     uint32_t rtpTime = mRTPTimeBase + (timeUs / (isWide ? 250 : 125));
 
     // hexdump(mediaData, mediaLength);
@@ -861,87 +834,5 @@ void ARTPWriter::sendAMRData(MediaBuffer *mediaBuf) {
     mLastNTPTime = GetNowNTP();
 }
 
-#ifdef MTK_AOSP_ENHANCEMENT
-void ARTPWriter::parseParams(MetaData *params) {
-    if (params != NULL) {
-        const char* target;
-        if (params->findCString(kKeyRTPTarget, &target)) {
-            const char *colonPos = strchr(target, ':');
-            int port = 5634;
-            AString s;
-            if (colonPos != NULL) {
-                s.setTo(target, colonPos - target);
-                port = atoi(colonPos + 1);
-            } else {
-                s.setTo(target);
-            }
-
-            if (!s.empty()) {
-                mRTPAddr.sin_addr.s_addr = inet_addr(s.c_str());
-                mRTPAddr.sin_port = htons(port);
-                mRTCPAddr = mRTPAddr;
-                mRTCPAddr.sin_port = htons(ntohs(mRTPAddr.sin_port) | 1);
-            }
-            ALOGI("rtp target %s = %s:%d", target, s.c_str(), port);
-        }
-    }
-}
-
-void ARTPWriter::sendMPEG4Data(MediaBuffer *mediaBuf) {
-    CHECK_GE(kMaxPacketSize, 12u + 2u);
-
-    int64_t timeUs;
-    CHECK(mediaBuf->meta_data()->findInt64(kKeyTime, &timeUs));
-
-    uint32_t rtpTime = mRTPTimeBase + (timeUs * 9 / 100ll);
-
-    const uint8_t *mediaData =
-        (const uint8_t *)mediaBuf->data() + mediaBuf->range_offset();
-
-    // hexdump(mediaData, mediaBuf->range_length());
-
-    size_t offset = 0;
-    size_t size = mediaBuf->range_length();
-
-    while (offset < size) {
-        sp<ABuffer> buffer = new ABuffer(kMaxPacketSize);
-
-        size_t remaining = size - offset;
-        bool lastPacket = (remaining + 12 <= buffer->capacity());
-        if (!lastPacket) {
-            remaining = buffer->capacity() - 12;
-        }
-
-        uint8_t *data = buffer->data();
-        data[0] = 0x80;
-        data[1] = (lastPacket ? 0x80 : 0x00) | PT;  // M-bit
-        data[2] = (mSeqNo >> 8) & 0xff;
-        data[3] = mSeqNo & 0xff;
-        data[4] = rtpTime >> 24;
-        data[5] = (rtpTime >> 16) & 0xff;
-        data[6] = (rtpTime >> 8) & 0xff;
-        data[7] = rtpTime & 0xff;
-        data[8] = mSourceID >> 24;
-        data[9] = (mSourceID >> 16) & 0xff;
-        data[10] = (mSourceID >> 8) & 0xff;
-        data[11] = mSourceID & 0xff;
-
-        memcpy(&data[12], &mediaData[offset], remaining);
-        offset += remaining;
-
-        buffer->setRange(0, remaining + 12);
-
-        send(buffer, false /* isRTCP */);
-
-        ++mSeqNo;
-        ++mNumRTPSent;
-        mNumRTPOctetsSent += buffer->size() - 12;
-    }
-
-    mLastRTPTime = rtpTime;
-    mLastNTPTime = GetNowNTP();
-}
-#endif // #ifdef MTK_AOSP_ENHANCEMENT
-
-
 }  // namespace android
+

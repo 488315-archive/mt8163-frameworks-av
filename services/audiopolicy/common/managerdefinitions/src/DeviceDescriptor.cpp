@@ -16,24 +16,42 @@
 
 #define LOG_TAG "APM::Devices"
 //#define LOG_NDEBUG 0
-#ifdef MTK_AUDIO
-//#define LOG_NDEBUG 0
-#endif
 
+#include <audio_utils/string.h>
+#include <media/TypeConverter.h>
+#include <set>
 #include "DeviceDescriptor.h"
+#include "TypeConverter.h"
 #include "AudioGain.h"
 #include "HwModule.h"
-#include "ConfigParsingUtils.h"
 
 namespace android {
 
-DeviceDescriptor::DeviceDescriptor(audio_devices_t type) :
+DeviceDescriptor::DeviceDescriptor(audio_devices_t type, const String8 &tagName) :
+        DeviceDescriptor(type, FormatVector{}, tagName)
+{
+}
+
+DeviceDescriptor::DeviceDescriptor(audio_devices_t type, const FormatVector &encodedFormats,
+        const String8 &tagName) :
     AudioPort(String8(""), AUDIO_PORT_TYPE_DEVICE,
               audio_is_output_device(type) ? AUDIO_PORT_ROLE_SINK :
                                              AUDIO_PORT_ROLE_SOURCE),
-    mTag(""), mAddress(""), mDeviceType(type), mId(0)
+    mTagName(tagName), mDeviceType(type), mEncodedFormats(encodedFormats)
 {
-
+    mCurrentEncodedFormat = AUDIO_FORMAT_DEFAULT;
+    if (audio_is_remote_submix_device(type)) {
+        mAddress = String8("0");
+    }
+    /* If framework runs against a pre 5.0 Audio HAL, encoded formats are absent from the config.
+     * FIXME: APM should know the version of the HAL and don't add the formats for V5.0.
+     * For now, the workaround to remove AC3 and IEC61937 support on HDMI is to declare
+     * something like 'encodedFormats="AUDIO_FORMAT_PCM_16_BIT"' on the HDMI devicePort.
+     */
+    if (type == AUDIO_DEVICE_OUT_HDMI && mEncodedFormats.isEmpty()) {
+        mEncodedFormats.add(AUDIO_FORMAT_AC3);
+        mEncodedFormats.add(AUDIO_FORMAT_IEC61937);
+    }
 }
 
 audio_port_handle_t DeviceDescriptor::getId() const
@@ -47,33 +65,63 @@ void DeviceDescriptor::attach(const sp<HwModule>& module)
     mId = getNextUniqueId();
 }
 
+void DeviceDescriptor::detach() {
+    mId = AUDIO_PORT_HANDLE_NONE;
+    AudioPort::detach();
+}
+
+template<typename T>
+bool checkEqual(const T& f1, const T& f2)
+{
+    std::set<typename T::value_type> s1(f1.begin(), f1.end());
+    std::set<typename T::value_type> s2(f2.begin(), f2.end());
+    return s1 == s2;
+}
+
 bool DeviceDescriptor::equals(const sp<DeviceDescriptor>& other) const
 {
     // Devices are considered equal if they:
     // - are of the same type (a device type cannot be AUDIO_DEVICE_NONE)
-    // - have the same address or one device does not specify the address
-    // - have the same channel mask or one device does not specify the channel mask
+    // - have the same address
+    // - have the same encodingFormats (if device supports encoding)
     if (other == 0) {
         return false;
     }
-    return (mDeviceType == other->mDeviceType) &&
-           (mAddress == "" || other->mAddress == "" || mAddress == other->mAddress) &&
-           (mChannelMask == 0 || other->mChannelMask == 0 ||
-                mChannelMask == other->mChannelMask);
+
+    return (mDeviceType == other->mDeviceType) && (mAddress == other->mAddress) &&
+           checkEqual(mEncodedFormats, other->mEncodedFormats);
 }
 
-void DeviceDescriptor::loadGains(cnode *root)
+bool DeviceDescriptor::hasCurrentEncodedFormat() const
 {
-    AudioPort::loadGains(root);
-    if (mGains.size() > 0) {
-        mGains[0]->getDefaultConfig(&mGain);
+    if (!device_has_encoding_capability(type())) {
+        return true;
     }
+    if (mEncodedFormats.isEmpty()) {
+        return true;
+    }
+
+    return (mCurrentEncodedFormat != AUDIO_FORMAT_DEFAULT);
+}
+
+bool DeviceDescriptor::supportsFormat(audio_format_t format)
+{
+    if (mEncodedFormats.isEmpty()) {
+        return true;
+    }
+
+    for (const auto& devFormat : mEncodedFormats) {
+        if (devFormat == format) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void DeviceVector::refreshTypes()
 {
     mDeviceTypes = AUDIO_DEVICE_NONE;
-    for(size_t i = 0; i < size(); i++) {
+    for (size_t i = 0; i < size(); i++) {
         mDeviceTypes |= itemAt(i)->type();
     }
     ALOGV("DeviceVector::refreshTypes() mDeviceTypes %08x", mDeviceTypes);
@@ -81,12 +129,25 @@ void DeviceVector::refreshTypes()
 
 ssize_t DeviceVector::indexOf(const sp<DeviceDescriptor>& item) const
 {
-    for(size_t i = 0; i < size(); i++) {
-        if (item->equals(itemAt(i))) {
+    for (size_t i = 0; i < size(); i++) {
+        if (itemAt(i)->equals(item)) { // item may be null sp<>, i.e. AUDIO_DEVICE_NONE
             return i;
         }
     }
     return -1;
+}
+
+void DeviceVector::add(const DeviceVector &devices)
+{
+    bool added = false;
+    for (const auto& device : devices) {
+        if (indexOf(device) < 0 && SortedVector::add(device) >= 0) {
+            added = true;
+        }
+    }
+    if (added) {
+        refreshTypes();
+    }
 }
 
 ssize_t DeviceVector::add(const sp<DeviceDescriptor>& item)
@@ -107,7 +168,6 @@ ssize_t DeviceVector::add(const sp<DeviceDescriptor>& item)
 
 ssize_t DeviceVector::remove(const sp<DeviceDescriptor>& item)
 {
-    size_t i;
     ssize_t ret = indexOf(item);
 
     if (ret < 0) {
@@ -121,164 +181,124 @@ ssize_t DeviceVector::remove(const sp<DeviceDescriptor>& item)
     return ret;
 }
 
-audio_devices_t DeviceVector::getDevicesFromHwModule(audio_module_handle_t moduleHandle) const
+void DeviceVector::remove(const DeviceVector &devices)
 {
-    audio_devices_t devices = AUDIO_DEVICE_NONE;
-    for (size_t i = 0; i < size(); i++) {
-        if (itemAt(i)->getModuleHandle() == moduleHandle) {
-            devices |= itemAt(i)->type();
+    for (const auto& device : devices) {
+        remove(device);
+    }
+}
+
+DeviceVector DeviceVector::getDevicesFromHwModule(audio_module_handle_t moduleHandle) const
+{
+    DeviceVector devices;
+    for (const auto& device : *this) {
+        if (device->getModuleHandle() == moduleHandle) {
+            devices.add(device);
         }
     }
     return devices;
 }
 
-void DeviceVector::loadDevicesFromType(audio_devices_t types)
+audio_devices_t DeviceVector::getDeviceTypesFromHwModule(audio_module_handle_t moduleHandle) const
 {
-    DeviceVector deviceList;
-
-    uint32_t role_bit = AUDIO_DEVICE_BIT_IN & types;
-    types &= ~role_bit;
-
-    while (types) {
-        uint32_t i = 31 - __builtin_clz(types);
-        uint32_t type = 1 << i;
-        types &= ~type;
-        add(new DeviceDescriptor(type | role_bit));
+    audio_devices_t deviceTypes = AUDIO_DEVICE_NONE;
+    for (const auto& device : *this) {
+        if (device->getModuleHandle() == moduleHandle) {
+            deviceTypes |= device->type();
+        }
     }
+    return deviceTypes;
 }
 
-void DeviceVector::loadDevicesFromTag(char *tag,
-                                       const DeviceVector& declaredDevices)
-{
-    char *devTag = strtok(tag, "|");
-    while (devTag != NULL) {
-        if (strlen(devTag) != 0) {
-            audio_devices_t type = ConfigParsingUtils::stringToEnum(sDeviceTypeToEnumTable,
-                                 ARRAY_SIZE(sDeviceTypeToEnumTable),
-                                 devTag);
-#if defined(MTK_AUDIO)&&defined(DISABLE_EARPIECE)
-            if (type == AUDIO_DEVICE_OUT_EARPIECE) {
-                devTag = strtok(NULL, "|");
-                continue;
-            }
-#endif
-            if (type != AUDIO_DEVICE_NONE) {
-                sp<DeviceDescriptor> dev = new DeviceDescriptor(type);
-                if (type == AUDIO_DEVICE_IN_REMOTE_SUBMIX ||
-                        type == AUDIO_DEVICE_OUT_REMOTE_SUBMIX ) {
-                    dev->mAddress = String8("0");
-                }
-                add(dev);
-            } else {
-                sp<DeviceDescriptor> deviceDesc =
-                        declaredDevices.getDeviceFromTag(String8(devTag));
-                if (deviceDesc != 0) {
-                    add(deviceDesc);
-                }
-            }
-         }
-         devTag = strtok(NULL, "|");
-     }
-}
-
-sp<DeviceDescriptor> DeviceVector::getDevice(audio_devices_t type, String8 address) const
+sp<DeviceDescriptor> DeviceVector::getDevice(audio_devices_t type, const String8& address,
+                                             audio_format_t format) const
 {
     sp<DeviceDescriptor> device;
     for (size_t i = 0; i < size(); i++) {
         if (itemAt(i)->type() == type) {
-            if (address == "" || itemAt(i)->mAddress == address) {
+            // If format is specified, match it and ignore address
+            // Otherwise if address is specified match it
+            // Otherwise always match
+            if (((address == "" || itemAt(i)->address() == address) &&
+                 format == AUDIO_FORMAT_DEFAULT) ||
+                (itemAt(i)->supportsFormat(format) && format != AUDIO_FORMAT_DEFAULT)) {
                 device = itemAt(i);
-                if (itemAt(i)->mAddress == address) {
+                if (itemAt(i)->address() == address) {
                     break;
                 }
             }
         }
     }
-    ALOGV("DeviceVector::getDevice() for type %08x address %s found %p",
-          type, address.string(), device.get());
+    ALOGV("DeviceVector::%s() for type %08x address \"%s\" found %p format %08x",
+            __func__, type, address.string(), device.get(), format);
     return device;
 }
 
 sp<DeviceDescriptor> DeviceVector::getDeviceFromId(audio_port_handle_t id) const
 {
-    sp<DeviceDescriptor> device;
-    for (size_t i = 0; i < size(); i++) {
-        if (itemAt(i)->getId() == id) {
-            device = itemAt(i);
-            break;
+    if (id != AUDIO_PORT_HANDLE_NONE) {
+        for (const auto& device : *this) {
+            if (device->getId() == id) {
+                return device;
+            }
         }
     }
-    return device;
+    return nullptr;
 }
 
-DeviceVector DeviceVector::getDevicesFromType(audio_devices_t type) const
+DeviceVector DeviceVector::getDevicesFromTypeMask(audio_devices_t type) const
 {
     DeviceVector devices;
     bool isOutput = audio_is_output_devices(type);
     type &= ~AUDIO_DEVICE_BIT_IN;
     for (size_t i = 0; (i < size()) && (type != AUDIO_DEVICE_NONE); i++) {
-        bool curIsOutput = audio_is_output_devices(itemAt(i)->mDeviceType);
-        audio_devices_t curType = itemAt(i)->mDeviceType & ~AUDIO_DEVICE_BIT_IN;
+        bool curIsOutput = audio_is_output_devices(itemAt(i)->type());
+        audio_devices_t curType = itemAt(i)->type() & ~AUDIO_DEVICE_BIT_IN;
         if ((isOutput == curIsOutput) && ((type & curType) != 0)) {
             devices.add(itemAt(i));
             type &= ~curType;
-            ALOGV("DeviceVector::getDevicesFromType() for type %x found %p",
-                  itemAt(i)->type(), itemAt(i).get());
+            ALOGV("DeviceVector::%s() for type %08x found %p",
+                    __func__, itemAt(i)->type(), itemAt(i).get());
         }
     }
     return devices;
 }
 
-DeviceVector DeviceVector::getDevicesFromTypeAddr(
-        audio_devices_t type, String8 address) const
+sp<DeviceDescriptor> DeviceVector::getDeviceFromTagName(const String8 &tagName) const
 {
-    DeviceVector devices;
-    for (size_t i = 0; i < size(); i++) {
-        if (itemAt(i)->type() == type) {
-            if (itemAt(i)->mAddress == address) {
-                devices.add(itemAt(i));
-            }
+    for (const auto& device : *this) {
+        if (device->getTagName() == tagName) {
+            return device;
         }
     }
-    return devices;
+    return nullptr;
 }
 
-sp<DeviceDescriptor> DeviceVector::getDeviceFromTag(const String8& tag) const
+void DeviceVector::dump(String8 *dst, const String8 &tag, int spaces, bool verbose) const
 {
-    sp<DeviceDescriptor> device;
-    for (size_t i = 0; i < size(); i++) {
-        if (itemAt(i)->mTag == tag) {
-            device = itemAt(i);
-            break;
-        }
+    if (isEmpty()) {
+        return;
     }
-    return device;
-}
-
-
-status_t DeviceVector::dump(int fd, const String8 &direction) const
-{
-    const size_t SIZE = 256;
-    char buffer[SIZE];
-
-    snprintf(buffer, SIZE, "\n Available %s devices:\n", direction.string());
-    write(fd, buffer, strlen(buffer));
+    dst->appendFormat("%*s- %s devices:\n", spaces, "", tag.string());
     for (size_t i = 0; i < size(); i++) {
-        itemAt(i)->dump(fd, 2, i);
+        itemAt(i)->dump(dst, spaces + 2, i, verbose);
     }
-    return NO_ERROR;
-}
-
-audio_policy_dev_state_t DeviceVector::getDeviceConnectionState(const sp<DeviceDescriptor> &devDesc) const
-{
-    ssize_t index = indexOf(devDesc);
-    return index >= 0 ? AUDIO_POLICY_DEVICE_STATE_AVAILABLE : AUDIO_POLICY_DEVICE_STATE_UNAVAILABLE;
 }
 
 void DeviceDescriptor::toAudioPortConfig(struct audio_port_config *dstConfig,
                                          const struct audio_port_config *srcConfig) const
 {
-    dstConfig->config_mask = AUDIO_PORT_CONFIG_CHANNEL_MASK|AUDIO_PORT_CONFIG_GAIN;
+    dstConfig->config_mask = AUDIO_PORT_CONFIG_GAIN;
+    if (mSamplingRate != 0) {
+        dstConfig->config_mask |= AUDIO_PORT_CONFIG_SAMPLE_RATE;
+    }
+    if (mChannelMask != AUDIO_CHANNEL_NONE) {
+        dstConfig->config_mask |= AUDIO_PORT_CONFIG_CHANNEL_MASK;
+    }
+    if (mFormat != AUDIO_FORMAT_INVALID) {
+        dstConfig->config_mask |= AUDIO_PORT_CONFIG_FORMAT;
+    }
+
     if (srcConfig != NULL) {
         dstConfig->config_mask |= srcConfig->config_mask;
     }
@@ -295,65 +315,109 @@ void DeviceDescriptor::toAudioPortConfig(struct audio_port_config *dstConfig,
     // without the test?
     // This has been demonstrated to NOT be true (at start up)
     // ALOG_ASSERT(mModule != NULL);
-    dstConfig->ext.device.hw_module = mModule != 0 ? mModule->mHandle : AUDIO_IO_HANDLE_NONE;
-    strncpy(dstConfig->ext.device.address, mAddress.string(), AUDIO_DEVICE_MAX_ADDRESS_LEN);
+    dstConfig->ext.device.hw_module = getModuleHandle();
+    (void)audio_utils_strlcpy_zerofill(dstConfig->ext.device.address, mAddress.string());
 }
 
 void DeviceDescriptor::toAudioPort(struct audio_port *port) const
 {
-    ALOGV("DeviceDescriptor::toAudioPort() handle %d type %x", mId, mDeviceType);
+    ALOGV("DeviceDescriptor::toAudioPort() handle %d type %08x", mId, mDeviceType);
     AudioPort::toAudioPort(port);
     port->id = mId;
     toAudioPortConfig(&port->active_config);
     port->ext.device.type = mDeviceType;
-    port->ext.device.hw_module = mModule->mHandle;
-    strncpy(port->ext.device.address, mAddress.string(), AUDIO_DEVICE_MAX_ADDRESS_LEN);
+    port->ext.device.hw_module = getModuleHandle();
+    (void)audio_utils_strlcpy_zerofill(port->ext.device.address, mAddress.string());
 }
 
-void DeviceDescriptor::importAudioPort(const sp<AudioPort> port) {
+void DeviceDescriptor::importAudioPort(const sp<AudioPort>& port, bool force) {
+    if (!force && !port->hasDynamicAudioProfile()) {
+        return;
+    }
     AudioPort::importAudioPort(port);
-    mSamplingRate = port->pickSamplingRate();
-    mFormat = port->pickFormat();
-    mChannelMask = port->pickChannelMask();
+    port->pickAudioProfile(mSamplingRate, mChannelMask, mFormat);
 }
 
-status_t DeviceDescriptor::dump(int fd, int spaces, int index) const
+void DeviceDescriptor::dump(String8 *dst, int spaces, int index, bool verbose) const
 {
-    const size_t SIZE = 256;
-    char buffer[SIZE];
-    String8 result;
-
-    snprintf(buffer, SIZE, "%*sDevice %d:\n", spaces, "", index+1);
-    result.append(buffer);
+    dst->appendFormat("%*sDevice %d:\n", spaces, "", index + 1);
     if (mId != 0) {
-        snprintf(buffer, SIZE, "%*s- id: %2d\n", spaces, "", mId);
-        result.append(buffer);
+        dst->appendFormat("%*s- id: %2d\n", spaces, "", mId);
     }
-    snprintf(buffer, SIZE, "%*s- type: %-48s\n", spaces, "",
-            ConfigParsingUtils::enumToString(sDeviceTypeToEnumTable,
-                    ARRAY_SIZE(sDeviceTypeToEnumTable),
-                    mDeviceType));
-    result.append(buffer);
-    if (mAddress.size() != 0) {
-        snprintf(buffer, SIZE, "%*s- address: %-32s\n", spaces, "", mAddress.string());
-        result.append(buffer);
+    if (!mTagName.isEmpty()) {
+        dst->appendFormat("%*s- tag name: %s\n", spaces, "", mTagName.string());
     }
-    write(fd, result.string(), result.size());
-    AudioPort::dump(fd, spaces);
 
-    return NO_ERROR;
+    dst->appendFormat("%*s- type: %-48s\n", spaces, "", ::android::toString(mDeviceType).c_str());
+
+    if (mAddress.size() != 0) {
+        dst->appendFormat("%*s- address: %-32s\n", spaces, "", mAddress.string());
+    }
+    AudioPort::dump(dst, spaces, verbose);
+}
+
+std::string DeviceDescriptor::toString() const
+{
+    std::stringstream sstream;
+    sstream << "type:0x" << std::hex << type() << ",@:" << mAddress;
+    return sstream.str();
+}
+
+std::string DeviceVector::toString() const
+{
+    if (isEmpty()) {
+        return {"AUDIO_DEVICE_NONE"};
+    }
+    std::string result = {"{"};
+    for (const auto &device : *this) {
+        if (device != *begin()) {
+           result += ";";
+        }
+        result += device->toString();
+    }
+    return result + "}";
+}
+
+DeviceVector DeviceVector::filter(const DeviceVector &devices) const
+{
+    DeviceVector filteredDevices;
+    for (const auto &device : *this) {
+        if (devices.contains(device)) {
+            filteredDevices.add(device);
+        }
+    }
+    return filteredDevices;
+}
+
+bool DeviceVector::containsAtLeastOne(const DeviceVector &devices) const
+{
+    return !filter(devices).isEmpty();
+}
+
+bool DeviceVector::containsAllDevices(const DeviceVector &devices) const
+{
+    return filter(devices).size() == devices.size();
+}
+
+DeviceVector DeviceVector::filterForEngine() const
+{
+    DeviceVector filteredDevices;
+    for (const auto &device : *this) {
+        if (audio_is_remote_submix_device(device->type()) && device->address() != "0") {
+            continue;
+        }
+        filteredDevices.add(device);
+    }
+    return filteredDevices;
 }
 
 void DeviceDescriptor::log() const
 {
-    ALOGI("Device id:%d type:0x%X:%s, addr:%s",
-          mId,
-          mDeviceType,
-          ConfigParsingUtils::enumToString(
-             sDeviceNameToEnumTable, ARRAY_SIZE(sDeviceNameToEnumTable), mDeviceType),
+    ALOGI("Device id:%d type:0x%08X:%s, addr:%s", mId,  mDeviceType,
+          ::android::toString(mDeviceType).c_str(),
           mAddress.string());
 
     AudioPort::log("  ");
 }
 
-}; // namespace android
+} // namespace android

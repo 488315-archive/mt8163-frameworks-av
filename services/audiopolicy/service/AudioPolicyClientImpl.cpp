@@ -1,9 +1,4 @@
 /*
-* Copyright (C) 2014 MediaTek Inc.
-* Modification based on code covered by the mentioned copyright
-* and/or permission notice(s).
-*/
-/*
  * Copyright (C) 2009 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -35,7 +30,7 @@ audio_module_handle_t AudioPolicyService::AudioPolicyClient::loadHwModule(const 
     sp<IAudioFlinger> af = AudioSystem::get_audio_flinger();
     if (af == 0) {
         ALOGW("%s: could not get AudioFlinger", __func__);
-        return 0;
+        return AUDIO_MODULE_HANDLE_NONE;
     }
 
     return af->loadHwModule(name);
@@ -142,7 +137,7 @@ status_t AudioPolicyService::AudioPolicyClient::invalidateStream(audio_stream_ty
     if (af == 0) {
         return PERMISSION_DENIED;
     }
-
+    ALOGD("%s: type %d", __func__, stream);
     return af->invalidateStream(stream);
 }
 
@@ -160,23 +155,12 @@ String8 AudioPolicyService::AudioPolicyClient::getParameters(audio_io_handle_t i
     return result;
 }
 
-status_t AudioPolicyService::AudioPolicyClient::startTone(audio_policy_tone_t tone,
-              audio_stream_type_t stream)
-{
-    return mAudioPolicyService->startTone(tone, stream);
-}
-
-status_t AudioPolicyService::AudioPolicyClient::stopTone()
-{
-    return mAudioPolicyService->stopTone();
-}
-
 status_t AudioPolicyService::AudioPolicyClient::setVoiceVolume(float volume, int delay_ms)
 {
     return mAudioPolicyService->setVoiceVolume(volume, delay_ms);
 }
 
-status_t AudioPolicyService::AudioPolicyClient::moveEffects(int session,
+status_t AudioPolicyService::AudioPolicyClient::moveEffects(audio_session_t session,
                         audio_io_handle_t src_output,
                         audio_io_handle_t dst_output)
 {
@@ -186,6 +170,13 @@ status_t AudioPolicyService::AudioPolicyClient::moveEffects(int session,
     }
 
     return af->moveEffects(session, src_output, dst_output);
+}
+
+void AudioPolicyService::AudioPolicyClient::setEffectSuspended(int effectId,
+                                audio_session_t sessionId,
+                                bool suspended)
+{
+    mAudioPolicyService->setEffectSuspended(effectId, sessionId, suspended);
 }
 
 status_t AudioPolicyService::AudioPolicyClient::createAudioPatch(const struct audio_patch *patch,
@@ -224,18 +215,34 @@ void AudioPolicyService::AudioPolicyClient::onDynamicPolicyMixStateUpdate(
     mAudioPolicyService->onDynamicPolicyMixStateUpdate(regId, state);
 }
 
-audio_unique_id_t AudioPolicyService::AudioPolicyClient::newAudioUniqueId()
+void AudioPolicyService::AudioPolicyClient::onRecordingConfigurationUpdate(
+                                                    int event,
+                                                    const record_client_info_t *clientInfo,
+                                                    const audio_config_base_t *clientConfig,
+                                                    std::vector<effect_descriptor_t> clientEffects,
+                                                    const audio_config_base_t *deviceConfig,
+                                                    std::vector<effect_descriptor_t> effects,
+                                                    audio_patch_handle_t patchHandle,
+                                                    audio_source_t source)
 {
-    return AudioSystem::newAudioUniqueId();
+    mAudioPolicyService->onRecordingConfigurationUpdate(event, clientInfo,
+            clientConfig, clientEffects, deviceConfig, effects, patchHandle, source);
+}
+
+void AudioPolicyService::AudioPolicyClient::onAudioVolumeGroupChanged(volume_group_t group,
+                                                                      int flags)
+{
+    mAudioPolicyService->onAudioVolumeGroupChanged(group, flags);
+}
+
+audio_unique_id_t AudioPolicyService::AudioPolicyClient::newAudioUniqueId(audio_unique_id_use_t use)
+{
+    return AudioSystem::newAudioUniqueId(use);
 }
 
 status_t AudioPolicyService::AudioPolicyClient::getCustomAudioVolume(void* pCustomVol)
 {
-#ifdef MTK_AUDIO
-    return mAudioPolicyService->getCustomAudioVolume(pCustomVol);
-#else
-    return INVALID_OPERATION;
-#endif
+    return mAudioPolicyService->getCustomAudioVolume(pCustomVol);   // MTK_AUDIO_GAIN_TABLE
 }
 
-}; // namespace android
+} // namespace android

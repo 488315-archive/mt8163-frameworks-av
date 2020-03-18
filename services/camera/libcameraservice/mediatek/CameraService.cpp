@@ -7,9 +7,9 @@
  * reproduction, modification, use or disclosure of MediaTek Software, and
  * information contained herein, in whole or in part, shall be strictly
  * prohibited.
- * 
+ *
  * MediaTek Inc. (C) 2010. All rights reserved.
- * 
+ *
  * BY OPENING THIS FILE, RECEIVER HEREBY UNEQUIVOCALLY ACKNOWLEDGES AND AGREES
  * THAT THE SOFTWARE/FIRMWARE AND ITS DOCUMENTATIONS ("MEDIATEK SOFTWARE")
  * RECEIVED FROM MEDIATEK AND/OR ITS REPRESENTATIVES ARE PROVIDED TO RECEIVER
@@ -58,59 +58,50 @@
 #include "CameraService.h"
 //
 #include <dlfcn.h>
+#include <media/mediaplayer.h>
 
 
 namespace android {
 
+using binder::Status;
+
+// Convenience methods for constructing binder::Status objects for error returns
+#define STATUS_ERROR_FMT(errorCode, errorString, ...) \
+    binder::Status::fromServiceSpecificError(errorCode, \
+            String8::format("%s:%d: " errorString, __FUNCTION__, __LINE__, __VA_ARGS__))
 
 /******************************************************************************
  *
  ******************************************************************************/
-status_t
+Status
 CameraService::
-getProperty(String8 const& key, String8& value) const
+getProperty(const String16& key, String16* value/*out*/)
 {
-    char const* sym = "MtkCam_getProperty";
-    void* pfn = ::dlsym(mModule->getDso(), sym);
-    if  ( ! pfn ) {
-        ALOGW("Cannot find symbol: %s", sym);
-        return  INVALID_OPERATION;
-    }
-    return  reinterpret_cast<status_t(*)(String8 const&, String8&)>(pfn)(key, value);
+    String8 s8Key(key);
+    String8 s8Value;
+    status_t res = mCameraProviderManager->getProperty(s8Key, s8Value);
+    *value = String16(const_cast<const String8&>(s8Value));
+
+    return (res == OK)?
+            Status::ok() :
+            STATUS_ERROR_FMT( ERROR_INVALID_OPERATION,
+                              "Error getProperty: %d (%s)", res, strerror(-res) );
 }
-
-
 /******************************************************************************
  *
  ******************************************************************************/
-status_t
+Status
 CameraService::
-setProperty(String8 const& key, String8 const& value)
+setProperty(const String16& key, const String16& value)
 {
-    char const* sym = "MtkCam_setProperty";
-    void* pfn = ::dlsym(mModule->getDso(), sym);
-    if  ( ! pfn ) {
-        ALOGW("Cannot find symbol: %s", sym);
-        return  INVALID_OPERATION;
-    }
-    return  reinterpret_cast<status_t(*)(String8 const&, String8 const&)>(pfn)(key, value);
-}
+    String8 s8Key(key);
+    String8 s8Value(value);
+    status_t res = mCameraProviderManager->setProperty(s8Key, s8Value);
 
-
-/******************************************************************************
- *
- ******************************************************************************/
-status_t
-CameraService::
-getExternalDeviceListener(/*out*/sp<IBinder>& listener)
-{
-    char const* sym = "MtkCam_getExternalDeviceListener";
-    void* pfn = ::dlsym(mModule->getDso(), sym);
-    if  ( ! pfn ) {
-        ALOGW("Cannot find symbol: %s", sym);
-        return  INVALID_OPERATION;
-    }
-    return  reinterpret_cast<status_t(*)(sp<IBinder>& listener)>(pfn)(listener);
+    return (res == OK)?
+            Status::ok() :
+            STATUS_ERROR_FMT( ERROR_INVALID_OPERATION,
+                              "Error setProperty: %d (%s)", res, strerror(-res) );
 }
 
 };

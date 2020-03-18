@@ -32,27 +32,32 @@
 #include <utils/Trace.h>
 #include <system/audio.h>
 #ifdef FAST_THREAD_STATISTICS
-#include <cpustats/CentralTendencyStatistics.h>
+#include <audio_utils/Statistics.h>
 #ifdef CPU_FREQUENCY_STATISTICS
 #include <cpustats/ThreadCpuUsage.h>
 #endif
 #endif
+#include <audio_utils/channels.h>
 #include <audio_utils/format.h>
-#include "AudioMixer.h"
+#include <audio_utils/mono_blend.h>
+#include <media/AudioMixer.h>
 #include "FastMixer.h"
+#include "TypedLogger.h"
 
-#ifdef MTK_AUDIO
-#include <audio_utils/pulse.h>
-#endif
+#if defined(MTK_LATENCY_DETECT_PULSE)
+#include "AudioDetectPulse.h"
+#endif // MTK_LATENCY_DETECT_PULSE
 
-#define FCC_2                       2   // fixed channel count assumption
+// <MTK_AUDIOMIXER_ENABLE_DRC
+#include <media/AudioUtilmtk.h>
+// MTK_AUDIOMIXER_ENABLE_DRC>
 
 namespace android {
 
 /*static*/ const FastMixerState FastMixer::sInitial;
 
-FastMixer::FastMixer() : FastThread(),
-    mSlopNs(0),
+FastMixer::FastMixer(audio_io_handle_t parentIoHandle)
+    : FastThread("cycle_ms", "load_us"),
     // mFastTrackNames
     // mGenerations
     mOutputSink(NULL),
@@ -63,15 +68,23 @@ FastMixer::FastMixer() : FastThread(),
     mSinkChannelCount(FCC_2),
     mMixerBuffer(NULL),
     mMixerBufferSize(0),
-    mMixerBufferFormat(AUDIO_FORMAT_PCM_16_BIT),
     mMixerBufferState(UNDEFINED),
     mFormat(Format_Invalid),
     mSampleRate(0),
     mFastTracksGen(0),
     mTotalNativeFramesWritten(0),
     // timestamp
-    mNativeFramesWrittenButNotPresented(0)   // the = 0 is to silence the compiler
+    mNativeFramesWrittenButNotPresented(0),   // the = 0 is to silence the compiler
+    mMasterMono(false),
+    mThreadIoHandle(parentIoHandle),
+// <MTK_AUDIOMIXER_ENABLE_DRC // ALPS04408933 low latency support drc
+    mDRCEnableGen(0),
+    mUpdateACFHCFParamGen(0),
+    mUpdateCustomSceneParamGen(0)
+// MTK_AUDIOMIXER_ENABLE_DRC>
 {
+    (void)mThreadIoHandle; // prevent unused warning, see C++17 [[maybe_unused]]
+
     // FIXME pass sInitial as parameter to base class constructor, and make it static local
     mPrevious = &sInitial;
     mCurrent = &sInitial;
@@ -82,8 +95,7 @@ FastMixer::FastMixer() : FastThread(),
     mSinkChannelMask = audio_channel_out_mask_from_count(mSinkChannelCount);
 
     unsigned i;
-    for (i = 0; i < FastMixerState::kMaxFastTracks; ++i) {
-        mFastTrackNames[i] = -1;
+    for (i = 0; i < FastMixerState::sMaxFastTracks; ++i) {
         mGenerations[i] = 0;
     }
 #ifdef FAST_THREAD_STATISTICS
@@ -106,10 +118,12 @@ const FastThreadState *FastMixer::poll()
     return mSQ.poll();
 }
 
-void FastMixer::setLog(NBLog::Writer *logWriter)
+void FastMixer::setNBLogWriter(NBLog::Writer *logWriter)
 {
+    // FIXME If mMixer is set or changed prior to this, we don't inform correctly.
+    //       Should cache logWriter and re-apply it at the assignment to mMixer.
     if (mMixer != NULL) {
-        mMixer->setLog(logWriter);
+        mMixer->setNBLogWriter(logWriter);
     }
 }
 
@@ -138,12 +152,85 @@ bool FastMixer::isSubClassCommand(FastThreadState::Command command)
     }
 }
 
+void FastMixer::updateMixerTrack(int index, Reason reason) {
+    const FastMixerState * const current = (const FastMixerState *) mCurrent;
+    const FastTrack * const fastTrack = &current->mFastTracks[index];
+
+    // check and update generation
+    if (reason == REASON_MODIFY && mGenerations[index] == fastTrack->mGeneration) {
+        return; // no change on an already configured track.
+    }
+    mGenerations[index] = fastTrack->mGeneration;
+
+    // mMixer == nullptr on configuration failure (check done after generation update).
+    if (mMixer == nullptr) {
+        return;
+    }
+
+    switch (reason) {
+    case REASON_REMOVE:
+        mMixer->destroy(index);
+        break;
+    case REASON_ADD: {
+        const status_t status = mMixer->create(
+                index, fastTrack->mChannelMask, fastTrack->mFormat, AUDIO_SESSION_OUTPUT_MIX);
+        LOG_ALWAYS_FATAL_IF(status != NO_ERROR,
+                "%s: cannot create fast track index"
+                " %d, mask %#x, format %#x in AudioMixer",
+                __func__, index, fastTrack->mChannelMask, fastTrack->mFormat);
+    }
+        [[fallthrough]];  // now fallthrough to update the newly created track.
+    case REASON_MODIFY:
+        mMixer->setBufferProvider(index, fastTrack->mBufferProvider);
+
+        float vlf, vrf;
+        if (fastTrack->mVolumeProvider != nullptr) {
+            const gain_minifloat_packed_t vlr = fastTrack->mVolumeProvider->getVolumeLR();
+            vlf = float_from_gain(gain_minifloat_unpack_left(vlr));
+            vrf = float_from_gain(gain_minifloat_unpack_right(vlr));
+        } else {
+            vlf = vrf = AudioMixer::UNITY_GAIN_FLOAT;
+        }
+
+        // set volume to avoid ramp whenever the track is updated (or created).
+        // Note: this does not distinguish from starting fresh or
+        // resuming from a paused state.
+        mMixer->setParameter(index, AudioMixer::VOLUME, AudioMixer::VOLUME0, &vlf);
+        mMixer->setParameter(index, AudioMixer::VOLUME, AudioMixer::VOLUME1, &vrf);
+
+        mMixer->setParameter(index, AudioMixer::RESAMPLE, AudioMixer::REMOVE, nullptr);
+        mMixer->setParameter(index, AudioMixer::TRACK, AudioMixer::MAIN_BUFFER,
+                (void *)mMixerBuffer);
+        mMixer->setParameter(index, AudioMixer::TRACK, AudioMixer::MIXER_FORMAT,
+                (void *)(uintptr_t)mMixerBufferFormat);
+        mMixer->setParameter(index, AudioMixer::TRACK, AudioMixer::FORMAT,
+                (void *)(uintptr_t)fastTrack->mFormat);
+        mMixer->setParameter(index, AudioMixer::TRACK, AudioMixer::CHANNEL_MASK,
+                (void *)(uintptr_t)fastTrack->mChannelMask);
+        mMixer->setParameter(index, AudioMixer::TRACK, AudioMixer::MIXER_CHANNEL_MASK,
+                (void *)(uintptr_t)mSinkChannelMask);
+        mMixer->setParameter(index, AudioMixer::TRACK, AudioMixer::HAPTIC_ENABLED,
+                (void *)(uintptr_t)fastTrack->mHapticPlaybackEnabled);
+        mMixer->setParameter(index, AudioMixer::TRACK, AudioMixer::HAPTIC_INTENSITY,
+                (void *)(uintptr_t)fastTrack->mHapticIntensity);
+
+        mMixer->enable(index);
+        break;
+    default:
+        LOG_ALWAYS_FATAL("%s: invalid update reason %d", __func__, reason);
+    }
+}
+
 void FastMixer::onStateChange()
 {
     const FastMixerState * const current = (const FastMixerState *) mCurrent;
     const FastMixerState * const previous = (const FastMixerState *) mPrevious;
     FastMixerDumpState * const dumpState = (FastMixerDumpState *) mDumpState;
     const size_t frameCount = current->mFrameCount;
+
+    // update boottime offset, in case it has changed
+    mTimestamp.mTimebaseOffset[ExtendedTimestamp::TIMEBASE_BOOTTIME] =
+            mBoottimeOffset.load();
 
     // handle state change here, but since we want to diff the state,
     // we're prepared for previous == &sInitial the first time through
@@ -154,20 +241,25 @@ void FastMixer::onStateChange()
     if (current->mOutputSinkGen != mOutputSinkGen) {
         mOutputSink = current->mOutputSink;
         mOutputSinkGen = current->mOutputSinkGen;
+        mSinkChannelMask = current->mSinkChannelMask;
+        mBalance.setChannelMask(mSinkChannelMask);
         if (mOutputSink == NULL) {
             mFormat = Format_Invalid;
             mSampleRate = 0;
             mSinkChannelCount = 0;
             mSinkChannelMask = AUDIO_CHANNEL_NONE;
+            mAudioChannelCount = 0;
         } else {
             mFormat = mOutputSink->format();
             mSampleRate = Format_sampleRate(mFormat);
             mSinkChannelCount = Format_channelCount(mFormat);
             LOG_ALWAYS_FATAL_IF(mSinkChannelCount > AudioMixer::MAX_NUM_CHANNELS);
 
-            // TODO: Add channel mask to NBAIO_Format
-            // We assume that the channel mask must be a valid positional channel mask.
-            mSinkChannelMask = audio_channel_out_mask_from_count(mSinkChannelCount);
+            if (mSinkChannelMask == AUDIO_CHANNEL_NONE) {
+                mSinkChannelMask = audio_channel_out_mask_from_count(mSinkChannelCount);
+            }
+            mAudioChannelCount = mSinkChannelCount - audio_channel_count_from_out_mask(
+                    mSinkChannelMask & AUDIO_CHANNEL_HAPTIC_ALL);
         }
         dumpState->mSampleRate = mSampleRate;
     }
@@ -181,14 +273,15 @@ void FastMixer::onStateChange()
         free(mSinkBuffer);
         mSinkBuffer = NULL;
         if (frameCount > 0 && mSampleRate > 0) {
-            // The mixer produces either 16 bit PCM or float output, select
-            // float output if the HAL supports higher than 16 bit precision.
-            mMixerBufferFormat = mFormat.mFormat == AUDIO_FORMAT_PCM_16_BIT ?
-                    AUDIO_FORMAT_PCM_16_BIT : AUDIO_FORMAT_PCM_FLOAT;
             // FIXME new may block for unbounded time at internal mutex of the heap
             //       implementation; it would be better to have normal mixer allocate for us
             //       to avoid blocking here and to prevent possible priority inversion
-            mMixer = new AudioMixer(frameCount, mSampleRate, FastMixerState::kMaxFastTracks);
+            mMixer = new AudioMixer(frameCount, mSampleRate);
+            // FIXME See the other FIXME at FastMixer::setNBLogWriter()
+            NBLog::thread_params_t params;
+            params.frameCount = frameCount;
+            params.sampleRate = mSampleRate;
+            LOG_THREAD_PARAMS(params);
             const size_t mixerFrameSize = mSinkChannelCount
                     * audio_bytes_per_sample(mMixerBufferFormat);
             mMixerBufferSize = mixerFrameSize * frameCount;
@@ -214,15 +307,14 @@ void FastMixer::onStateChange()
             mWarmupNsMax = LONG_MAX;
         }
         mMixerBufferState = UNDEFINED;
-#if !LOG_NDEBUG
-        for (unsigned i = 0; i < FastMixerState::kMaxFastTracks; ++i) {
-            mFastTrackNames[i] = -1;
-        }
-#endif
         // we need to reconfigure all active tracks
         previousTrackMask = 0;
         mFastTracksGen = current->mFastTracksGen - 1;
         dumpState->mFrameCount = frameCount;
+#ifdef TEE_SINK
+        mTee.set(mFormat, NBAIO_Tee::TEE_FLAG_OUTPUT_THREAD);
+        mTee.setId(std::string("_") + std::to_string(mThreadIoHandle) + "_F");
+#endif
     } else {
         previousTrackMask = previous->mTrackMask;
     }
@@ -230,27 +322,16 @@ void FastMixer::onStateChange()
     // check for change in active track set
     const unsigned currentTrackMask = current->mTrackMask;
     dumpState->mTrackMask = currentTrackMask;
+    dumpState->mNumTracks = popcount(currentTrackMask);
     if (current->mFastTracksGen != mFastTracksGen) {
-        ALOG_ASSERT(mMixerBuffer != NULL);
-        int name;
 
         // process removed tracks first to avoid running out of track names
         unsigned removedTracks = previousTrackMask & ~currentTrackMask;
         while (removedTracks != 0) {
             int i = __builtin_ctz(removedTracks);
             removedTracks &= ~(1 << i);
-            const FastTrack* fastTrack = &current->mFastTracks[i];
-            ALOG_ASSERT(fastTrack->mBufferProvider == NULL);
-            if (mMixer != NULL) {
-                name = mFastTrackNames[i];
-                ALOG_ASSERT(name >= 0);
-                mMixer->deleteTrackName(name);
-            }
-#if !LOG_NDEBUG
-            mFastTrackNames[i] = -1;
-#endif
+            updateMixerTrack(i, REASON_REMOVE);
             // don't reset track dump state, since other side is ignoring it
-            mGenerations[i] = fastTrack->mGeneration;
         }
 
         // now process added tracks
@@ -258,31 +339,7 @@ void FastMixer::onStateChange()
         while (addedTracks != 0) {
             int i = __builtin_ctz(addedTracks);
             addedTracks &= ~(1 << i);
-            const FastTrack* fastTrack = &current->mFastTracks[i];
-            AudioBufferProvider *bufferProvider = fastTrack->mBufferProvider;
-            ALOG_ASSERT(bufferProvider != NULL && mFastTrackNames[i] == -1);
-            if (mMixer != NULL) {
-                name = mMixer->getTrackName(fastTrack->mChannelMask,
-                        fastTrack->mFormat, AUDIO_SESSION_OUTPUT_MIX);
-                ALOG_ASSERT(name >= 0);
-                mFastTrackNames[i] = name;
-                mMixer->setBufferProvider(name, bufferProvider);
-                mMixer->setParameter(name, AudioMixer::TRACK, AudioMixer::MAIN_BUFFER,
-                        (void *)mMixerBuffer);
-                // newly allocated track names default to full scale volume
-                mMixer->setParameter(
-                        name,
-                        AudioMixer::TRACK,
-                        AudioMixer::MIXER_FORMAT, (void *)mMixerBufferFormat);
-                mMixer->setParameter(name, AudioMixer::TRACK, AudioMixer::FORMAT,
-                        (void *)(uintptr_t)fastTrack->mFormat);
-                mMixer->setParameter(name, AudioMixer::TRACK, AudioMixer::CHANNEL_MASK,
-                        (void *)(uintptr_t)fastTrack->mChannelMask);
-                mMixer->setParameter(name, AudioMixer::TRACK, AudioMixer::MIXER_CHANNEL_MASK,
-                        (void *)(uintptr_t)mSinkChannelMask);
-                mMixer->enable(name);
-            }
-            mGenerations[i] = fastTrack->mGeneration;
+            updateMixerTrack(i, REASON_ADD);
         }
 
         // finally process (potentially) modified tracks; these use the same slot
@@ -291,53 +348,75 @@ void FastMixer::onStateChange()
         while (modifiedTracks != 0) {
             int i = __builtin_ctz(modifiedTracks);
             modifiedTracks &= ~(1 << i);
-            const FastTrack* fastTrack = &current->mFastTracks[i];
-            if (fastTrack->mGeneration != mGenerations[i]) {
-                // this track was actually modified
-                AudioBufferProvider *bufferProvider = fastTrack->mBufferProvider;
-                ALOG_ASSERT(bufferProvider != NULL);
-                if (mMixer != NULL) {
-                    name = mFastTrackNames[i];
-                    ALOG_ASSERT(name >= 0);
-                    mMixer->setBufferProvider(name, bufferProvider);
-                    if (fastTrack->mVolumeProvider == NULL) {
-                        float f = AudioMixer::UNITY_GAIN_FLOAT;
-                        mMixer->setParameter(name, AudioMixer::VOLUME, AudioMixer::VOLUME0, &f);
-                        mMixer->setParameter(name, AudioMixer::VOLUME, AudioMixer::VOLUME1, &f);
-                    }
-                    mMixer->setParameter(name, AudioMixer::RESAMPLE,
-                            AudioMixer::REMOVE, NULL);
-                    mMixer->setParameter(
-                            name,
-                            AudioMixer::TRACK,
-                            AudioMixer::MIXER_FORMAT, (void *)mMixerBufferFormat);
-                    mMixer->setParameter(name, AudioMixer::TRACK, AudioMixer::FORMAT,
-                            (void *)(uintptr_t)fastTrack->mFormat);
-                    mMixer->setParameter(name, AudioMixer::TRACK, AudioMixer::CHANNEL_MASK,
-                            (void *)(uintptr_t)fastTrack->mChannelMask);
-                    mMixer->setParameter(name, AudioMixer::TRACK, AudioMixer::MIXER_CHANNEL_MASK,
-                            (void *)(uintptr_t)mSinkChannelMask);
-                    // already enabled
-                }
-                mGenerations[i] = fastTrack->mGeneration;
-            }
+            updateMixerTrack(i, REASON_MODIFY);
         }
 
         mFastTracksGen = current->mFastTracksGen;
-
-        dumpState->mNumTracks = popcount(currentTrackMask);
     }
+
+    if (FeatureOption::MTK_AUDIOMIXER_ENABLE_DRC) {
+        // ALPS04408933 low latency support drc
+        if (current->mDRCEnableGen != mDRCEnableGen) {
+            ALOGD("%s, mDRCEnable %d", __func__, current->mDRCEnable);
+
+            mMixer->setDRCEnable(current->mDRCEnable);
+            mDRCEnableGen = current->mDRCEnableGen;
+        }
+
+        if (current->mUpdateACFHCFParamGen != mUpdateACFHCFParamGen) {
+            ALOGD("%s, UpdateACFHCFParam", __func__);
+
+            mMixer->setParameter(
+                0,
+                AudioMixer::DRC,
+                AudioMixer::UPDATE_ACFHCF, (void *)NULL);
+            mUpdateACFHCFParamGen = current->mUpdateACFHCFParamGen;
+        }
+
+        if (current->mUpdateCustomSceneParamGen != mUpdateCustomSceneParamGen) {
+            ALOGD("%s, UpdateCustomSceneParam, %s", __func__, current->mCustomScene.string());
+
+            mMixer->setParameter(
+                0,
+                AudioMixer::DRC,
+                AudioMixer::UPDATE_SCENE, (void *)current->mCustomScene.string());
+            mUpdateCustomSceneParamGen = current->mUpdateCustomSceneParamGen;
+        }
+    } // MTK_AUDIOMIXER_ENABLE_DRC
 }
 
 void FastMixer::onWork()
 {
+    // TODO: pass an ID parameter to indicate which time series we want to write to in NBLog.cpp
+    // Or: pass both of these into a single call with a boolean
     const FastMixerState * const current = (const FastMixerState *) mCurrent;
     FastMixerDumpState * const dumpState = (FastMixerDumpState *) mDumpState;
+
+    if (mIsWarm) {
+        // Logging timestamps for FastMixer is currently disabled to make memory room for logging
+        // other statistics in FastMixer.
+        // To re-enable, delete the #ifdef FASTMIXER_LOG_HIST_TS lines (and the #endif lines).
+#ifdef FASTMIXER_LOG_HIST_TS
+        LOG_HIST_TS();
+#endif
+        //ALOGD("Eric FastMixer::onWork() mIsWarm");
+    } else {
+        dumpState->mTimestampVerifier.discontinuity();
+        // See comment in if block.
+#ifdef FASTMIXER_LOG_HIST_TS
+        LOG_AUDIO_STATE();
+#endif
+    }
     const FastMixerState::Command command = mCommand;
     const size_t frameCount = current->mFrameCount;
 
     if ((command & FastMixerState::MIX) && (mMixer != NULL) && mIsWarm) {
         ALOG_ASSERT(mMixerBuffer != NULL);
+
+        // AudioMixer::mState.enabledTracks is undefined if mState.hook == process__validate,
+        // so we keep a side copy of enabledTracks
+        bool anyEnabledTracks = false;
+
         // for each track, update volume and check for underrun
         unsigned currentTrackMask = current->mTrackMask;
         while (currentTrackMask != 0) {
@@ -345,32 +424,56 @@ void FastMixer::onWork()
             currentTrackMask &= ~(1 << i);
             const FastTrack* fastTrack = &current->mFastTracks[i];
 
-            // Refresh the per-track timestamp
-            if (mTimestampStatus == NO_ERROR) {
-                uint32_t trackFramesWrittenButNotPresented =
-                    mNativeFramesWrittenButNotPresented;
-                uint32_t trackFramesWritten = fastTrack->mBufferProvider->framesReleased();
-                // Can't provide an AudioTimestamp before first frame presented,
-                // or during the brief 32-bit wraparound window
-                if (trackFramesWritten >= trackFramesWrittenButNotPresented) {
-                    AudioTimestamp perTrackTimestamp;
-                    perTrackTimestamp.mPosition =
-                            trackFramesWritten - trackFramesWrittenButNotPresented;
-                    perTrackTimestamp.mTime = mTimestamp.mTime;
-                    fastTrack->mBufferProvider->onTimestamp(perTrackTimestamp);
-                }
-            }
+            const int64_t trackFramesWrittenButNotPresented =
+                mNativeFramesWrittenButNotPresented;
+            const int64_t trackFramesWritten = fastTrack->mBufferProvider->framesReleased();
+            ExtendedTimestamp perTrackTimestamp(mTimestamp);
 
-            int name = mFastTrackNames[i];
-            ALOG_ASSERT(name >= 0);
+            // Can't provide an ExtendedTimestamp before first frame presented.
+            // Also, timestamp may not go to very last frame on stop().
+            if (trackFramesWritten >= trackFramesWrittenButNotPresented &&
+                    perTrackTimestamp.mTimeNs[ExtendedTimestamp::LOCATION_KERNEL] > 0) {
+                perTrackTimestamp.mPosition[ExtendedTimestamp::LOCATION_KERNEL] =
+                        trackFramesWritten - trackFramesWrittenButNotPresented;
+            } else {
+                perTrackTimestamp.mPosition[ExtendedTimestamp::LOCATION_KERNEL] = 0;
+                perTrackTimestamp.mTimeNs[ExtendedTimestamp::LOCATION_KERNEL] = -1;
+            }
+            perTrackTimestamp.mPosition[ExtendedTimestamp::LOCATION_SERVER] = trackFramesWritten;
+            fastTrack->mBufferProvider->onTimestamp(perTrackTimestamp);
+
+            const int name = i;
             if (fastTrack->mVolumeProvider != NULL) {
                 gain_minifloat_packed_t vlr = fastTrack->mVolumeProvider->getVolumeLR();
                 float vlf = float_from_gain(gain_minifloat_unpack_left(vlr));
                 float vrf = float_from_gain(gain_minifloat_unpack_right(vlr));
 
-                mMixer->setParameter(name, AudioMixer::VOLUME, AudioMixer::VOLUME0, &vlf);
-                mMixer->setParameter(name, AudioMixer::VOLUME, AudioMixer::VOLUME1, &vrf);
+                mMixer->setParameter(name, AudioMixer::RAMP_VOLUME, AudioMixer::VOLUME0, &vlf);
+                mMixer->setParameter(name, AudioMixer::RAMP_VOLUME, AudioMixer::VOLUME1, &vrf);
             }
+
+            if (FeatureOption::MTK_AUDIOMIXER_ENABLE_DRC) {
+                // ALPS04408933 low latency support drc
+                //ALOGD("%s, drc set, track name %d, mStreamType %d, mOutputDevice %d",
+                //        __func__, name, fastTrack->mStreamType, fastTrack->mOutputDevice);
+                if (name != 0) {
+                    mMixer->setParameter(
+                        name,
+                        AudioMixer::TRACK,
+                        AudioMixer::STREAM_TYPE, (void *)fastTrack->mStreamType);
+
+                    mMixer->setParameter(
+                        name,
+                        AudioMixer::TRACK,
+                        AudioMixer::FLAGS, (void *)AUDIO_OUTPUT_FLAG_FAST);
+
+                    mMixer->setParameter(
+                        name,
+                        AudioMixer::DRC,
+                        AudioMixer::DEVICE, (void *)(uintptr_t)fastTrack->mOutputDevice);
+                }
+            } // MTK_AUDIOMIXER_ENABLE_DRC
+
             // FIXME The current implementation of framesReady() for fast tracks
             // takes a tryLock, which can block
             // up to 1 ms.  If enough active tracks all blocked in sequence, this would result
@@ -396,24 +499,27 @@ void FastMixer::onWork()
                     underruns.mBitFields.mPartial++;
                     underruns.mBitFields.mMostRecent = UNDERRUN_PARTIAL;
                     mMixer->enable(name);
+                    anyEnabledTracks = true;
                 }
             } else {
                 underruns.mBitFields.mFull++;
                 underruns.mBitFields.mMostRecent = UNDERRUN_FULL;
                 mMixer->enable(name);
+                anyEnabledTracks = true;
             }
             ftDump->mUnderruns = underruns;
             ftDump->mFramesReady = framesReady;
+            ftDump->mFramesWritten = trackFramesWritten;
         }
 
-        int64_t pts;
-        if (mOutputSink == NULL || (OK != mOutputSink->getNextWriteTimestamp(&pts))) {
-            pts = AudioBufferProvider::kInvalidPTS;
+        if (anyEnabledTracks) {
+            // process() is CPU-bound
+            mMixer->process();
+            mMixerBufferState = MIXED;
+        } else if (mMixerBufferState != ZEROED) {
+            mMixerBufferState = UNDEFINED;
         }
 
-        // process() is CPU-bound
-        mMixer->process(pts);
-        mMixerBufferState = MIXED;
     } else if (mMixerBufferState == MIXED) {
         mMixerBufferState = UNDEFINED;
     }
@@ -423,22 +529,42 @@ void FastMixer::onWork()
             memset(mMixerBuffer, 0, mMixerBufferSize);
             mMixerBufferState = ZEROED;
         }
+
+        if (mMasterMono.load()) {  // memory_order_seq_cst
+            mono_blend(mMixerBuffer, mMixerBufferFormat, Format_channelCount(mFormat), frameCount,
+                    true /*limit*/);
+        }
+
+        // Balance must take effect after mono conversion.
+        // mBalance detects zero balance within the class for speed (not needed here).
+        mBalance.setBalance(mMasterBalance.load());
+        mBalance.process((float *)mMixerBuffer, frameCount);
+
         // prepare the buffer used to write to sink
         void *buffer = mSinkBuffer != NULL ? mSinkBuffer : mMixerBuffer;
         if (mFormat.mFormat != mMixerBufferFormat) { // sink format not the same as mixer format
             memcpy_by_audio_format(buffer, mFormat.mFormat, mMixerBuffer, mMixerBufferFormat,
                     frameCount * Format_channelCount(mFormat));
         }
+        if (mSinkChannelMask & AUDIO_CHANNEL_HAPTIC_ALL) {
+            // When there are haptic channels, the sample data is partially interleaved.
+            // Make the sample data fully interleaved here.
+            adjust_channels_non_destructive(buffer, mAudioChannelCount, buffer, mSinkChannelCount,
+                    audio_bytes_per_sample(mFormat.mFormat),
+                    frameCount * audio_bytes_per_frame(mAudioChannelCount, mFormat.mFormat));
+        }
 
-#ifdef MTK_LATENCY_DETECT_PULSE
-        detectPulse(4, 800, 0, (void *)buffer, frameCount, mFormat.mFormat, mSinkChannelCount, mSampleRate);
-#endif
+#if defined(MTK_LATENCY_DETECT_PULSE)
+        if (AudioDetectPulse::getDetectPulse()) {
+            AudioDetectPulse::doDetectPulse(TAG_FAST_MIXER, 800, 0, (void *)buffer, mMixerBufferSize,
+                                            mFormat.mFormat, mSinkChannelCount, mSampleRate);
+        }
+#endif // MTK_LATENCY_DETECT_PULSE
 
         // if non-NULL, then duplicate write() to this non-blocking sink
-        NBAIO_Sink* teeSink;
-        if ((teeSink = current->mTeeSink) != NULL) {
-            (void) teeSink->write(buffer, frameCount);
-        }
+#ifdef TEE_SINK
+        mTee.write(buffer, frameCount);
+#endif
         // FIXME write() is non-blocking and lock-free for a properly implemented NBAIO sink,
         //       but this code should be modified to handle both non-blocking and blocking sinks
         dumpState->mWriteSequence++;
@@ -459,15 +585,48 @@ void FastMixer::onWork()
         mAttemptedWrite = true;
         // FIXME count # of writes blocked excessively, CPU usage, etc. for dump
 
-        mTimestampStatus = mOutputSink->getTimestamp(mTimestamp);
-        if (mTimestampStatus == NO_ERROR) {
-            uint32_t totalNativeFramesPresented = mTimestamp.mPosition;
-            if (totalNativeFramesPresented <= mTotalNativeFramesWritten) {
-                mNativeFramesWrittenButNotPresented =
-                    mTotalNativeFramesWritten - totalNativeFramesPresented;
+        if (mIsWarm) {
+            ExtendedTimestamp timestamp; // local
+            status_t status = mOutputSink->getTimestamp(timestamp);
+            if (status == NO_ERROR) {
+                dumpState->mTimestampVerifier.add(
+                        timestamp.mPosition[ExtendedTimestamp::LOCATION_KERNEL],
+                        timestamp.mTimeNs[ExtendedTimestamp::LOCATION_KERNEL],
+                        mSampleRate);
+                const int64_t totalNativeFramesPresented =
+                        timestamp.mPosition[ExtendedTimestamp::LOCATION_KERNEL];
+                if (totalNativeFramesPresented <= mTotalNativeFramesWritten) {
+                    mNativeFramesWrittenButNotPresented =
+                        mTotalNativeFramesWritten - totalNativeFramesPresented;
+                    mTimestamp.mPosition[ExtendedTimestamp::LOCATION_KERNEL] =
+                            timestamp.mPosition[ExtendedTimestamp::LOCATION_KERNEL];
+                    mTimestamp.mTimeNs[ExtendedTimestamp::LOCATION_KERNEL] =
+                            timestamp.mTimeNs[ExtendedTimestamp::LOCATION_KERNEL];
+                    // We don't compensate for server - kernel time difference and
+                    // only update latency if we have valid info.
+                    const double latencyMs =
+                            (double)mNativeFramesWrittenButNotPresented * 1000 / mSampleRate;
+                    dumpState->mLatencyMs = latencyMs;
+                    LOG_LATENCY(latencyMs);
+                } else {
+                    // HAL reported that more frames were presented than were written
+                    mNativeFramesWrittenButNotPresented = 0;
+                    status = INVALID_OPERATION;
+                }
             } else {
-                // HAL reported that more frames were presented than were written
-                mTimestampStatus = INVALID_OPERATION;
+                dumpState->mTimestampVerifier.error();
+            }
+            if (status == NO_ERROR) {
+                mTimestamp.mTimeNs[ExtendedTimestamp::LOCATION_SERVER] =
+                        mTimestamp.mTimeNs[ExtendedTimestamp::LOCATION_KERNEL];
+            } else {
+                // fetch server time if we can't get timestamp
+                mTimestamp.mTimeNs[ExtendedTimestamp::LOCATION_SERVER] =
+                        systemTime(SYSTEM_TIME_MONOTONIC);
+                // clear out kernel cached position as this may get rapidly stale
+                // if we never get a new valid timestamp
+                mTimestamp.mPosition[ExtendedTimestamp::LOCATION_KERNEL] = 0;
+                mTimestamp.mTimeNs[ExtendedTimestamp::LOCATION_KERNEL] = -1;
             }
         }
     }

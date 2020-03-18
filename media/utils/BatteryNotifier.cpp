@@ -14,6 +14,9 @@
  * limitations under the License.
  */
 
+#define LOG_TAG "BatteryNotifier"
+//#define LOG_NDEBUG 0
+
 #include "include/mediautils/BatteryNotifier.h"
 
 #include <binder/IServiceManager.h>
@@ -26,7 +29,7 @@ void BatteryNotifier::DeathNotifier::binderDied(const wp<IBinder>& /*who*/) {
     BatteryNotifier::getInstance().onBatteryStatServiceDied();
 }
 
-BatteryNotifier::BatteryNotifier() : mVideoRefCount(0), mAudioRefCount(0) {}
+BatteryNotifier::BatteryNotifier() {}
 
 BatteryNotifier::~BatteryNotifier() {
     Mutex::Autolock _l(mLock);
@@ -35,77 +38,83 @@ BatteryNotifier::~BatteryNotifier() {
     }
 }
 
-void BatteryNotifier::noteStartVideo() {
+void BatteryNotifier::noteStartVideo(uid_t uid) {
     Mutex::Autolock _l(mLock);
     sp<IBatteryStats> batteryService = getBatteryService_l();
-    if (mVideoRefCount == 0 && batteryService != nullptr) {
-        batteryService->noteStartVideo(AID_MEDIA);
+    if (mVideoRefCounts[uid] == 0 && batteryService != nullptr) {
+        batteryService->noteStartVideo(uid);
     }
-    mVideoRefCount++;
+    mVideoRefCounts[uid]++;
 }
 
-void BatteryNotifier::noteStopVideo() {
+void BatteryNotifier::noteStopVideo(uid_t uid) {
     Mutex::Autolock _l(mLock);
-    if (mVideoRefCount == 0) {
-        ALOGW("%s: video refcount is broken.", __FUNCTION__);
+    if (mVideoRefCounts.find(uid) == mVideoRefCounts.end()) {
+        ALOGW("%s: video refcount is broken for uid(%d).", __FUNCTION__, (int)uid);
         return;
     }
 
     sp<IBatteryStats> batteryService = getBatteryService_l();
 
-    mVideoRefCount--;
-    if (mVideoRefCount == 0 && batteryService != nullptr) {
-        batteryService->noteStopVideo(AID_MEDIA);
+    mVideoRefCounts[uid]--;
+    if (mVideoRefCounts[uid] == 0) {
+        if (batteryService != nullptr) {
+            batteryService->noteStopVideo(uid);
+        }
+        mVideoRefCounts.erase(uid);
     }
 }
 
 void BatteryNotifier::noteResetVideo() {
     Mutex::Autolock _l(mLock);
     sp<IBatteryStats> batteryService = getBatteryService_l();
-    mVideoRefCount = 0;
+    mVideoRefCounts.clear();
     if (batteryService != nullptr) {
-        batteryService->noteResetAudio();
+        batteryService->noteResetVideo();
     }
 }
 
-void BatteryNotifier::noteStartAudio() {
+void BatteryNotifier::noteStartAudio(uid_t uid) {
     Mutex::Autolock _l(mLock);
     sp<IBatteryStats> batteryService = getBatteryService_l();
-    if (mAudioRefCount == 0 && batteryService != nullptr) {
-        batteryService->noteStartAudio(AID_MEDIA);
+    if (mAudioRefCounts[uid] == 0 && batteryService != nullptr) {
+        batteryService->noteStartAudio(uid);
     }
-    mAudioRefCount++;
+    mAudioRefCounts[uid]++;
 }
 
-void BatteryNotifier::noteStopAudio() {
+void BatteryNotifier::noteStopAudio(uid_t uid) {
     Mutex::Autolock _l(mLock);
-    if (mAudioRefCount == 0) {
-        ALOGW("%s: audio refcount is broken.", __FUNCTION__);
+    if (mAudioRefCounts.find(uid) == mAudioRefCounts.end()) {
+        ALOGW("%s: audio refcount is broken for uid(%d).", __FUNCTION__, (int)uid);
         return;
     }
 
     sp<IBatteryStats> batteryService = getBatteryService_l();
 
-    mAudioRefCount--;
-    if (mAudioRefCount == 0 && batteryService != nullptr) {
-        batteryService->noteStopAudio(AID_MEDIA);
+    mAudioRefCounts[uid]--;
+    if (mAudioRefCounts[uid] == 0) {
+        if (batteryService != nullptr) {
+            batteryService->noteStopAudio(uid);
+        }
+        mAudioRefCounts.erase(uid);
     }
 }
 
 void BatteryNotifier::noteResetAudio() {
     Mutex::Autolock _l(mLock);
     sp<IBatteryStats> batteryService = getBatteryService_l();
-    mAudioRefCount = 0;
+    mAudioRefCounts.clear();
     if (batteryService != nullptr) {
         batteryService->noteResetAudio();
     }
 }
 
-void BatteryNotifier::noteFlashlightOn(const String8& id, int uid) {
+void BatteryNotifier::noteFlashlightOn(const String8& id, uid_t uid) {
     Mutex::Autolock _l(mLock);
     sp<IBatteryStats> batteryService = getBatteryService_l();
 
-    std::pair<String8, int> k = std::make_pair(id, uid);
+    std::pair<String8, uid_t> k = std::make_pair(id, uid);
     if (!mFlashlightState[k]) {
         mFlashlightState[k] = true;
         if (batteryService != nullptr) {
@@ -114,11 +123,11 @@ void BatteryNotifier::noteFlashlightOn(const String8& id, int uid) {
     }
 }
 
-void BatteryNotifier::noteFlashlightOff(const String8& id, int uid) {
+void BatteryNotifier::noteFlashlightOff(const String8& id, uid_t uid) {
     Mutex::Autolock _l(mLock);
     sp<IBatteryStats> batteryService = getBatteryService_l();
 
-    std::pair<String8, int> k = std::make_pair(id, uid);
+    std::pair<String8, uid_t> k = std::make_pair(id, uid);
     if (mFlashlightState[k]) {
         mFlashlightState[k] = false;
         if (batteryService != nullptr) {
@@ -136,10 +145,10 @@ void BatteryNotifier::noteResetFlashlight() {
     }
 }
 
-void BatteryNotifier::noteStartCamera(const String8& id, int uid) {
+void BatteryNotifier::noteStartCamera(const String8& id, uid_t uid) {
     Mutex::Autolock _l(mLock);
     sp<IBatteryStats> batteryService = getBatteryService_l();
-    std::pair<String8, int> k = std::make_pair(id, uid);
+    std::pair<String8, uid_t> k = std::make_pair(id, uid);
     if (!mCameraState[k]) {
         mCameraState[k] = true;
         if (batteryService != nullptr) {
@@ -148,10 +157,10 @@ void BatteryNotifier::noteStartCamera(const String8& id, int uid) {
     }
 }
 
-void BatteryNotifier::noteStopCamera(const String8& id, int uid) {
+void BatteryNotifier::noteStopCamera(const String8& id, uid_t uid) {
     Mutex::Autolock _l(mLock);
     sp<IBatteryStats> batteryService = getBatteryService_l();
-    std::pair<String8, int> k = std::make_pair(id, uid);
+    std::pair<String8, uid_t> k = std::make_pair(id, uid);
     if (mCameraState[k]) {
         mCameraState[k] = false;
         if (batteryService != nullptr) {
@@ -173,7 +182,7 @@ void BatteryNotifier::onBatteryStatServiceDied() {
     Mutex::Autolock _l(mLock);
     mBatteryStatService.clear();
     mDeathNotifier.clear();
-    // Do not reset mVideoRefCount and mAudioRefCount here. The ref
+    // Do not reset mVideoRefCounts and mAudioRefCounts here. The ref
     // counting is independent of the battery service availability.
     // We need this if battery service becomes available after media
     // started.
@@ -190,20 +199,27 @@ sp<IBatteryStats> BatteryNotifier::getBatteryService_l() {
         const String16 name("batterystats");
         mBatteryStatService = interface_cast<IBatteryStats>(sm->checkService(name));
         if (mBatteryStatService == nullptr) {
-            ALOGE("batterystats service unavailable!");
+            // this may occur normally during the init sequence as mediaserver
+            // and audioserver start before the batterystats service is available.
+            ALOGW("batterystats service unavailable!");
             return nullptr;
         }
 
         mDeathNotifier = new DeathNotifier();
         IInterface::asBinder(mBatteryStatService)->linkToDeath(mDeathNotifier);
 
-        // Notify start now if media already started
-        if (mVideoRefCount > 0) {
-            mBatteryStatService->noteStartVideo(AID_MEDIA);
+        // Notify start now if mediaserver or audioserver is already started.
+        // 1) mediaserver and audioserver is started before batterystats service
+        // 2) batterystats server may have crashed.
+        std::map<uid_t, int>::iterator it = mVideoRefCounts.begin();
+        for (; it != mVideoRefCounts.end(); ++it) {
+            mBatteryStatService->noteStartVideo(it->first);
         }
-        if (mAudioRefCount > 0) {
-            mBatteryStatService->noteStartAudio(AID_MEDIA);
+        it = mAudioRefCounts.begin();
+        for (; it != mAudioRefCounts.end(); ++it) {
+            mBatteryStatService->noteStartAudio(it->first);
         }
+        // TODO: Notify for camera and flashlight state as well?
     }
     return mBatteryStatService;
 }

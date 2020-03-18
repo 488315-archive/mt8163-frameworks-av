@@ -1,9 +1,4 @@
 /*
-* Copyright (C) 2014 MediaTek Inc.
-* Modification based on code covered by the mentioned copyright
-* and/or permission notice(s).
-*/
-/*
  * Copyright (C) 2010 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,6 +19,7 @@
 //#define LOG_NDEBUG 0
 #define LOG_TAG "CameraSourceTimeLapse"
 
+#include <media/hardware/HardwareAPI.h>
 #include <binder/IPCThreadState.h>
 #include <binder/MemoryBase.h>
 #include <binder/MemoryHeapBase.h>
@@ -40,11 +36,12 @@ namespace android {
 
 // static
 CameraSourceTimeLapse *CameraSourceTimeLapse::CreateFromCamera(
-        const sp<ICamera> &camera,
+        const sp<hardware::ICamera> &camera,
         const sp<ICameraRecordingProxy> &proxy,
         int32_t cameraId,
         const String16& clientName,
         uid_t clientUid,
+        pid_t clientPid,
         Size videoSize,
         int32_t videoFrameRate,
         const sp<IGraphicBufferProducer>& surface,
@@ -53,7 +50,7 @@ CameraSourceTimeLapse *CameraSourceTimeLapse::CreateFromCamera(
 
     CameraSourceTimeLapse *source = new
             CameraSourceTimeLapse(camera, proxy, cameraId,
-                clientName, clientUid,
+                clientName, clientUid, clientPid,
                 videoSize, videoFrameRate, surface,
                 timeBetweenFrameCaptureUs,
                 storeMetaDataInVideoBuffers);
@@ -68,17 +65,18 @@ CameraSourceTimeLapse *CameraSourceTimeLapse::CreateFromCamera(
 }
 
 CameraSourceTimeLapse::CameraSourceTimeLapse(
-        const sp<ICamera>& camera,
+        const sp<hardware::ICamera>& camera,
         const sp<ICameraRecordingProxy>& proxy,
         int32_t cameraId,
         const String16& clientName,
         uid_t clientUid,
+        pid_t clientPid,
         Size videoSize,
         int32_t videoFrameRate,
         const sp<IGraphicBufferProducer>& surface,
         int64_t timeBetweenFrameCaptureUs,
         bool storeMetaDataInVideoBuffers)
-      : CameraSource(camera, proxy, cameraId, clientName, clientUid,
+      : CameraSource(camera, proxy, cameraId, clientName, clientUid, clientPid,
                 videoSize, videoFrameRate, surface,
                 storeMetaDataInVideoBuffers),
       mTimeBetweenTimeLapseVideoFramesUs(1E6/videoFrameRate),
@@ -102,9 +100,6 @@ CameraSourceTimeLapse::CameraSourceTimeLapse(
     mForceRead = false;
     mLastReadBufferCopy = NULL;
     mStopWaitingForIdleCamera = false;
-#ifdef MTK_AOSP_ENHANCEMENT
-    mForcePick = false;
-#endif
 }
 
 CameraSourceTimeLapse::~CameraSourceTimeLapse() {
@@ -146,7 +141,6 @@ bool CameraSourceTimeLapse::trySettingVideoSize(
 
     bool videoSizeSupported = false;
     for (size_t i = 0; i < supportedSizes.size(); ++i) {
-
         int32_t pictureWidth = supportedSizes[i].width;
         int32_t pictureHeight = supportedSizes[i].height;
 
@@ -154,6 +148,7 @@ bool CameraSourceTimeLapse::trySettingVideoSize(
             videoSizeSupported = true;
         }
     }
+
     bool isSuccessful = false;
     if (videoSizeSupported) {
         ALOGV("Video size (%d, %d) is supported", width, height);
@@ -174,21 +169,30 @@ bool CameraSourceTimeLapse::trySettingVideoSize(
     return isSuccessful;
 }
 
-void CameraSourceTimeLapse::signalBufferReturned(MediaBuffer* buffer) {
+void CameraSourceTimeLapse::signalBufferReturned(MediaBufferBase* buffer) {
     ALOGV("signalBufferReturned");
     Mutex::Autolock autoLock(mQuickStopLock);
     if (mQuickStop && (buffer == mLastReadBufferCopy)) {
+        if (metaDataStoredInVideoBuffers() == kMetadataBufferTypeNativeHandleSource) {
+            native_handle_t* handle = (
+                (VideoNativeHandleMetadata*)(mLastReadBufferCopy->data()))->pHandle;
+            native_handle_close(handle);
+            native_handle_delete(handle);
+        }
         buffer->setObserver(NULL);
         buffer->release();
+        mLastReadBufferCopy = NULL;
+        mForceRead = true;
     } else {
         return CameraSource::signalBufferReturned(buffer);
     }
 }
 
 void createMediaBufferCopy(
-        const MediaBuffer& sourceBuffer,
+        const MediaBufferBase& sourceBuffer,
         int64_t frameTime,
-        MediaBuffer **newBuffer) {
+        MediaBufferBase **newBuffer,
+        int32_t videoBufferMode) {
 
     ALOGV("createMediaBufferCopy");
     size_t sourceSize = sourceBuffer.size();
@@ -197,20 +201,27 @@ void createMediaBufferCopy(
     (*newBuffer) = new MediaBuffer(sourceSize);
     memcpy((*newBuffer)->data(), sourcePointer, sourceSize);
 
-    (*newBuffer)->meta_data()->setInt64(kKeyTime, frameTime);
+    (*newBuffer)->meta_data().setInt64(kKeyTime, frameTime);
+
+    if (videoBufferMode == kMetadataBufferTypeNativeHandleSource) {
+        ((VideoNativeHandleMetadata*)((*newBuffer)->data()))->pHandle =
+            native_handle_clone(
+                ((VideoNativeHandleMetadata*)(sourceBuffer.data()))->pHandle);
+    }
 }
 
-void CameraSourceTimeLapse::fillLastReadBufferCopy(MediaBuffer& sourceBuffer) {
+void CameraSourceTimeLapse::fillLastReadBufferCopy(MediaBufferBase& sourceBuffer) {
     ALOGV("fillLastReadBufferCopy");
     int64_t frameTime;
-    CHECK(sourceBuffer.meta_data()->findInt64(kKeyTime, &frameTime));
-    createMediaBufferCopy(sourceBuffer, frameTime, &mLastReadBufferCopy);
+    CHECK(sourceBuffer.meta_data().findInt64(kKeyTime, &frameTime));
+    createMediaBufferCopy(sourceBuffer, frameTime, &mLastReadBufferCopy,
+        metaDataStoredInVideoBuffers());
     mLastReadBufferCopy->add_ref();
     mLastReadBufferCopy->setObserver(this);
 }
 
 status_t CameraSourceTimeLapse::read(
-        MediaBuffer **buffer, const ReadOptions *options) {
+        MediaBufferBase **buffer, const ReadOptions *options) {
     ALOGV("read");
     if (mLastReadBufferCopy == NULL) {
         mLastReadStatus = CameraSource::read(buffer, options);
@@ -254,12 +265,12 @@ bool CameraSourceTimeLapse::skipCurrentFrame(int64_t /* timestampUs */) {
 
 bool CameraSourceTimeLapse::skipFrameAndModifyTimeStamp(int64_t *timestampUs) {
     ALOGV("skipFrameAndModifyTimeStamp");
-#ifdef MTK_AOSP_ENHANCEMENT//Drop frame before CameraSource and keep time lapse initial status
+
+    // First time lapse frame.
     if (mNumFramesReceived < 1) {
         mLastTimeLapseFrameRealTimestampUs = *timestampUs;
         return false;
     }
-#endif
 
     if (mLastTimeLapseFrameRealTimestampUs == 0) {
         // First time lapse frame. Initialize mLastTimeLapseFrameRealTimestampUs
@@ -293,15 +304,8 @@ bool CameraSourceTimeLapse::skipFrameAndModifyTimeStamp(int64_t *timestampUs) {
     // Workaround to bypass the first 2 input frames for skipping.
     // The first 2 output frames from the encoder are: decoder specific info and
     // the compressed video frame data for the first input video frame.
-#ifdef MTK_AOSP_ENHANCEMENT
-    if (mNumFramesReceived >= 1 && *timestampUs <//We can not expect when encoder return the buffer, which leads to mNumFramesEncoded++. So we use mNumFramesReceived.
-        (mLastTimeLapseFrameRealTimestampUs + mTimeBetweenFrameCaptureUs)) {
-        if (mForcePick)
-            return forcePick(timestampUs);
-#else
     if (mNumFramesEncoded >= 1 && *timestampUs <
         (mLastTimeLapseFrameRealTimestampUs + mTimeBetweenFrameCaptureUs)) {
-#endif
         // Skip all frames from last encoded frame until
         // sufficient time (mTimeBetweenFrameCaptureUs) has passed.
         // Tell the camera to release its recording frame and return.
@@ -328,18 +332,30 @@ void CameraSourceTimeLapse::dataCallbackTimestamp(int64_t timestampUs, int32_t m
     CameraSource::dataCallbackTimestamp(timestampUs, msgType, data);
 }
 
-#ifdef MTK_AOSP_ENHANCEMENT//force pick frame for some quick return case and set time stamp to the previous ts
-bool CameraSourceTimeLapse::forcePick(int64_t *timestampUs) {
-    if (1 == mForcePickMode) {
-        *timestampUs = mLastFrameTimestampUs;
-        ALOGD("Force pick ts %lld, mode 1", (long long)*timestampUs);
-    } else if (2 == mForcePickMode){
-        *timestampUs = mLastFrameTimestampUs + mTimeBetweenTimeLapseVideoFramesUs;
-        ALOGD("Force pick ts %lld, mode 2", (long long)*timestampUs);
-    }
-
-    return false;
+void CameraSourceTimeLapse::recordingFrameHandleCallbackTimestamp(int64_t timestampUs,
+            native_handle_t* handle) {
+    ALOGV("recordingFrameHandleCallbackTimestamp");
+    mSkipCurrentFrame = skipFrameAndModifyTimeStamp(&timestampUs);
+    CameraSource::recordingFrameHandleCallbackTimestamp(timestampUs, handle);
 }
-#endif
+
+void CameraSourceTimeLapse::recordingFrameHandleCallbackTimestampBatch(
+        const std::vector<int64_t>& timestampsUs,
+        const std::vector<native_handle_t*>& handles) {
+    ALOGV("recordingFrameHandleCallbackTimestampBatch");
+    int n = timestampsUs.size();
+    for (int i = 0; i < n; i++) {
+        // Don't do batching for CameraSourceTimeLapse for now
+        recordingFrameHandleCallbackTimestamp(timestampsUs[i], handles[i]);
+    }
+}
+
+void CameraSourceTimeLapse::processBufferQueueFrame(BufferItem& buffer) {
+    ALOGV("processBufferQueueFrame");
+    int64_t timestampUs = buffer.mTimestamp / 1000;
+    mSkipCurrentFrame = skipFrameAndModifyTimeStamp(&timestampUs);
+    buffer.mTimestamp = timestampUs * 1000;
+    CameraSource::processBufferQueueFrame(buffer);
+}
 
 }  // namespace android

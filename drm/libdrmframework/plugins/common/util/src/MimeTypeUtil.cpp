@@ -61,6 +61,11 @@ static const char mime_type_audio_wav[]   = "audio/wav";
 static const char mime_type_video_mpeg4[] = "video/mpeg4";
 static const char mime_type_video_3gpp[]  = "video/3gpp";
 
+static const char mime_type_image_bmp[] = "image/bmp";
+static const char mime_type_image_gif[] = "image/gif";
+static const char mime_type_image_jpeg[] = "image/jpeg";
+static const char mime_type_image_png[] = "image/png";
+
 // Known mimetype groups
 static const char mime_group_audio[]       = "audio/";
 static const char mime_group_application[] = "application/";
@@ -106,6 +111,13 @@ static struct MimeTypeList mimeTypeList[] = {
     // 3gpp video mime types
     {MIMETYPE_VIDEO, "3gp",          sizeof("3gp")-1,         mime_type_video_3gpp},
 
+    // jpg image
+    {MIMETYPE_IMAGE, "bmp",          sizeof("bmp")-1,         mime_type_image_bmp},
+    {MIMETYPE_IMAGE, "gif",          sizeof("gif")-1,         mime_type_image_gif},
+    {MIMETYPE_IMAGE, "jpeg",         sizeof("jpeg")-1,        mime_type_image_jpeg},
+    {MIMETYPE_IMAGE, "png",          sizeof("png")-1,         mime_type_image_png},
+
+
     // Must be last entry
     {MIMETYPE_LAST,  NULL,           0,                       NULL}
 };
@@ -115,7 +127,7 @@ static struct MimeTypeList mimeTypeList[] = {
  * replacement mimetype otherwise the original mimetype
  * is returned.
  *
- * If the mimetype is of unsupported group i.e. application/*
+ * If the mimetype is of unsupported group i.e. application/...
  * then "unsupported/drm.mimetype" will be returned.
  *
  * @param mimeType - mimetype in lower case to convert.
@@ -131,7 +143,8 @@ String8 MimeTypeUtil::convertMimeType(String8& mimeType) {
     pMimeType = mimeType.string();
     if (NULL != pMimeType) {
         if ((0 == strncmp(pMimeType, mime_group_audio, (sizeof mime_group_audio) - 1)) ||
-            (0 == strncmp(pMimeType, mime_group_video, (sizeof mime_group_video) - 1))) {
+            (0 == strncmp(pMimeType, mime_group_video, (sizeof mime_group_video) - 1)) ||
+            (0 == strncmp(pMimeType, mime_group_image, (sizeof mime_group_image) - 1))) {
             /* Check which group the mimetype is */
             pGroup = mimeGroup;
             while (MIMETYPE_LAST != pGroup->type) {

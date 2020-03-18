@@ -1,9 +1,4 @@
 /*
-* Copyright (C) 2014 MediaTek Inc.
-* Modification based on code covered by the mentioned copyright
-* and/or permission notice(s).
-*/
-/*
  * Copyright (C) 2010 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -36,10 +31,9 @@
 
 #include <selinux/android.h>
 
-#if defined(MTK_OMA_DRM_SUPPORT) || defined(MTK_WV_DRM_SUPPORT) || defined (MTK_CTA_DRM_SUPPORT)
+
 #include <drm/DrmMtkUtil.h>
-#include <drm/DrmMtkDef.h>
-#endif
+
 
 using namespace android;
 
@@ -61,30 +55,33 @@ const char *const DrmManagerService::drm_perm_labels[] = {
 const char *DrmManagerService::get_perm_label(drm_perm_t perm) {
     unsigned int index = perm;
 
-    if (index < 0 ||
-            index >= (sizeof(drm_perm_labels) / sizeof(drm_perm_labels[0]))) {
+    if (index >= (sizeof(drm_perm_labels) / sizeof(drm_perm_labels[0]))) {
         ALOGE("SELinux: Failed to retrieve permission label(perm=%d).\n", perm);
         abort();
     }
     return drm_perm_labels[index];
 }
 
-bool DrmManagerService::selinuxIsProtectedCallAllowed(pid_t spid, drm_perm_t perm) {
+bool DrmManagerService::selinuxIsProtectedCallAllowed(pid_t spid, const char* ssid, drm_perm_t perm) {
     if (selinux_enabled <= 0) {
         return true;
     }
 
-    char *sctx;
+    char *sctx = NULL;
     const char *selinux_class = "drmservice";
     const char *str_perm = get_perm_label(perm);
 
-    if (getpidcon(spid, &sctx) != 0) {
-        ALOGE("SELinux: getpidcon(pid=%d) failed.\n", spid);
-        return false;
+    if (ssid == NULL) {
+        android_errorWriteLog(0x534e4554, "121035042");
+
+        if (getpidcon(spid, &sctx) != 0) {
+            ALOGE("SELinux: getpidcon(pid=%d) failed.\n", spid);
+            return false;
+        }
     }
 
-    bool allowed = (selinux_check_access(sctx, drmserver_context, selinux_class,
-            str_perm, NULL) == 0);
+    bool allowed = (selinux_check_access(ssid ? ssid : sctx, drmserver_context,
+            selinux_class, str_perm, NULL) == 0);
     freecon(sctx);
 
     return allowed;
@@ -99,30 +96,33 @@ bool DrmManagerService::isProtectedCallAllowed(drm_perm_t perm) {
     IPCThreadState* ipcState = IPCThreadState::self();
     uid_t uid = ipcState->getCallingUid();
     pid_t spid = ipcState->getCallingPid();
+    const char* ssid = ipcState->getCallingSid();
 
     for (unsigned int i = 0; i < trustedUids.size(); ++i) {
         if (trustedUids[i] == uid) {
-            result = selinuxIsProtectedCallAllowed(spid, perm);
+            result = selinuxIsProtectedCallAllowed(spid, ssid, perm);
         }
     }
 
-#if defined(MTK_OMA_DRM_SUPPORT) || defined(MTK_WV_DRM_SUPPORT) || defined (MTK_CTA_DRM_SUPPORT)
-    // M:
-    // for OMA DRM v1 implementation
+    ALOGD("isProtectedCallAllowed result[%d]", result);
+
+    // M: Add for OMA DRM v1 implementation
     // if can't authorize the process by UID, then check the process name.
     if (!result) {
-        pid_t pid = ipcState->getCallingPid();
-        result = DrmTrustedClient::IsDrmTrustedClient(DrmMtkUtil::getProcessName(pid));
+        result = DrmMtkUtil::isTrustedClient(DrmMtkUtil::getProcessName(spid));
     }
-#endif
+
+    ALOGD("isProtectedCallAllowed2 result[%d]", result);
+
 
     return result;
 }
 
 void DrmManagerService::instantiate() {
     ALOGV("instantiate");
-    ALOGI("try register drm server to Service Manager.");
-    defaultServiceManager()->addService(String16("drm.drmManager"), new DrmManagerService());
+    sp<DrmManagerService> service = new DrmManagerService();
+    service->setRequestingSid(true);
+    defaultServiceManager()->addService(String16("drm.drmManager"), service);
 
     if (0 >= trustedUids.size()) {
         // TODO
@@ -131,10 +131,6 @@ void DrmManagerService::instantiate() {
 
         // Add trusted uids here
         trustedUids.push(AID_MEDIA);
-        // M: migration these 3 from ICS
-        trustedUids.push(AID_DRM);
-        trustedUids.push(AID_SYSTEM);
-        trustedUids.push(AID_ROOT);
     }
 
     selinux_enabled = is_selinux_enabled();
@@ -235,7 +231,7 @@ int DrmManagerService::checkRightsStatus(
 }
 
 status_t DrmManagerService::consumeRights(
-            int uniqueId, DecryptHandle* decryptHandle, int action, bool reserve) {
+            int uniqueId, sp<DecryptHandle>& decryptHandle, int action, bool reserve) {
     ALOGV("Entering consumeRights");
     if (!isProtectedCallAllowed(CONSUME_RIGHTS)) {
         return DRM_ERROR_NO_PERMISSION;
@@ -244,7 +240,7 @@ status_t DrmManagerService::consumeRights(
 }
 
 status_t DrmManagerService::setPlaybackStatus(
-            int uniqueId, DecryptHandle* decryptHandle, int playbackStatus, int64_t position) {
+            int uniqueId, sp<DecryptHandle>& decryptHandle, int playbackStatus, int64_t position) {
     ALOGV("Entering setPlaybackStatus");
     if (!isProtectedCallAllowed(SET_PLAYBACK_STATUS)) {
         return DRM_ERROR_NO_PERMISSION;
@@ -291,10 +287,10 @@ status_t DrmManagerService::getAllSupportInfo(
     return mDrmManager->getAllSupportInfo(uniqueId, length, drmSupportInfoArray);
 }
 
-//Add by rui to pass client's client to drmserver
-DecryptHandle* DrmManagerService::openDecryptSession(
+// Add by rui to pass client's client to drmserver
+sp<DecryptHandle> DrmManagerService::openDecryptSession(
             int uniqueId, int fd, off64_t offset, off64_t length, const char* mime, pid_t pid) {
-    ALOGV("Entering DrmManagerService::openDecryptSession");
+    ALOGD("Entering DrmManagerService::openDecryptSession 1");
     if (isProtectedCallAllowed(OPEN_DECRYPT_SESSION)) {
         return mDrmManager->openDecryptSession(uniqueId, fd, offset, length, mime, pid);
     }
@@ -302,7 +298,7 @@ DecryptHandle* DrmManagerService::openDecryptSession(
     return NULL;
 }
 
-DecryptHandle* DrmManagerService::openDecryptSession(
+sp<DecryptHandle> DrmManagerService::openDecryptSession(
             int uniqueId, int fd, off64_t offset, off64_t length, const char* mime) {
     ALOGV("Entering DrmManagerService::openDecryptSession");
     if (isProtectedCallAllowed(OPEN_DECRYPT_SESSION)) {
@@ -312,7 +308,7 @@ DecryptHandle* DrmManagerService::openDecryptSession(
     return NULL;
 }
 
-DecryptHandle* DrmManagerService::openDecryptSession(
+sp<DecryptHandle> DrmManagerService::openDecryptSession(
             int uniqueId, const char* uri, const char* mime) {
     ALOGV("Entering DrmManagerService::openDecryptSession with uri");
     if (isProtectedCallAllowed(OPEN_DECRYPT_SESSION)) {
@@ -322,7 +318,7 @@ DecryptHandle* DrmManagerService::openDecryptSession(
     return NULL;
 }
 
-DecryptHandle* DrmManagerService::openDecryptSession(
+sp<DecryptHandle> DrmManagerService::openDecryptSession(
             int uniqueId, const DrmBuffer& buf, const String8& mimeType) {
     ALOGV("Entering DrmManagerService::openDecryptSession for streaming");
     if (isProtectedCallAllowed(OPEN_DECRYPT_SESSION)) {
@@ -332,7 +328,7 @@ DecryptHandle* DrmManagerService::openDecryptSession(
     return NULL;
 }
 
-status_t DrmManagerService::closeDecryptSession(int uniqueId, DecryptHandle* decryptHandle) {
+status_t DrmManagerService::closeDecryptSession(int uniqueId, sp<DecryptHandle>& decryptHandle) {
     ALOGV("Entering closeDecryptSession");
     if (!isProtectedCallAllowed(CLOSE_DECRYPT_SESSION)) {
         return DRM_ERROR_NO_PERMISSION;
@@ -340,7 +336,7 @@ status_t DrmManagerService::closeDecryptSession(int uniqueId, DecryptHandle* dec
     return mDrmManager->closeDecryptSession(uniqueId, decryptHandle);
 }
 
-status_t DrmManagerService::initializeDecryptUnit(int uniqueId, DecryptHandle* decryptHandle,
+status_t DrmManagerService::initializeDecryptUnit(int uniqueId, sp<DecryptHandle>& decryptHandle,
             int decryptUnitId, const DrmBuffer* headerInfo) {
     ALOGV("Entering initializeDecryptUnit");
     if (!isProtectedCallAllowed(INITIALIZE_DECRYPT_UNIT)) {
@@ -350,7 +346,7 @@ status_t DrmManagerService::initializeDecryptUnit(int uniqueId, DecryptHandle* d
 }
 
 status_t DrmManagerService::decrypt(
-            int uniqueId, DecryptHandle* decryptHandle, int decryptUnitId,
+            int uniqueId, sp<DecryptHandle>& decryptHandle, int decryptUnitId,
             const DrmBuffer* encBuffer, DrmBuffer** decBuffer, DrmBuffer* IV) {
     ALOGV("Entering decrypt");
     if (!isProtectedCallAllowed(DECRYPT)) {
@@ -360,7 +356,7 @@ status_t DrmManagerService::decrypt(
 }
 
 status_t DrmManagerService::finalizeDecryptUnit(
-            int uniqueId, DecryptHandle* decryptHandle, int decryptUnitId) {
+            int uniqueId, sp<DecryptHandle>& decryptHandle, int decryptUnitId) {
     ALOGV("Entering finalizeDecryptUnit");
     if (!isProtectedCallAllowed(FINALIZE_DECRYPT_UNIT)) {
         return DRM_ERROR_NO_PERMISSION;
@@ -368,7 +364,7 @@ status_t DrmManagerService::finalizeDecryptUnit(
     return mDrmManager->finalizeDecryptUnit(uniqueId, decryptHandle, decryptUnitId);
 }
 
-ssize_t DrmManagerService::pread(int uniqueId, DecryptHandle* decryptHandle,
+ssize_t DrmManagerService::pread(int uniqueId, sp<DecryptHandle>& decryptHandle,
             void* buffer, ssize_t numBytes, off64_t offset) {
     ALOGV("Entering pread");
     if (!isProtectedCallAllowed(PREAD)) {
@@ -397,8 +393,12 @@ status_t DrmManagerService::dump(int fd, const Vector<String16>& args)
             }
         }
         if (dumpMem) {
-            dumpMemoryAddresses(fd);
+            result.append("\nDumping memory:\n");
+            std::string s = dumpMemoryAddresses(100 /* limit */);
+            result.append(s.c_str(), s.size());
         }
+#else
+        (void)args;
 #endif
     }
     write(fd, result.string(), result.size());

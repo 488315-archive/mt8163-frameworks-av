@@ -18,19 +18,35 @@
 #ifndef ANDROID_MEDIARECORDERCLIENT_H
 #define ANDROID_MEDIARECORDERCLIENT_H
 
+#include "DeathNotifier.h"
+
+#include <media/AudioSystem.h>
 #include <media/IMediaRecorder.h>
+
+#include <vector>
 
 namespace android {
 
-class MediaRecorderBase;
+struct MediaRecorderBase;
 class MediaPlayerService;
 class ICameraRecordingProxy;
-class IGraphicBufferProducer;
 
 class MediaRecorderClient : public BnMediaRecorder
 {
+    class AudioDeviceUpdatedNotifier: public AudioSystem::AudioDeviceCallback
+    {
+    public:
+        AudioDeviceUpdatedNotifier(const sp<IMediaRecorderClient>& listener);
+        virtual ~AudioDeviceUpdatedNotifier();
+        virtual void onAudioDeviceUpdate(
+                audio_io_handle_t audioIo,
+                audio_port_handle_t deviceId);
+    private:
+        wp<IMediaRecorderClient> mListener;
+    };
+
 public:
-    virtual     status_t   setCamera(const sp<ICamera>& camera,
+    virtual     status_t   setCamera(const sp<hardware::ICamera>& camera,
                                     const sp<ICameraRecordingProxy>& proxy);
     virtual     status_t   setPreviewSurface(const sp<IGraphicBufferProducer>& surface);
     virtual     status_t   setVideoSource(int vs);
@@ -38,8 +54,8 @@ public:
     virtual     status_t   setOutputFormat(int of);
     virtual     status_t   setVideoEncoder(int ve);
     virtual     status_t   setAudioEncoder(int ae);
-    virtual     status_t   setOutputFile(int fd, int64_t offset,
-                                                  int64_t length);
+    virtual     status_t   setOutputFile(int fd);
+    virtual     status_t   setNextOutputFile(int fd);
     virtual     status_t   setVideoSize(int width, int height);
     virtual     status_t   setVideoFrameRate(int frames_per_second);
     virtual     status_t   setParameters(const String8& params);
@@ -48,15 +64,26 @@ public:
     virtual     status_t   setClientName(const String16& clientName);
     virtual     status_t   prepare();
     virtual     status_t   getMaxAmplitude(int* max);
+    virtual     status_t   getMetrics(Parcel* reply);
     virtual     status_t   start();
     virtual     status_t   stop();
     virtual     status_t   reset();
+    virtual     status_t   pause();
+    virtual     status_t   resume();
     virtual     status_t   init();
     virtual     status_t   close();
     virtual     status_t   release();
     virtual     status_t   dump(int fd, const Vector<String16>& args);
-    virtual     status_t   setInputSurface(const sp<IGraphicBufferConsumer>& surface);
+    virtual     status_t   setInputSurface(const sp<PersistentSurface>& surface);
     virtual     sp<IGraphicBufferProducer> querySurfaceMediaSource();
+    virtual     status_t   setInputDevice(audio_port_handle_t deviceId);
+    virtual     status_t   getRoutedDeviceId(audio_port_handle_t* deviceId);
+    virtual     status_t   enableAudioDeviceCallback(bool enabled);
+    virtual     status_t   getActiveMicrophones(
+                              std::vector<media::MicrophoneInfo>* activeMicrophones);
+    virtual     status_t   setPreferredMicrophoneDirection(audio_microphone_direction_t direction);
+    virtual     status_t   setPreferredMicrophoneFieldDimension(float zoom);
+                status_t   getPortId(audio_port_handle_t *portId) override;
 
 private:
     friend class           MediaPlayerService;  // for accessing private constructor
@@ -66,6 +93,9 @@ private:
                                                                pid_t pid,
                                                                const String16& opPackageName);
     virtual                ~MediaRecorderClient();
+
+    std::vector<DeathNotifier> mDeathNotifiers;
+    sp<AudioDeviceUpdatedNotifier> mAudioDeviceUpdatedNotifier;
 
     pid_t                  mPid;
     Mutex                  mLock;

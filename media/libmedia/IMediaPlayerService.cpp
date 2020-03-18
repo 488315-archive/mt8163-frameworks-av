@@ -1,9 +1,4 @@
 /*
-* Copyright (C) 2014 MediaTek Inc.
-* Modification based on code covered by the mentioned copyright
-* and/or permission notice(s).
-*/
-/*
 **
 ** Copyright 2008, The Android Open Source Project
 **
@@ -25,12 +20,10 @@
 
 #include <binder/Parcel.h>
 #include <binder/IMemory.h>
-#include <media/ICrypto.h>
-#include <media/IDrm.h>
-#include <media/IHDCP.h>
 #include <media/IMediaCodecList.h>
 #include <media/IMediaHTTPService.h>
 #include <media/IMediaPlayerService.h>
+#include <media/IMediaPlayer.h>
 #include <media/IMediaRecorder.h>
 #include <media/IOMX.h>
 #include <media/IRemoteDisplay.h>
@@ -40,40 +33,24 @@
 #include <utils/Errors.h>  // for status_t
 #include <utils/String8.h>
 
-///M:Xmount@{
-#include <media/IRemoteMount.h>
-#include <media/IRemoteMountClient.h>
-///@}
-
 namespace android {
 
 enum {
     CREATE = IBinder::FIRST_CALL_TRANSACTION,
     CREATE_MEDIA_RECORDER,
     CREATE_METADATA_RETRIEVER,
-    GET_OMX,
-    MAKE_CRYPTO,
-    MAKE_DRM,
-    MAKE_HDCP,
     ADD_BATTERY_DATA,
     PULL_BATTERY_DATA,
     LISTEN_FOR_REMOTE_DISPLAY,
-        GET_CODEC_LIST,
-#ifdef MTK_AOSP_ENHANCEMENT
-    ///M:Xmount@{
-    LISTEN_FOR_CROSS_MOUNT,
-    ///@}
+    GET_CODEC_LIST,
     ENABLE_REMOTE_DISPLAY,
-    LISTEN_FOR_FAST_REMOTE_DISPLAY,
-    CONNECT_FOR_REMOTE_DISPLAY,
     ENABLE_FAST_REMOTE_DISPLAY
-#endif
 };
 
 class BpMediaPlayerService: public BpInterface<IMediaPlayerService>
 {
 public:
-    BpMediaPlayerService(const sp<IBinder>& impl)
+    explicit BpMediaPlayerService(const sp<IBinder>& impl)
         : BpInterface<IMediaPlayerService>(impl)
     {
     }
@@ -87,7 +64,7 @@ public:
     }
 
     virtual sp<IMediaPlayer> create(
-            const sp<IMediaPlayerClient>& client, int audioSessionId) {
+            const sp<IMediaPlayerClient>& client, audio_session_t audioSessionId) {
         Parcel data, reply;
         data.writeInterfaceToken(IMediaPlayerService::getInterfaceDescriptor());
         data.writeStrongBinder(IInterface::asBinder(client));
@@ -104,35 +81,6 @@ public:
         data.writeString16(opPackageName);
         remote()->transact(CREATE_MEDIA_RECORDER, data, &reply);
         return interface_cast<IMediaRecorder>(reply.readStrongBinder());
-    }
-
-    virtual sp<IOMX> getOMX() {
-        Parcel data, reply;
-        data.writeInterfaceToken(IMediaPlayerService::getInterfaceDescriptor());
-        remote()->transact(GET_OMX, data, &reply);
-        return interface_cast<IOMX>(reply.readStrongBinder());
-    }
-
-    virtual sp<ICrypto> makeCrypto() {
-        Parcel data, reply;
-        data.writeInterfaceToken(IMediaPlayerService::getInterfaceDescriptor());
-        remote()->transact(MAKE_CRYPTO, data, &reply);
-        return interface_cast<ICrypto>(reply.readStrongBinder());
-    }
-
-    virtual sp<IDrm> makeDrm() {
-        Parcel data, reply;
-        data.writeInterfaceToken(IMediaPlayerService::getInterfaceDescriptor());
-        remote()->transact(MAKE_DRM, data, &reply);
-        return interface_cast<IDrm>(reply.readStrongBinder());
-    }
-
-    virtual sp<IHDCP> makeHDCP(bool createEncryptionModule) {
-        Parcel data, reply;
-        data.writeInterfaceToken(IMediaPlayerService::getInterfaceDescriptor());
-        data.writeInt32(createEncryptionModule);
-        remote()->transact(MAKE_HDCP, data, &reply);
-        return interface_cast<IHDCP>(reply.readStrongBinder());
     }
 
     virtual void addBatteryData(uint32_t params) {
@@ -167,7 +115,7 @@ public:
         return interface_cast<IMediaCodecList>(reply.readStrongBinder());
     }
 
-#ifdef MTK_AOSP_ENHANCEMENT
+    /// M: MTK WFD added on feature @{
     virtual status_t enableRemoteDisplay(const char *iface) {
         Parcel data, reply;
         data.writeInterfaceToken(IMediaPlayerService::getInterfaceDescriptor());
@@ -183,44 +131,6 @@ public:
         return reply.readInt32();
     }
 
-///M: MTK WFD added on feature @{
-    virtual sp<IRemoteDisplay> listenForRemoteDisplay(
-            const String16 &opPackageName,
-            const sp<IRemoteDisplayClient>& client,
-            const String8& iface, const uint32_t wfdFlags)
-    {
-        Parcel data, reply;
-        data.writeInterfaceToken(IMediaPlayerService::getInterfaceDescriptor());
-        data.writeString16(opPackageName);
-        data.writeStrongBinder(IInterface::asBinder(client));
-        data.writeString8(iface);
-        data.writeInt32(wfdFlags);
-
-        remote()->transact(LISTEN_FOR_FAST_REMOTE_DISPLAY, data, &reply);
-        return interface_cast<IRemoteDisplay>(reply.readStrongBinder());
-    }
-
-    virtual sp<IRemoteDisplay> connectForRemoteDisplay(const sp<IRemoteDisplayClient>& client,
-            const String8& iface, const sp<IGraphicBufferProducer> &bufferProducer)
-    {
-#ifdef MTK_WFD_SINK_SUPPORT
-        Parcel data, reply;
-        data.writeInterfaceToken(IMediaPlayerService::getInterfaceDescriptor());
-        data.writeStrongBinder(IInterface::asBinder(client));
-        data.writeString8(iface);
-        data.writeStrongBinder(IInterface::asBinder(bufferProducer));
-
-        remote()->transact(CONNECT_FOR_REMOTE_DISPLAY, data, &reply);
-        return interface_cast<IRemoteDisplay>(reply.readStrongBinder());
-#else
-        (void)client;
-        (void)iface;
-        (void)bufferProducer;
-        return NULL;
-#endif
-    }
-
-
     virtual status_t enableRemoteDisplay(const char *iface, const uint32_t wfdFlags) {
         Parcel data, reply;
         data.writeInterfaceToken(IMediaPlayerService::getInterfaceDescriptor());
@@ -229,7 +139,7 @@ public:
         if (iface != NULL) {
             data.writeInt32(1);
             data.writeCString(iface);
-        }else{
+        } else {
             data.writeInt32(0);
         }
         data.writeInt32(wfdFlags);
@@ -237,26 +147,7 @@ public:
         remote()->transact(ENABLE_FAST_REMOTE_DISPLAY, data, &reply);
         return reply.readInt32();
     }
-
 /// @}
-
-//M:XMount @{
-    virtual sp<IRemoteMount> listenForRemoteMount(const sp<IRemoteMountClient>& client,
-            const String8& iface, const bool isProvider, const uint32_t mode)
-    {
-        Parcel data, reply;
-        data.writeInterfaceToken(IMediaPlayerService::getInterfaceDescriptor());
-
-        data.writeStrongBinder(IInterface::asBinder(client));
-        data.writeString8(iface);
-        data.writeInt32(isProvider);
-        data.writeInt32(mode);
-        remote()->transact(LISTEN_FOR_CROSS_MOUNT, data, &reply);
-        return interface_cast<IRemoteMount>(reply.readStrongBinder());
-    }
-///@}
-
-#endif
 };
 
 IMPLEMENT_META_INTERFACE(MediaPlayerService, "android.media.IMediaPlayerService");
@@ -271,7 +162,7 @@ status_t BnMediaPlayerService::onTransact(
             CHECK_INTERFACE(IMediaPlayerService, data, reply);
             sp<IMediaPlayerClient> client =
                 interface_cast<IMediaPlayerClient>(data.readStrongBinder());
-            int audioSessionId = data.readInt32();
+            audio_session_t audioSessionId = (audio_session_t) data.readInt32();
             sp<IMediaPlayer> player = create(client, audioSessionId);
             reply->writeStrongBinder(IInterface::asBinder(player));
             return NO_ERROR;
@@ -287,31 +178,6 @@ status_t BnMediaPlayerService::onTransact(
             CHECK_INTERFACE(IMediaPlayerService, data, reply);
             sp<IMediaMetadataRetriever> retriever = createMetadataRetriever();
             reply->writeStrongBinder(IInterface::asBinder(retriever));
-            return NO_ERROR;
-        } break;
-        case GET_OMX: {
-            CHECK_INTERFACE(IMediaPlayerService, data, reply);
-            sp<IOMX> omx = getOMX();
-            reply->writeStrongBinder(IInterface::asBinder(omx));
-            return NO_ERROR;
-        } break;
-        case MAKE_CRYPTO: {
-            CHECK_INTERFACE(IMediaPlayerService, data, reply);
-            sp<ICrypto> crypto = makeCrypto();
-            reply->writeStrongBinder(IInterface::asBinder(crypto));
-            return NO_ERROR;
-        } break;
-        case MAKE_DRM: {
-            CHECK_INTERFACE(IMediaPlayerService, data, reply);
-            sp<IDrm> drm = makeDrm();
-            reply->writeStrongBinder(IInterface::asBinder(drm));
-            return NO_ERROR;
-        } break;
-        case MAKE_HDCP: {
-            CHECK_INTERFACE(IMediaPlayerService, data, reply);
-            bool createEncryptionModule = data.readInt32();
-            sp<IHDCP> hdcp = makeHDCP(createEncryptionModule);
-            reply->writeStrongBinder(IInterface::asBinder(hdcp));
             return NO_ERROR;
         } break;
         case ADD_BATTERY_DATA: {
@@ -330,6 +196,10 @@ status_t BnMediaPlayerService::onTransact(
             const String16 opPackageName = data.readString16();
             sp<IRemoteDisplayClient> client(
                     interface_cast<IRemoteDisplayClient>(data.readStrongBinder()));
+            if (client == NULL) {
+                reply->writeStrongBinder(NULL);
+                return NO_ERROR;
+            }
             String8 iface(data.readString8());
             sp<IRemoteDisplay> display(listenForRemoteDisplay(opPackageName, client, iface));
             reply->writeStrongBinder(IInterface::asBinder(display));
@@ -341,7 +211,6 @@ status_t BnMediaPlayerService::onTransact(
             reply->writeStrongBinder(IInterface::asBinder(mcl));
             return NO_ERROR;
         } break;
-#ifdef MTK_AOSP_ENHANCEMENT
         case ENABLE_REMOTE_DISPLAY: {
             CHECK_INTERFACE(IMediaPlayerService, data, reply);
             const char *iface = NULL;
@@ -351,31 +220,6 @@ status_t BnMediaPlayerService::onTransact(
             reply->writeInt32(enableRemoteDisplay(iface));
             return NO_ERROR;
         } break;
-        case LISTEN_FOR_FAST_REMOTE_DISPLAY: {
-            CHECK_INTERFACE(IMediaPlayerService, data, reply);
-            const String16 opPackageName = data.readString16();
-            sp<IRemoteDisplayClient> client(
-                    interface_cast<IRemoteDisplayClient>(data.readStrongBinder()));
-            String8 iface(data.readString8());
-            const uint32_t wfdFlags = data.readInt32();
-            sp<IRemoteDisplay> display(
-                listenForRemoteDisplay(opPackageName, client, iface, wfdFlags));
-            reply->writeStrongBinder(IInterface::asBinder(display));
-            return NO_ERROR;
-        } break;
-    #ifdef MTK_WFD_SINK_SUPPORT
-        case CONNECT_FOR_REMOTE_DISPLAY: {
-            CHECK_INTERFACE(IMediaPlayerService, data, reply);
-            sp<IRemoteDisplayClient> client(
-                    interface_cast<IRemoteDisplayClient>(data.readStrongBinder()));
-            String8 iface(data.readString8());
-            sp<IGraphicBufferProducer> bufferProducer(
-                    interface_cast<IGraphicBufferProducer>(data.readStrongBinder()));
-            sp<IRemoteDisplay> display(connectForRemoteDisplay(client, iface, bufferProducer));
-            reply->writeStrongBinder(IInterface::asBinder(display));
-            return NO_ERROR;
-        } break;
-    #endif
         case ENABLE_FAST_REMOTE_DISPLAY: {
             CHECK_INTERFACE(IMediaPlayerService, data, reply);
             const char *iface = NULL;
@@ -388,23 +232,6 @@ status_t BnMediaPlayerService::onTransact(
             reply->writeInt32(enableRemoteDisplay(iface, wfdFlags));
             return NO_ERROR;
         } break;
-
-        ///M:Xmount@@{
-        case LISTEN_FOR_CROSS_MOUNT: {
-            CHECK_INTERFACE(IMediaPlayerService, data, reply);
-            sp<IRemoteMountClient> client(
-                    interface_cast<IRemoteMountClient>(data.readStrongBinder()));
-            String8 iface(data.readString8());
-            const uint32_t isProvider = data.readInt32();
-            const uint32_t mode = data.readInt32();
-            sp<IRemoteMount> display(listenForRemoteMount(client, iface, isProvider, mode));
-            reply->writeStrongBinder(IInterface::asBinder(display));
-            return NO_ERROR;
-        } break;
-        ///@}
-
-#endif
-
         default:
             return BBinder::onTransact(code, data, reply, flags);
     }

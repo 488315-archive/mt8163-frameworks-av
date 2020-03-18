@@ -17,6 +17,7 @@
 //#define LOG_NDEBUG 0
 #define LOG_TAG "OMXHarness"
 #include <inttypes.h>
+#include <android-base/macros.h>
 #include <utils/Log.h>
 
 #include "OMXHarness.h"
@@ -25,23 +26,46 @@
 
 #include <binder/ProcessState.h>
 #include <binder/IServiceManager.h>
-#include <binder/MemoryDealer.h>
+#include <cutils/properties.h>
+#include <media/DataSource.h>
 #include <media/IMediaHTTPService.h>
-#include <media/IMediaPlayerService.h>
+#include <media/MediaSource.h>
+#include <media/OMXBuffer.h>
 #include <media/stagefright/foundation/ADebug.h>
 #include <media/stagefright/foundation/ALooper.h>
-#include <media/stagefright/DataSource.h>
+#include <media/stagefright/DataSourceFactory.h>
+#include <media/stagefright/InterfaceUtils.h>
 #include <media/stagefright/MediaBuffer.h>
 #include <media/stagefright/MediaDefs.h>
 #include <media/stagefright/MediaErrors.h>
-#include <media/stagefright/MediaExtractor.h>
-#include <media/stagefright/MediaSource.h>
+#include <media/stagefright/MediaExtractorFactory.h>
 #include <media/stagefright/MetaData.h>
-#include <media/stagefright/OMXCodec.h>
+#include <media/stagefright/OMXClient.h>
+#include <media/stagefright/SimpleDecodingSource.h>
+#include <system/window.h>
 
 #define DEFAULT_TIMEOUT         500000
 
 namespace android {
+
+/////////////////////////////////////////////////////////////////////
+
+struct Harness::CodecObserver : public BnOMXObserver {
+    CodecObserver(const sp<Harness> &harness, int32_t gen)
+            : mHarness(harness), mGeneration(gen) {}
+
+    void onMessages(const std::list<omx_message> &messages) override;
+
+private:
+    sp<Harness> mHarness;
+    int32_t mGeneration;
+};
+
+void Harness::CodecObserver::onMessages(const std::list<omx_message> &messages) {
+    mHarness->handleMessages(mGeneration, messages);
+}
+
+/////////////////////////////////////////////////////////////////////
 
 Harness::Harness()
     : mInitCheck(NO_INIT) {
@@ -56,26 +80,28 @@ status_t Harness::initCheck() const {
 }
 
 status_t Harness::initOMX() {
-    sp<IServiceManager> sm = defaultServiceManager();
-    sp<IBinder> binder = sm->getService(String16("media.player"));
-    sp<IMediaPlayerService> service = interface_cast<IMediaPlayerService>(binder);
-    mOMX = service->getOMX();
+    OMXClient client;
+    if (client.connect() != OK) {
+        ALOGE("Failed to connect to OMX to create persistent input surface.");
+        return NO_INIT;
+    }
+
+    mOMX = client.interface();
 
     return mOMX != 0 ? OK : NO_INIT;
 }
 
-void Harness::onMessages(const std::list<omx_message> &messages) {
+void Harness::handleMessages(int32_t gen, const std::list<omx_message> &messages) {
     Mutex::Autolock autoLock(mLock);
     for (std::list<omx_message>::const_iterator it = messages.cbegin(); it != messages.cend(); ) {
         mMessageQueue.push_back(*it++);
+        mLastMsgGeneration = gen;
     }
     mMessageAddedCondition.signal();
 }
 
-status_t Harness::dequeueMessageForNode(
-        IOMX::node_id node, omx_message *msg, int64_t timeoutUs) {
-    return dequeueMessageForNodeIgnoringBuffers(
-            node, NULL, NULL, msg, timeoutUs);
+status_t Harness::dequeueMessageForNode(omx_message *msg, int64_t timeoutUs) {
+    return dequeueMessageForNodeIgnoringBuffers(NULL, NULL, msg, timeoutUs);
 }
 
 // static
@@ -120,7 +146,6 @@ bool Harness::handleBufferMessage(
 }
 
 status_t Harness::dequeueMessageForNodeIgnoringBuffers(
-        IOMX::node_id node,
         Vector<Buffer> *inputBuffers,
         Vector<Buffer> *outputBuffers,
         omx_message *msg, int64_t timeoutUs) {
@@ -128,21 +153,22 @@ status_t Harness::dequeueMessageForNodeIgnoringBuffers(
 
     for (;;) {
         Mutex::Autolock autoLock(mLock);
+        // Messages are queued in batches, if the last batch queued is
+        // from a node that already expired, discard those messages.
+        if (mLastMsgGeneration < mCurGeneration) {
+            mMessageQueue.clear();
+        }
         List<omx_message>::iterator it = mMessageQueue.begin();
         while (it != mMessageQueue.end()) {
-            if ((*it).node == node) {
-                if (handleBufferMessage(*it, inputBuffers, outputBuffers)) {
-                    it = mMessageQueue.erase(it);
-                    continue;
-                }
-
-                *msg = *it;
-                mMessageQueue.erase(it);
-
-                return OK;
+            if (handleBufferMessage(*it, inputBuffers, outputBuffers)) {
+                it = mMessageQueue.erase(it);
+                continue;
             }
 
-            ++it;
+            *msg = *it;
+            mMessageQueue.erase(it);
+
+            return OK;
         }
 
         status_t err = (timeoutUs < 0)
@@ -158,16 +184,15 @@ status_t Harness::dequeueMessageForNodeIgnoringBuffers(
 }
 
 status_t Harness::getPortDefinition(
-        IOMX::node_id node, OMX_U32 portIndex,
-        OMX_PARAM_PORTDEFINITIONTYPE *def) {
+        OMX_U32 portIndex, OMX_PARAM_PORTDEFINITIONTYPE *def) {
     def->nSize = sizeof(*def);
     def->nVersion.s.nVersionMajor = 1;
     def->nVersion.s.nVersionMinor = 0;
     def->nVersion.s.nRevision = 0;
     def->nVersion.s.nStep = 0;
     def->nPortIndex = portIndex;
-    return mOMX->getParameter(
-            node, OMX_IndexParamPortDefinition, def, sizeof(*def));
+    return mOMXNode->getParameter(
+            OMX_IndexParamPortDefinition, def, sizeof(*def));
 }
 
 #define EXPECT(condition, info) \
@@ -179,24 +204,31 @@ status_t Harness::getPortDefinition(
     EXPECT((err) == OK, info " failed")
 
 status_t Harness::allocatePortBuffers(
-        const sp<MemoryDealer> &dealer,
-        IOMX::node_id node, OMX_U32 portIndex,
-        Vector<Buffer> *buffers) {
+        OMX_U32 portIndex, Vector<Buffer> *buffers) {
     buffers->clear();
 
     OMX_PARAM_PORTDEFINITIONTYPE def;
-    status_t err = getPortDefinition(node, portIndex, &def);
+    status_t err = getPortDefinition(portIndex, &def);
     EXPECT_SUCCESS(err, "getPortDefinition");
 
     for (OMX_U32 i = 0; i < def.nBufferCountActual; ++i) {
         Buffer buffer;
-        buffer.mMemory = dealer->allocate(def.nBufferSize);
         buffer.mFlags = 0;
-        CHECK(buffer.mMemory != NULL);
+        bool success;
+        auto transStatus = mAllocator->allocate(def.nBufferSize,
+                [&success, &buffer](
+                        bool s,
+                        hidl_memory const& m) {
+                    success = s;
+                    buffer.mHidlMemory = m;
+                });
+        EXPECT(transStatus.isOk(),
+                "Cannot call allocator");
+        EXPECT(success,
+                "Cannot allocate memory");
+        err = mOMXNode->useBuffer(portIndex, buffer.mHidlMemory, &buffer.mID);
 
-        err = mOMX->allocateBufferWithBackup(
-                node, portIndex, buffer.mMemory, &buffer.mID, buffer.mMemory->size());
-        EXPECT_SUCCESS(err, "allocateBuffer");
+        EXPECT_SUCCESS(err, "useBuffer");
 
         buffers->push(buffer);
     }
@@ -204,7 +236,7 @@ status_t Harness::allocatePortBuffers(
     return OK;
 }
 
-status_t Harness::setRole(IOMX::node_id node, const char *role) {
+status_t Harness::setRole(const char *role) {
     OMX_PARAM_COMPONENTROLETYPE params;
     params.nSize = sizeof(params);
     params.nVersion.s.nVersionMajor = 1;
@@ -214,45 +246,45 @@ status_t Harness::setRole(IOMX::node_id node, const char *role) {
     strncpy((char *)params.cRole, role, OMX_MAX_STRINGNAME_SIZE - 1);
     params.cRole[OMX_MAX_STRINGNAME_SIZE - 1] = '\0';
 
-    return mOMX->setParameter(
-            node, OMX_IndexParamStandardComponentRole,
+    return mOMXNode->setParameter(
+            OMX_IndexParamStandardComponentRole,
             &params, sizeof(params));
 }
 
 struct NodeReaper {
-    NodeReaper(const sp<Harness> &harness, IOMX::node_id node)
+    NodeReaper(const sp<Harness> &harness, const sp<IOMXNode> &omxNode)
         : mHarness(harness),
-          mNode(node) {
+          mOMXNode(omxNode) {
     }
 
     ~NodeReaper() {
-        if (mNode != 0) {
-            mHarness->mOMX->freeNode(mNode);
-            mNode = 0;
+        if (mOMXNode != 0) {
+            mOMXNode->freeNode();
+            mOMXNode = NULL;
         }
     }
 
     void disarm() {
-        mNode = 0;
+        mOMXNode = NULL;
     }
 
 private:
     sp<Harness> mHarness;
-    IOMX::node_id mNode;
+    sp<IOMXNode> mOMXNode;
 
     NodeReaper(const NodeReaper &);
     NodeReaper &operator=(const NodeReaper &);
 };
 
-static sp<MediaExtractor> CreateExtractorFromURI(const char *uri) {
+static sp<IMediaExtractor> CreateExtractorFromURI(const char *uri) {
     sp<DataSource> source =
-        DataSource::CreateFromURI(NULL /* httpService */, uri);
+        DataSourceFactory::CreateFromURI(NULL /* httpService */, uri);
 
     if (source == NULL) {
         return NULL;
     }
 
-    return MediaExtractor::Create(source);
+    return MediaExtractorFactory::Create(source);
 }
 
 status_t Harness::testStateTransitions(
@@ -263,24 +295,28 @@ status_t Harness::testStateTransitions(
         return OK;
     }
 
-    sp<MemoryDealer> dealer = new MemoryDealer(16 * 1024 * 1024, "OMXHarness");
-    IOMX::node_id node;
+    mAllocator = IAllocator::getService("ashmem");
+    EXPECT(mAllocator != nullptr,
+            "Cannot obtain hidl AshmemAllocator");
+    // TODO: When Treble has MemoryHeap/MemoryDealer, we should specify the heap
+    // size to be 16 * 1024 * 1024.
 
-    status_t err =
-        mOMX->allocateNode(componentName, this, &node);
+    sp<CodecObserver> observer = new CodecObserver(this, ++mCurGeneration);
+
+    status_t err = mOMX->allocateNode(componentName, observer, &mOMXNode);
     EXPECT_SUCCESS(err, "allocateNode");
 
-    NodeReaper reaper(this, node);
+    NodeReaper reaper(this, mOMXNode);
 
-    err = setRole(node, componentRole);
+    err = setRole(componentRole);
     EXPECT_SUCCESS(err, "setRole");
 
     // Initiate transition Loaded->Idle
-    err = mOMX->sendCommand(node, OMX_CommandStateSet, OMX_StateIdle);
+    err = mOMXNode->sendCommand(OMX_CommandStateSet, OMX_StateIdle);
     EXPECT_SUCCESS(err, "sendCommand(go-to-Idle)");
 
     omx_message msg;
-    err = dequeueMessageForNode(node, &msg, DEFAULT_TIMEOUT);
+    err = dequeueMessageForNode(&msg, DEFAULT_TIMEOUT);
     // Make sure node doesn't just transition to idle before we are done
     // allocating all input and output buffers.
     EXPECT(err == TIMED_OUT,
@@ -289,17 +325,17 @@ status_t Harness::testStateTransitions(
 
     // Now allocate buffers.
     Vector<Buffer> inputBuffers;
-    err = allocatePortBuffers(dealer, node, 0, &inputBuffers);
+    err = allocatePortBuffers(0, &inputBuffers);
     EXPECT_SUCCESS(err, "allocatePortBuffers(input)");
 
-    err = dequeueMessageForNode(node, &msg, DEFAULT_TIMEOUT);
+    err = dequeueMessageForNode(&msg, DEFAULT_TIMEOUT);
     CHECK_EQ(err, (status_t)TIMED_OUT);
 
     Vector<Buffer> outputBuffers;
-    err = allocatePortBuffers(dealer, node, 1, &outputBuffers);
+    err = allocatePortBuffers(1, &outputBuffers);
     EXPECT_SUCCESS(err, "allocatePortBuffers(output)");
 
-    err = dequeueMessageForNode(node, &msg, DEFAULT_TIMEOUT);
+    err = dequeueMessageForNode(&msg, DEFAULT_TIMEOUT);
     EXPECT(err == OK
             && msg.type == omx_message::EVENT
             && msg.u.event_data.event == OMX_EventCmdComplete
@@ -309,10 +345,10 @@ status_t Harness::testStateTransitions(
            "after all input and output buffers were allocated.");
 
     // Initiate transition Idle->Executing
-    err = mOMX->sendCommand(node, OMX_CommandStateSet, OMX_StateExecuting);
+    err = mOMXNode->sendCommand(OMX_CommandStateSet, OMX_StateExecuting);
     EXPECT_SUCCESS(err, "sendCommand(go-to-Executing)");
 
-    err = dequeueMessageForNode(node, &msg, DEFAULT_TIMEOUT);
+    err = dequeueMessageForNode(&msg, DEFAULT_TIMEOUT);
     EXPECT(err == OK
             && msg.type == omx_message::EVENT
             && msg.u.event_data.event == OMX_EventCmdComplete
@@ -322,17 +358,17 @@ status_t Harness::testStateTransitions(
            "executing state.");
 
     for (size_t i = 0; i < outputBuffers.size(); ++i) {
-        err = mOMX->fillBuffer(node, outputBuffers[i].mID);
+        err = mOMXNode->fillBuffer(outputBuffers[i].mID, OMXBuffer::sPreset);
         EXPECT_SUCCESS(err, "fillBuffer");
 
         outputBuffers.editItemAt(i).mFlags |= kBufferBusy;
     }
 
-    err = mOMX->sendCommand(node, OMX_CommandFlush, 1);
+    err = mOMXNode->sendCommand(OMX_CommandFlush, 1);
     EXPECT_SUCCESS(err, "sendCommand(flush-output-port)");
 
     err = dequeueMessageForNodeIgnoringBuffers(
-            node, &inputBuffers, &outputBuffers, &msg, DEFAULT_TIMEOUT);
+            &inputBuffers, &outputBuffers, &msg, DEFAULT_TIMEOUT);
     EXPECT(err == OK
             && msg.type == omx_message::EVENT
             && msg.u.event_data.event == OMX_EventCmdComplete
@@ -347,18 +383,18 @@ status_t Harness::testStateTransitions(
     }
 
     for (size_t i = 0; i < outputBuffers.size(); ++i) {
-        err = mOMX->fillBuffer(node, outputBuffers[i].mID);
+        err = mOMXNode->fillBuffer(outputBuffers[i].mID, OMXBuffer::sPreset);
         EXPECT_SUCCESS(err, "fillBuffer");
 
         outputBuffers.editItemAt(i).mFlags |= kBufferBusy;
     }
 
     // Initiate transition Executing->Idle
-    err = mOMX->sendCommand(node, OMX_CommandStateSet, OMX_StateIdle);
+    err = mOMXNode->sendCommand(OMX_CommandStateSet, OMX_StateIdle);
     EXPECT_SUCCESS(err, "sendCommand(go-to-Idle)");
 
     err = dequeueMessageForNodeIgnoringBuffers(
-            node, &inputBuffers, &outputBuffers, &msg, DEFAULT_TIMEOUT);
+            &inputBuffers, &outputBuffers, &msg, DEFAULT_TIMEOUT);
     EXPECT(err == OK
             && msg.type == omx_message::EVENT
             && msg.u.event_data.event == OMX_EventCmdComplete
@@ -382,28 +418,28 @@ status_t Harness::testStateTransitions(
     }
 
     // Initiate transition Idle->Loaded
-    err = mOMX->sendCommand(node, OMX_CommandStateSet, OMX_StateLoaded);
+    err = mOMXNode->sendCommand(OMX_CommandStateSet, OMX_StateLoaded);
     EXPECT_SUCCESS(err, "sendCommand(go-to-Loaded)");
 
     // Make sure node doesn't just transition to loaded before we are done
     // freeing all input and output buffers.
-    err = dequeueMessageForNode(node, &msg, DEFAULT_TIMEOUT);
+    err = dequeueMessageForNode(&msg, DEFAULT_TIMEOUT);
     CHECK_EQ(err, (status_t)TIMED_OUT);
 
     for (size_t i = 0; i < inputBuffers.size(); ++i) {
-        err = mOMX->freeBuffer(node, 0, inputBuffers[i].mID);
+        err = mOMXNode->freeBuffer(0, inputBuffers[i].mID);
         EXPECT_SUCCESS(err, "freeBuffer");
     }
 
-    err = dequeueMessageForNode(node, &msg, DEFAULT_TIMEOUT);
+    err = dequeueMessageForNode(&msg, DEFAULT_TIMEOUT);
     CHECK_EQ(err, (status_t)TIMED_OUT);
 
     for (size_t i = 0; i < outputBuffers.size(); ++i) {
-        err = mOMX->freeBuffer(node, 1, outputBuffers[i].mID);
+        err = mOMXNode->freeBuffer(1, outputBuffers[i].mID);
         EXPECT_SUCCESS(err, "freeBuffer");
     }
 
-    err = dequeueMessageForNode(node, &msg, DEFAULT_TIMEOUT);
+    err = dequeueMessageForNode(&msg, DEFAULT_TIMEOUT);
     EXPECT(err == OK
             && msg.type == omx_message::EVENT
             && msg.u.event_data.event == OMX_EventCmdComplete
@@ -412,12 +448,12 @@ status_t Harness::testStateTransitions(
            "Component did not properly transition to from idle to "
            "loaded state after freeing all input and output buffers.");
 
-    err = mOMX->freeNode(node);
+    err = mOMXNode->freeNode();
     EXPECT_SUCCESS(err, "freeNode");
 
     reaper.disarm();
 
-    node = 0;
+    mOMXNode = NULL;
 
     return OK;
 }
@@ -499,7 +535,7 @@ static sp<MediaSource> CreateSourceForMime(const char *mime) {
         return NULL;
     }
 
-    sp<MediaExtractor> extractor = CreateExtractorFromURI(url);
+    sp<IMediaExtractor> extractor = CreateExtractorFromURI(url);
 
     if (extractor == NULL) {
         return NULL;
@@ -513,7 +549,7 @@ static sp<MediaSource> CreateSourceForMime(const char *mime) {
         CHECK(meta->findCString(kKeyMIMEType, &trackMime));
 
         if (!strcasecmp(mime, trackMime)) {
-            return extractor->getTrack(i);
+            return CreateMediaSourceFromIMediaSource(extractor->getTrack(i));
         }
     }
 
@@ -576,9 +612,8 @@ status_t Harness::testSeek(
 
     CHECK_EQ(seekSource->start(), (status_t)OK);
 
-    sp<MediaSource> codec = OMXCodec::Create(
-            mOMX, source->getFormat(), false /* createEncoder */,
-            source, componentName);
+    sp<MediaSource> codec = SimpleDecodingSource::Create(
+            source, 0 /* flags */, NULL /* nativeWindow */, componentName);
 
     CHECK(codec != NULL);
 
@@ -623,7 +658,7 @@ status_t Harness::testSeek(
                      requestedSeekTimeUs, requestedSeekTimeUs / 1E6);
             }
 
-            MediaBuffer *buffer = NULL;
+            MediaBufferBase *buffer = NULL;
             options.setSeekTo(
                     requestedSeekTimeUs, MediaSource::ReadOptions::SEEK_NEXT_SYNC);
 
@@ -632,7 +667,7 @@ status_t Harness::testSeek(
                 actualSeekTimeUs = -1;
             } else {
                 CHECK(buffer != NULL);
-                CHECK(buffer->meta_data()->findInt64(kKeyTime, &actualSeekTimeUs));
+                CHECK(buffer->meta_data().findInt64(kKeyTime, &actualSeekTimeUs));
                 CHECK(actualSeekTimeUs >= 0);
 
                 buffer->release();
@@ -644,7 +679,7 @@ status_t Harness::testSeek(
         }
 
         status_t err;
-        MediaBuffer *buffer;
+        MediaBufferBase *buffer;
         for (;;) {
             err = codec->read(&buffer, &options);
             options.clearSeekTo();
@@ -693,7 +728,7 @@ status_t Harness::testSeek(
             CHECK(buffer != NULL);
 
             int64_t bufferTimeUs;
-            CHECK(buffer->meta_data()->findInt64(kKeyTime, &bufferTimeUs));
+            CHECK(buffer->meta_data().findInt64(kKeyTime, &bufferTimeUs));
             if (!CloseEnough(bufferTimeUs, actualSeekTimeUs)) {
                 printf("\n  * Attempted seeking to %" PRId64 " us (%.2f secs)",
                        requestedSeekTimeUs, requestedSeekTimeUs / 1E6);
@@ -785,7 +820,6 @@ int main(int argc, char **argv) {
     using namespace android;
 
     android::ProcessState::self()->startThreadPool();
-    DataSource::RegisterDefaultSniffers();
 
     const char *me = argv[0];
 
@@ -810,7 +844,7 @@ int main(int argc, char **argv) {
 
             case '?':
                 fprintf(stderr, "\n");
-                // fall through
+                FALLTHROUGH_INTENDED;
 
             case 'h':
             default:

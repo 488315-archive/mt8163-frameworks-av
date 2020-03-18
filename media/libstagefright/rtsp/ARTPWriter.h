@@ -1,10 +1,4 @@
 /*
-* Copyright (C) 2014 MediaTek Inc.
-* Modification based on code covered by the mentioned copyright
-* and/or permission notice(s).
-*/
-
-/*
  * Copyright (C) 2010 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -41,7 +35,7 @@ struct ABuffer;
 class MediaBuffer;
 
 struct ARTPWriter : public MediaWriter {
-    ARTPWriter(int fd);
+    explicit ARTPWriter(int fd);
 
     virtual status_t addSource(const sp<MediaSource> &source);
     virtual bool reachedEOS();
@@ -106,9 +100,6 @@ private:
         H263,
         AMR_NB,
         AMR_WB,
-#ifdef MTK_AOSP_ENHANCEMENT
-        MPEG_4_SP,
-#endif // #ifdef MTK_AOSP_ENHANCEMENT
     } mMode;
 
     static uint64_t GetNowNTP();
@@ -119,23 +110,17 @@ private:
     void addSR(const sp<ABuffer> &buffer);
     void addSDES(const sp<ABuffer> &buffer);
 
-    void makeH264SPropParamSets(MediaBuffer *buffer);
+    void makeH264SPropParamSets(MediaBufferBase *buffer);
     void dumpSessionDesc();
 
     void sendBye();
-    void sendAVCData(MediaBuffer *mediaBuf);
-    void sendH263Data(MediaBuffer *mediaBuf);
-    void sendAMRData(MediaBuffer *mediaBuf);
+    void sendAVCData(MediaBufferBase *mediaBuf);
+    void sendH263Data(MediaBufferBase *mediaBuf);
+    void sendAMRData(MediaBufferBase *mediaBuf);
 
     void send(const sp<ABuffer> &buffer, bool isRTCP);
 
     DISALLOW_EVIL_CONSTRUCTORS(ARTPWriter);
-
-#ifdef MTK_AOSP_ENHANCEMENT
-private:
-    void parseParams(MetaData *params);
-    void sendMPEG4Data(MediaBuffer *mediaBuf);
-#endif // #ifdef MTK_AOSP_ENHANCEMENT
 };
 
 }  // namespace android

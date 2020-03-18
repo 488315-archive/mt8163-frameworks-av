@@ -18,7 +18,6 @@
 #define ANDROID_SERVERS_CAMERA_CAMERA2CLIENT_BASE_H
 
 #include "common/CameraDeviceBase.h"
-#include "common/CameraModule.h"
 #include "camera/CaptureResult.h"
 
 namespace android {
@@ -38,8 +37,8 @@ public:
     /**
      * Base binder interface (see ICamera/ICameraDeviceUser for details)
      */
-    virtual status_t      connect(const sp<TCamCallbacks>& callbacks);
-    virtual void          disconnect();
+    virtual status_t       connect(const sp<TCamCallbacks>& callbacks);
+    virtual binder::Status disconnect();
 
     /**
      * Interface used by CameraService
@@ -49,21 +48,22 @@ public:
     Camera2ClientBase(const sp<CameraService>& cameraService,
                       const sp<TCamCallbacks>& remoteCallback,
                       const String16& clientPackageName,
-                      int cameraId,
+                      const String8& cameraId,
+                      int api1CameraId,
                       int cameraFacing,
                       int clientPid,
                       uid_t clientUid,
                       int servicePid);
     virtual ~Camera2ClientBase();
 
-    virtual status_t      initialize(CameraModule *module);
-    virtual status_t      dump(int fd, const Vector<String16>& args);
+    virtual status_t      initialize(sp<CameraProviderManager> manager, const String8& monitorTags);
+    virtual status_t      dumpClient(int fd, const Vector<String16>& args);
 
     /**
      * CameraDeviceBase::NotificationListener implementation
      */
 
-    virtual void          notifyError(ICameraDeviceCallbacks::CameraErrorCode errorCode,
+    virtual void          notifyError(int32_t errorCode,
                                       const CaptureResultExtras& resultExtras);
     virtual void          notifyIdle();
     virtual void          notifyShutter(const CaptureResultExtras& resultExtras,
@@ -73,6 +73,8 @@ public:
     virtual void          notifyAutoWhitebalance(uint8_t newState,
                                                  int triggerId);
     virtual void          notifyPrepared(int streamId);
+    virtual void          notifyRequestQueueEmpty();
+    virtual void          notifyRepeatingRequestError(long lastFrameNumber);
 
     int                   getCameraId() const;
     const sp<CameraDeviceBase>&
@@ -92,13 +94,13 @@ public:
       public:
         class Lock {
           public:
-            Lock(SharedCameraCallbacks &client);
+            explicit Lock(SharedCameraCallbacks &client);
             ~Lock();
             sp<TCamCallbacks> &mRemoteCallback;
           private:
             SharedCameraCallbacks &mSharedClient;
         };
-        SharedCameraCallbacks(const sp<TCamCallbacks>& client);
+        explicit SharedCameraCallbacks(const sp<TCamCallbacks>& client);
         SharedCameraCallbacks& operator=(const sp<TCamCallbacks>& client);
         void clear();
       private:
@@ -125,10 +127,13 @@ protected:
     // that mBinderSerializationLock is locked when they're called
     mutable Mutex         mBinderSerializationLock;
 
-    /** CameraDeviceBase instance wrapping HAL2+ entry */
+    /** CameraDeviceBase instance wrapping HAL3+ entry */
 
     const int mDeviceVersion;
-    sp<CameraDeviceBase>  mDevice;
+
+    // Set to const to avoid mDevice being updated (update of sp<> is racy) during
+    // dumpDevice (which is important to be lock free for debugging purpose)
+    const sp<CameraDeviceBase>  mDevice;
 
     /** Utility members */
 
@@ -136,6 +141,14 @@ protected:
     status_t              checkPid(const char *checkLocation) const;
 
     virtual void          detachDevice();
+
+    bool                  mDeviceActive;
+
+    const int             mApi1CameraId; // -1 if client is API2
+
+private:
+    template<typename TProviderPtr>
+    status_t              initializeImpl(TProviderPtr providerPtr, const String8& monitorTags);
 };
 
 }; // namespace android

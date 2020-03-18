@@ -1,9 +1,4 @@
 /*
-* Copyright (C) 2014 MediaTek Inc.
-* Modification based on code covered by the mentioned copyright
-* and/or permission notice(s).
-*/
-/*
  * Copyright (C) 2010 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,17 +20,26 @@
 
 #include <sys/types.h>
 
+#include <media/MediaSource.h>
 #include <media/stagefright/foundation/ABase.h>
 #include <media/stagefright/foundation/AMessage.h>
-#include <media/stagefright/MediaSource.h>
+#include <media/stagefright/foundation/AudioPresentationInfo.h>
 #include <utils/KeyedVector.h>
 #include <utils/Vector.h>
 #include <utils/RefBase.h>
+#include <vector>
 
 namespace android {
+namespace hardware {
+namespace cas {
+namespace V1_0 {
+struct ICas;
+}}}
+using hardware::cas::V1_0::ICas;
 
 class ABitReader;
 struct ABuffer;
+struct AnotherPacketSource;
 
 struct ATSParser : public RefBase {
     enum DiscontinuityType {
@@ -54,10 +58,6 @@ struct ATSParser : public RefBase {
         DISCONTINUITY_FORMAT_ONLY       =
             DISCONTINUITY_AUDIO_FORMAT
                 | DISCONTINUITY_VIDEO_FORMAT,
-#ifdef MTK_AOSP_ENHANCEMENT
-        DISCONTINUITY_HTTPLIVE_MEDIATIME     = 0x20000000,
-        DISCONTINUITY_FLUSH_SOURCE_ONLY       = 0x80000000,
-#endif
     };
 
     enum Flags {
@@ -69,38 +69,47 @@ struct ATSParser : public RefBase {
         TS_TIMESTAMPS_ARE_ABSOLUTE = 1,
         // Video PES packets contain exactly one (aligned) access unit.
         ALIGNED_VIDEO_DATA         = 2,
-#ifdef MTK_AOSP_ENHANCEMENT
-        TS_SOURCE_IS_LOCAL = 0x40000000,
-        TS_SOURCE_IS_STREAMING = 0x80000000,
-#endif
+    };
+
+    enum SourceType {
+        VIDEO = 0,
+        AUDIO = 1,
+        META  = 2,
+        NUM_SOURCE_TYPES = 3
     };
 
     // Event is used to signal sync point event at feedTSPacket().
     struct SyncEvent {
-        SyncEvent(off64_t offset);
+        explicit SyncEvent(off64_t offset);
 
-        void init(off64_t offset, const sp<MediaSource> &source,
-                int64_t timeUs);
+        void init(off64_t offset, const sp<AnotherPacketSource> &source,
+                int64_t timeUs, SourceType type);
 
-        bool isInit() { return mInit; }
-        off64_t getOffset() { return mOffset; }
-        const sp<MediaSource> &getMediaSource() { return mMediaSource; }
-        int64_t getTimeUs() { return mTimeUs; }
+        bool hasReturnedData() const { return mHasReturnedData; }
+        void reset();
+        off64_t getOffset() const { return mOffset; }
+        const sp<AnotherPacketSource> &getMediaSource() const { return mMediaSource; }
+        int64_t getTimeUs() const { return mTimeUs; }
+        SourceType getType() const { return mType; }
 
     private:
-        bool mInit;
+        bool mHasReturnedData;
         /*
-         * mInit == false: the current offset
-         * mInit == true: the start offset of sync payload
+         * mHasReturnedData == false: the current offset (or undefined if the returned data
+                                      has been invalidated via reset())
+         * mHasReturnedData == true: the start offset of sync payload
          */
         off64_t mOffset;
         /* The media source object for this event. */
-        sp<MediaSource> mMediaSource;
+        sp<AnotherPacketSource> mMediaSource;
         /* The timestamp of the sync frame. */
         int64_t mTimeUs;
+        SourceType mType;
     };
 
-    ATSParser(uint32_t flags = 0);
+    explicit ATSParser(uint32_t flags = 0);
+
+    status_t setMediaCas(const sp<ICas> &cas);
 
     // Feed a TS packet into the parser. uninitialized event with the start
     // offset of this TS packet goes in, and if the parser detects PES with
@@ -113,30 +122,19 @@ struct ATSParser : public RefBase {
     status_t feedTSPacket(
             const void *data, size_t size, SyncEvent *event = NULL);
 
-#ifdef MTK_AOSP_ENHANCEMENT
-    void signalDiscontinuity(DiscontinuityType type, const sp <AMessage> &extra = NULL);
-#else
     void signalDiscontinuity(
             DiscontinuityType type, const sp<AMessage> &extra);
-#endif
 
     void signalEOS(status_t finalResult);
 
-    enum SourceType {
-        VIDEO = 0,
-        AUDIO = 1,
-        META  = 2,
-        NUM_SOURCE_TYPES = 3
-#ifdef MTK_AOSP_ENHANCEMENT
-#ifdef MTK_AOSP_ENHANCEMENT
-        ,SUBTITLE
-#endif
-#endif
-    };
-    sp<MediaSource> getSource(SourceType type);
+    sp<AnotherPacketSource> getSource(SourceType type);
     bool hasSource(SourceType type) const;
 
     bool PTSTimeDeltaEstablished();
+
+    int64_t getFirstPTSTimeUs();
+
+    void signalNewSampleAesKey(const sp<AMessage> &keyItem);
 
     enum {
         // From ISO/IEC 13818-1: 2000 (E), Table 2-29
@@ -145,49 +143,67 @@ struct ATSParser : public RefBase {
         STREAMTYPE_MPEG2_VIDEO          = 0x02,
         STREAMTYPE_MPEG1_AUDIO          = 0x03,
         STREAMTYPE_MPEG2_AUDIO          = 0x04,
-#ifdef MTK_AOSP_ENHANCEMENT
-#ifdef MTK_AOSP_ENHANCEMENT
-        STREAMTYPE_SUBTITLE = 0x06,
-#endif
-#endif
+        STREAMTYPE_PES_PRIVATE_DATA     = 0x06,
         STREAMTYPE_MPEG2_AUDIO_ADTS     = 0x0f,
         STREAMTYPE_MPEG4_VIDEO          = 0x10,
         STREAMTYPE_METADATA             = 0x15,
         STREAMTYPE_H264                 = 0x1b,
-#ifdef MTK_AOSP_ENHANCEMENT
-        STREAMTYPE_HEVC                 = 0x24,
-        STREAMTYPE_AUDIO_PSLPCM = 0xa0,
-        STREAMTYPE_AUDIO_BDLPCM = 0x80,
-        STREAMTYPE_VC1_VIDEO = 0xea,
-#endif
+
         // From ATSC A/53 Part 3:2009, 6.7.1
         STREAMTYPE_AC3                  = 0x81,
-        STREAMTYPE_PCM_AUDIO            = 0x83,
+
         // Stream type 0x83 is non-standard,
         // it could be LPCM or TrueHD AC3
-        STREAMTYPE_EC3                  = 0x87,
+        STREAMTYPE_LPCM_AC3             = 0x83,
+        STREAMTYPE_EAC3                 = 0x87,
+
+        //Sample Encrypted types
+        STREAMTYPE_H264_ENCRYPTED       = 0xDB,
+        STREAMTYPE_AAC_ENCRYPTED        = 0xCF,
+        STREAMTYPE_AC3_ENCRYPTED        = 0xC1,
     };
 
-        sp<MediaSource> getSource(unsigned PID, unsigned index);
+    enum {
+        // From ISO/IEC 13818-1: 2007 (E), Table 2-45
+        DESCRIPTOR_CA                   = 0x09,
 
-    bool       isParsedPIDEmpty();
-    unsigned   parsedPIDSize();
-    void       removeParsedPID(unsigned index);
-    void       addParsedPID(unsigned elemPID);
-    unsigned   getParsedPID(unsigned index);
-    size_t getPlayProgramPID(size_t playindex);
+        // DVB BlueBook A038 Table 12
+        DESCRIPTOR_DVB_EXTENSION        = 0x7F,
+    };
+
+    // DVB BlueBook A038 Table 109
+    enum {
+        EXT_DESCRIPTOR_DVB_AC4                  = 0x15,
+        EXT_DESCRIPTOR_DVB_AUDIO_PRESELECTION   = 0x19,
+        EXT_DESCRIPTOR_DVB_RESERVED_MAX         = 0x7F,
+    };
 
 protected:
     virtual ~ATSParser();
 
 private:
-        Vector<unsigned> mParsedPID;
     struct Program;
     struct Stream;
     struct PSISection;
+    struct CasManager;
+    struct CADescriptor {
+        CADescriptor() : mPID(0), mSystemID(-1) {}
+        unsigned mPID;
+        int32_t mSystemID;
+        std::vector<uint8_t> mPrivateData;
+    };
+
+    struct StreamInfo {
+        unsigned mType;
+        unsigned mTypeExt;
+        unsigned mPID;
+        CADescriptor mCADescriptor;
+        AudioPresentationCollection mAudioPresentations;
+    };
+
+    sp<CasManager> mCasManager;
 
     uint32_t mFlags;
-    bool isSourceFromWFD;
     Vector<sp<Program> > mPrograms;
 
     // Keyed by PID
@@ -201,11 +217,9 @@ private:
 
     size_t mNumTSPacketsParsed;
 
-#ifdef MTK_AOSP_ENHANCEMENT
-    status_t parseProgramAssociationTable(ABitReader *br);
-#else
+    sp<AMessage> mSampleAesKeyItem;
+
     void parseProgramAssociationTable(ABitReader *br);
-#endif
     void parseProgramMap(ABitReader *br);
     // Parse PES packet where br is pointing to. If the PES contains a sync
     // frame, set event with the time and the start offset of this PES.
@@ -221,42 +235,24 @@ private:
         ABitReader *br, unsigned PID,
         unsigned continuity_counter,
         unsigned payload_unit_start_indicator,
+        unsigned transport_scrambling_control,
+        unsigned random_access_indicator,
         SyncEvent *event);
 
-    status_t parseAdaptationField(ABitReader *br, unsigned PID);
+    status_t parseAdaptationField(
+            ABitReader *br, unsigned PID, unsigned *random_access_indicator);
+
     // see feedTSPacket().
     status_t parseTS(ABitReader *br, SyncEvent *event);
 
-    void updatePCR(unsigned PID, uint64_t PCR, size_t byteOffsetFromStart);
+    void updatePCR(unsigned PID, uint64_t PCR, uint64_t byteOffsetFromStart);
 
     uint64_t mPCR[2];
-    size_t mPCRBytes[2];
+    uint64_t mPCRBytes[2];
     int64_t mSystemTimeUs[2];
     size_t mNumPCRs;
 
     DISALLOW_EVIL_CONSTRUCTORS(ATSParser);
-#ifdef MTK_AOSP_ENHANCEMENT
-public:
-    void setQueue(bool isQueue);
-    int64_t getMaxPTS();
-    bool firstPTSIsValid();
-    bool findPAT(const void *data, size_t size);
-    bool getDequeueState();
-    void setDequeueState(bool needDequeuePES);
-    void useFrameBase();
-    bool isFrameBase();
-    size_t getPlayIndex(){return currentPlayIndex;}
-    void setPlayIndex(size_t playindex){currentPlayIndex = playindex;}
-    void setFirstPTSIsValid();
-    void DumpTS(const void *data);//mtk08123 for tsdump
-    void configureTSDump();//mtk08123 for tsdump
-private:
-    FILE* mDumptsfile;
-    bool Dumptsfile;
-    bool mNeedDequeuePES;
-    bool mUseFrameBase;
-    size_t currentPlayIndex;
-#endif
 };
 
 }  // namespace android

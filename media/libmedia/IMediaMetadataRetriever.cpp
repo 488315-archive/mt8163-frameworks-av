@@ -23,6 +23,7 @@
 #include <media/IDataSource.h>
 #include <media/IMediaHTTPService.h>
 #include <media/IMediaMetadataRetriever.h>
+#include <processgroup/sched_policy.h>
 #include <utils/String8.h>
 #include <utils/KeyedVector.h>
 
@@ -68,6 +69,9 @@ enum {
     SET_DATA_SOURCE_FD,
     SET_DATA_SOURCE_CALLBACK,
     GET_FRAME_AT_TIME,
+    GET_IMAGE_AT_INDEX,
+    GET_IMAGE_RECT_AT_INDEX,
+    GET_FRAME_AT_INDEX,
     EXTRACT_ALBUM_ART,
     EXTRACT_METADATA,
 };
@@ -75,7 +79,7 @@ enum {
 class BpMediaMetadataRetriever: public BpInterface<IMediaMetadataRetriever>
 {
 public:
-    BpMediaMetadataRetriever(const sp<IBinder>& impl)
+    explicit BpMediaMetadataRetriever(const sp<IBinder>& impl)
         : BpInterface<IMediaMetadataRetriever>(impl)
     {
     }
@@ -127,22 +131,32 @@ public:
         return reply.readInt32();
     }
 
-    status_t setDataSource(const sp<IDataSource>& source)
+    status_t setDataSource(const sp<IDataSource>& source, const char *mime)
     {
         Parcel data, reply;
         data.writeInterfaceToken(IMediaMetadataRetriever::getInterfaceDescriptor());
         data.writeStrongBinder(IInterface::asBinder(source));
+
+        if (mime != NULL) {
+            data.writeInt32(1);
+            data.writeCString(mime);
+        } else {
+            data.writeInt32(0);
+        }
         remote()->transact(SET_DATA_SOURCE_CALLBACK, data, &reply);
         return reply.readInt32();
     }
 
-    sp<IMemory> getFrameAtTime(int64_t timeUs, int option)
+    sp<IMemory> getFrameAtTime(int64_t timeUs, int option, int colorFormat, bool metaOnly)
     {
-        ALOGV("getTimeAtTime: time(%" PRId64 " us) and option(%d)", timeUs, option);
+        ALOGV("getTimeAtTime: time(%" PRId64 " us), option(%d), colorFormat(%d) metaOnly(%d)",
+                timeUs, option, colorFormat, metaOnly);
         Parcel data, reply;
         data.writeInterfaceToken(IMediaMetadataRetriever::getInterfaceDescriptor());
         data.writeInt64(timeUs);
         data.writeInt32(option);
+        data.writeInt32(colorFormat);
+        data.writeInt32(metaOnly);
 #ifndef DISABLE_GROUP_SCHEDULE_HACK
         sendSchedPolicy(data);
 #endif
@@ -152,6 +166,80 @@ public:
             return NULL;
         }
         return interface_cast<IMemory>(reply.readStrongBinder());
+    }
+
+    sp<IMemory> getImageAtIndex(int index, int colorFormat, bool metaOnly, bool thumbnail)
+    {
+        ALOGV("getImageAtIndex: index %d, colorFormat(%d) metaOnly(%d) thumbnail(%d)",
+                index, colorFormat, metaOnly, thumbnail);
+        Parcel data, reply;
+        data.writeInterfaceToken(IMediaMetadataRetriever::getInterfaceDescriptor());
+        data.writeInt32(index);
+        data.writeInt32(colorFormat);
+        data.writeInt32(metaOnly);
+        data.writeInt32(thumbnail);
+#ifndef DISABLE_GROUP_SCHEDULE_HACK
+        sendSchedPolicy(data);
+#endif
+        remote()->transact(GET_IMAGE_AT_INDEX, data, &reply);
+        status_t ret = reply.readInt32();
+        if (ret != NO_ERROR) {
+            return NULL;
+        }
+        return interface_cast<IMemory>(reply.readStrongBinder());
+    }
+
+    sp<IMemory> getImageRectAtIndex(
+            int index, int colorFormat, int left, int top, int right, int bottom)
+    {
+        ALOGV("getImageRectAtIndex: index %d, colorFormat(%d) rect {%d, %d, %d, %d}",
+                index, colorFormat, left, top, right, bottom);
+        Parcel data, reply;
+        data.writeInterfaceToken(IMediaMetadataRetriever::getInterfaceDescriptor());
+        data.writeInt32(index);
+        data.writeInt32(colorFormat);
+        data.writeInt32(left);
+        data.writeInt32(top);
+        data.writeInt32(right);
+        data.writeInt32(bottom);
+#ifndef DISABLE_GROUP_SCHEDULE_HACK
+        sendSchedPolicy(data);
+#endif
+        remote()->transact(GET_IMAGE_RECT_AT_INDEX, data, &reply);
+        status_t ret = reply.readInt32();
+        if (ret != NO_ERROR) {
+            return NULL;
+        }
+        return interface_cast<IMemory>(reply.readStrongBinder());
+    }
+
+    status_t getFrameAtIndex(std::vector<sp<IMemory> > *frames,
+            int frameIndex, int numFrames, int colorFormat, bool metaOnly)
+    {
+        ALOGV("getFrameAtIndex: frameIndex(%d), numFrames(%d), colorFormat(%d) metaOnly(%d)",
+                frameIndex, numFrames, colorFormat, metaOnly);
+        Parcel data, reply;
+        data.writeInterfaceToken(IMediaMetadataRetriever::getInterfaceDescriptor());
+        data.writeInt32(frameIndex);
+        data.writeInt32(numFrames);
+        data.writeInt32(colorFormat);
+        data.writeInt32(metaOnly);
+#ifndef DISABLE_GROUP_SCHEDULE_HACK
+        sendSchedPolicy(data);
+#endif
+        remote()->transact(GET_FRAME_AT_INDEX, data, &reply);
+        status_t ret = reply.readInt32();
+        if (ret != NO_ERROR) {
+            return ret;
+        }
+        int retNumFrames = reply.readInt32();
+        if (retNumFrames < numFrames) {
+            numFrames = retNumFrames;
+        }
+        for (int i = 0; i < numFrames; i++) {
+            frames->push_back(interface_cast<IMemory>(reply.readStrongBinder()));
+        }
+        return OK;
     }
 
     sp<IMemory> extractAlbumArt()
@@ -224,6 +312,11 @@ status_t BnMediaMetadataRetriever::onTransact(
 
             const char* srcUrl = data.readCString();
 
+            if (httpService == NULL || srcUrl == NULL) {
+                reply->writeInt32(BAD_VALUE);
+                return NO_ERROR;
+            }
+
             KeyedVector<String8, String8> headers;
             size_t numHeaders = (size_t) data.readInt64();
             for (size_t i = 0; i < numHeaders; ++i) {
@@ -240,7 +333,7 @@ status_t BnMediaMetadataRetriever::onTransact(
         } break;
         case SET_DATA_SOURCE_FD: {
             CHECK_INTERFACE(IMediaMetadataRetriever, data, reply);
-            int fd = dup(data.readFileDescriptor());
+            int fd = data.readFileDescriptor();
             int64_t offset = data.readInt64();
             int64_t length = data.readInt64();
             reply->writeInt32(setDataSource(fd, offset, length));
@@ -250,23 +343,112 @@ status_t BnMediaMetadataRetriever::onTransact(
             CHECK_INTERFACE(IMediaMetadataRetriever, data, reply);
             sp<IDataSource> source =
                 interface_cast<IDataSource>(data.readStrongBinder());
-            reply->writeInt32(setDataSource(source));
+            if (source == NULL) {
+                reply->writeInt32(BAD_VALUE);
+            } else {
+                int32_t hasMime = data.readInt32();
+                const char *mime = NULL;
+                if (hasMime) {
+                    mime = data.readCString();
+                }
+                reply->writeInt32(setDataSource(source, mime));
+            }
             return NO_ERROR;
         } break;
         case GET_FRAME_AT_TIME: {
             CHECK_INTERFACE(IMediaMetadataRetriever, data, reply);
             int64_t timeUs = data.readInt64();
             int option = data.readInt32();
-            ALOGV("getTimeAtTime: time(%" PRId64 " us) and option(%d)", timeUs, option);
+            int colorFormat = data.readInt32();
+            bool metaOnly = (data.readInt32() != 0);
+            ALOGV("getTimeAtTime: time(%" PRId64 " us), option(%d), colorFormat(%d), metaOnly(%d)",
+                    timeUs, option, colorFormat, metaOnly);
 #ifndef DISABLE_GROUP_SCHEDULE_HACK
             setSchedPolicy(data);
 #endif
-            sp<IMemory> bitmap = getFrameAtTime(timeUs, option);
+            sp<IMemory> bitmap = getFrameAtTime(timeUs, option, colorFormat, metaOnly);
             if (bitmap != 0) {  // Don't send NULL across the binder interface
                 reply->writeInt32(NO_ERROR);
                 reply->writeStrongBinder(IInterface::asBinder(bitmap));
             } else {
                 reply->writeInt32(UNKNOWN_ERROR);
+            }
+#ifndef DISABLE_GROUP_SCHEDULE_HACK
+            restoreSchedPolicy();
+#endif
+            return NO_ERROR;
+        } break;
+        case GET_IMAGE_AT_INDEX: {
+            CHECK_INTERFACE(IMediaMetadataRetriever, data, reply);
+            int index = data.readInt32();
+            int colorFormat = data.readInt32();
+            bool metaOnly = (data.readInt32() != 0);
+            bool thumbnail = (data.readInt32() != 0);
+            ALOGV("getImageAtIndex: index(%d), colorFormat(%d), metaOnly(%d), thumbnail(%d)",
+                    index, colorFormat, metaOnly, thumbnail);
+#ifndef DISABLE_GROUP_SCHEDULE_HACK
+            setSchedPolicy(data);
+#endif
+            sp<IMemory> bitmap = getImageAtIndex(index, colorFormat, metaOnly, thumbnail);
+            if (bitmap != 0) {  // Don't send NULL across the binder interface
+                reply->writeInt32(NO_ERROR);
+                reply->writeStrongBinder(IInterface::asBinder(bitmap));
+            } else {
+                reply->writeInt32(UNKNOWN_ERROR);
+            }
+#ifndef DISABLE_GROUP_SCHEDULE_HACK
+            restoreSchedPolicy();
+#endif
+            return NO_ERROR;
+        } break;
+
+        case GET_IMAGE_RECT_AT_INDEX: {
+            CHECK_INTERFACE(IMediaMetadataRetriever, data, reply);
+            int index = data.readInt32();
+            int colorFormat = data.readInt32();
+            int left = data.readInt32();
+            int top = data.readInt32();
+            int right = data.readInt32();
+            int bottom = data.readInt32();
+            ALOGV("getImageRectAtIndex: index(%d), colorFormat(%d), rect {%d, %d, %d, %d}",
+                    index, colorFormat, left, top, right, bottom);
+#ifndef DISABLE_GROUP_SCHEDULE_HACK
+            setSchedPolicy(data);
+#endif
+            sp<IMemory> bitmap = getImageRectAtIndex(
+                    index, colorFormat, left, top, right, bottom);
+            if (bitmap != 0) {  // Don't send NULL across the binder interface
+                reply->writeInt32(NO_ERROR);
+                reply->writeStrongBinder(IInterface::asBinder(bitmap));
+            } else {
+                reply->writeInt32(UNKNOWN_ERROR);
+            }
+#ifndef DISABLE_GROUP_SCHEDULE_HACK
+            restoreSchedPolicy();
+#endif
+            return NO_ERROR;
+        } break;
+
+        case GET_FRAME_AT_INDEX: {
+            CHECK_INTERFACE(IMediaMetadataRetriever, data, reply);
+            int frameIndex = data.readInt32();
+            int numFrames = data.readInt32();
+            int colorFormat = data.readInt32();
+            bool metaOnly = (data.readInt32() != 0);
+            ALOGV("getFrameAtIndex: frameIndex(%d), numFrames(%d), colorFormat(%d), metaOnly(%d)",
+                    frameIndex, numFrames, colorFormat, metaOnly);
+#ifndef DISABLE_GROUP_SCHEDULE_HACK
+            setSchedPolicy(data);
+#endif
+            std::vector<sp<IMemory> > frames;
+            status_t err = getFrameAtIndex(
+                    &frames, frameIndex, numFrames, colorFormat, metaOnly);
+            reply->writeInt32(err);
+            if (OK == err) {
+                reply->writeInt32(frames.size());
+                for (size_t i = 0; i < frames.size(); i++) {
+                    reply->writeStrongBinder(IInterface::asBinder(frames[i]));
+                }
             }
 #ifndef DISABLE_GROUP_SCHEDULE_HACK
             restoreSchedPolicy();

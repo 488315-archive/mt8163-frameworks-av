@@ -17,14 +17,11 @@
 #ifndef ANDROID_EFFECTSFACTORY_H_
 #define ANDROID_EFFECTSFACTORY_H_
 
-#include <cutils/log.h>
-#include <pthread.h>
 #include <dirent.h>
-#ifdef MTK_AUDIO
-#include <hardware/audio_effect_mtk.h>
-#else
+#include <pthread.h>
+
+#include <cutils/compiler.h>
 #include <hardware/audio_effect.h>
-#endif
 
 #if __cplusplus
 extern "C" {
@@ -61,6 +58,11 @@ typedef struct effect_entry_s {
     lib_entry_t *lib;
 } effect_entry_t;
 
+typedef struct lib_failed_entry_s {
+    char *name;
+    char *path;
+} lib_failed_entry_t;
+
 // Structure used to store the lib entry
 // and the descriptor of the sub effects.
 // The library entry is to be stored in case of
@@ -70,6 +72,7 @@ typedef struct sub_effect_entry_s {
     lib_entry_t *lib;
     void *object;
 } sub_effect_entry_t;
+
 
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -93,6 +96,7 @@ typedef struct sub_effect_entry_s {
 //        *pDescriptor:     updated with the sub effect descriptors.
 //
 ////////////////////////////////////////////////////////////////////////////////
+ANDROID_API
 int EffectGetSubEffects(const effect_uuid_t *pEffectUuid,
                         sub_effect_entry_t **pSube,
                         size_t size);

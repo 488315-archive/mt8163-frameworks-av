@@ -19,6 +19,7 @@
 #define PLAYLIST_FETCHER_H_
 
 #include <media/stagefright/foundation/AHandler.h>
+#include <openssl/aes.h>
 
 #include "mpeg2ts/ATSParser.h"
 #include "LiveSession.h"
@@ -144,6 +145,7 @@ private:
     sp<M3UParser> mPlaylist;
     int32_t mSeqNumber;
     int32_t mNumRetries;
+    int32_t mNumRetriesForMonitorQueue;
     bool mStartup;
     bool mIDRFound;
     int32_t mSeekMode;
@@ -175,7 +177,10 @@ private:
     // Stores the initialization vector to decrypt the next block of cipher text, which can
     // either be derived from the sequence number, read from the manifest, or copied from
     // the last block of cipher text (cipher-block chaining).
-    unsigned char mAESInitVec[16];
+    unsigned char mAESInitVec[AES_BLOCK_SIZE];
+    unsigned char mKeyData[AES_BLOCK_SIZE];
+    bool mSampleAesKeyItemChanged;
+    sp<AMessage> mSampleAesKeyItem;
 
     Mutex mThresholdLock;
     float mThresholdRatio;
@@ -184,9 +189,6 @@ private:
 
     bool mHasMetadata;
 
-#ifdef MTK_AOSP_ENHANCEMENT
-    FILE *mLogFile;
-#endif
     // Set first to true if decrypting the first segment of a playlist segment. When
     // first is true, reset the initialization vector based on the available
     // information in the manifest; otherwise, use the initialization vector as
@@ -221,6 +223,9 @@ private:
     void onStop(const sp<AMessage> &msg);
     void onMonitorQueue();
     void onDownloadNext();
+    void initSeqNumberForLiveStream(
+            int32_t &firstSeqNumberInPlaylist,
+            int32_t &lastSeqNumberInPlaylist);
     bool initDownloadState(
             AString &uri,
             sp<AMessage> &itemMeta,

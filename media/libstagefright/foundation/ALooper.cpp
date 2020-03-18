@@ -66,7 +66,7 @@ private:
 
 // static
 int64_t ALooper::GetNowUs() {
-    return systemTime(SYSTEM_TIME_MONOTONIC) / 1000ll;
+    return systemTime(SYSTEM_TIME_MONOTONIC) / 1000LL;
 }
 
 ALooper::ALooper()
@@ -151,6 +151,10 @@ status_t ALooper::stop() {
     }
 
     mQueueChangedCondition.signal();
+    {
+        Mutex::Autolock autoLock(mRepliesLock);
+        mRepliesCondition.broadcast();
+    }
 
     if (!runningLocally && !thread->isCurrentThread()) {
         // If not running locally and this thread _is_ the looper thread,
@@ -166,7 +170,9 @@ void ALooper::post(const sp<AMessage> &msg, int64_t delayUs) {
 
     int64_t whenUs;
     if (delayUs > 0) {
-        whenUs = GetNowUs() + delayUs;
+        int64_t nowUs = GetNowUs();
+        whenUs = (delayUs > INT64_MAX - nowUs ? INT64_MAX : nowUs + delayUs);
+
     } else {
         whenUs = GetNowUs();
     }
@@ -204,6 +210,9 @@ bool ALooper::loop() {
 
         if (whenUs > nowUs) {
             int64_t delayUs = whenUs - nowUs;
+            if (delayUs > INT64_MAX / 1000) {
+                delayUs = INT64_MAX / 1000;
+            }
             mQueueChangedCondition.waitRelative(mLock, delayUs * 1000ll);
 
             return true;
@@ -234,6 +243,12 @@ status_t ALooper::awaitResponse(const sp<AReplyToken> &replyToken, sp<AMessage> 
     Mutex::Autolock autoLock(mRepliesLock);
     CHECK(replyToken != NULL);
     while (!replyToken->retrieveReply(response)) {
+        {
+            Mutex::Autolock autoLock(mLock);
+            if (mThread == NULL) {
+                return -ENOENT;
+            }
+        }
         mRepliesCondition.wait(mRepliesLock);
     }
     return OK;

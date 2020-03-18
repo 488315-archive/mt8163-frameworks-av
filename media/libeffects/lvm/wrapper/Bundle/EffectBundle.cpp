@@ -1,9 +1,4 @@
 /*
-* Copyright (C) 2014 MediaTek Inc.
-* Modification based on code covered by the mentioned copyright
-* and/or permission notice(s).
-*/
-/*
  * Copyright (C) 2010-2010 NXP Software
  * Copyright (C) 2009 The Android Open Source Project
  *
@@ -19,9 +14,11 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
+#ifndef LVM_FLOAT
+typedef float LVM_FLOAT;
+#endif
 #define LOG_TAG "Bundle"
-#define ARRAY_SIZE(array) (sizeof array / sizeof array[0])
+#define ARRAY_SIZE(array) (sizeof (array) / sizeof (array)[0])
 //#define LOG_NDEBUG 0
 
 #include <assert.h>
@@ -30,42 +27,42 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <cutils/log.h>
+#include <audio_utils/primitives.h>
+#include <log/log.h>
+
 #include "EffectBundle.h"
 #include "math.h"
-
 
 // effect_handle_t interface implementation for bass boost
 extern "C" const struct effect_interface_s gLvmEffectInterface;
 
+// Turn on VERY_VERY_VERBOSE_LOGGING to log parameter get and set for effects.
+
+//#define VERY_VERY_VERBOSE_LOGGING
+#ifdef VERY_VERY_VERBOSE_LOGGING
+#define ALOGVV ALOGV
+#else
+#define ALOGVV(a...) do { } while (false)
+#endif
+
 #define LVM_ERROR_CHECK(LvmStatus, callingFunc, calledFunc){\
-        if (LvmStatus == LVM_NULLADDRESS){\
+        if ((LvmStatus) == LVM_NULLADDRESS){\
             ALOGV("\tLVM_ERROR : Parameter error - "\
                     "null pointer returned by %s in %s\n\n\n\n", callingFunc, calledFunc);\
         }\
-        if (LvmStatus == LVM_ALIGNMENTERROR){\
+        if ((LvmStatus) == LVM_ALIGNMENTERROR){\
             ALOGV("\tLVM_ERROR : Parameter error - "\
                     "bad alignment returned by %s in %s\n\n\n\n", callingFunc, calledFunc);\
         }\
-        if (LvmStatus == LVM_INVALIDNUMSAMPLES){\
+        if ((LvmStatus) == LVM_INVALIDNUMSAMPLES){\
             ALOGV("\tLVM_ERROR : Parameter error - "\
                     "bad number of samples returned by %s in %s\n\n\n\n", callingFunc, calledFunc);\
         }\
-        if (LvmStatus == LVM_OUTOFRANGE){\
+        if ((LvmStatus) == LVM_OUTOFRANGE){\
             ALOGV("\tLVM_ERROR : Parameter error - "\
                     "out of range returned by %s in %s\n", callingFunc, calledFunc);\
         }\
     }
-
-
-static inline int16_t clamp16(int32_t sample)
-{
-    // check overflow for both positive and negative values:
-    // all bits above short range must me equal to sign bit
-    if ((sample>>15) ^ (sample>>31))
-        sample = 0x7FFF ^ (sample>>31);
-    return sample;
-}
 
 // Namespaces
 namespace android {
@@ -143,23 +140,43 @@ int  LvmEffect_disable         (EffectContext *pContext);
 void LvmEffect_free            (EffectContext *pContext);
 int  Effect_setConfig          (EffectContext *pContext, effect_config_t *pConfig);
 void Effect_getConfig          (EffectContext *pContext, effect_config_t *pConfig);
-int  BassBoost_setParameter    (EffectContext *pContext, void *pParam, void *pValue);
+int  BassBoost_setParameter    (EffectContext *pContext,
+                                uint32_t       paramSize,
+                                void          *pParam,
+                                uint32_t       valueSize,
+                                void          *pValue);
 int  BassBoost_getParameter    (EffectContext *pContext,
-                               void           *pParam,
-                               uint32_t       *pValueSize,
-                               void           *pValue);
-int  Virtualizer_setParameter  (EffectContext *pContext, void *pParam, void *pValue);
-int  Virtualizer_getParameter  (EffectContext *pContext,
-                               void           *pParam,
-                               uint32_t       *pValueSize,
-                               void           *pValue);
-int  Equalizer_setParameter    (EffectContext *pContext, void *pParam, void *pValue);
-int  Equalizer_getParameter    (EffectContext *pContext,
+                                uint32_t       paramSize,
                                 void          *pParam,
                                 uint32_t      *pValueSize,
                                 void          *pValue);
-int  Volume_setParameter       (EffectContext *pContext, void *pParam, void *pValue);
+int  Virtualizer_setParameter  (EffectContext *pContext,
+                                uint32_t       paramSize,
+                                void          *pParam,
+                                uint32_t       valueSize,
+                                void          *pValue);
+int  Virtualizer_getParameter  (EffectContext *pContext,
+                                uint32_t       paramSize,
+                                void          *pParam,
+                                uint32_t      *pValueSize,
+                                void          *pValue);
+int  Equalizer_setParameter    (EffectContext *pContext,
+                                uint32_t       paramSize,
+                                void          *pParam,
+                                uint32_t       valueSize,
+                                void          *pValue);
+int  Equalizer_getParameter    (EffectContext *pContext,
+                                uint32_t       paramSize,
+                                void          *pParam,
+                                uint32_t      *pValueSize,
+                                void          *pValue);
+int  Volume_setParameter       (EffectContext *pContext,
+                                uint32_t       paramSize,
+                                void          *pParam,
+                                uint32_t       valueSize,
+                                void          *pValue);
 int  Volume_getParameter       (EffectContext *pContext,
+                                uint32_t       paramSize,
                                 void          *pParam,
                                 uint32_t      *pValueSize,
                                 void          *pValue);
@@ -172,7 +189,7 @@ extern "C" int EffectCreate(const effect_uuid_t *uuid,
                             int32_t             ioId __unused,
                             effect_handle_t  *pHandle){
     int ret = 0;
-    int sessionNo;
+    int sessionNo = -1;
     int i;
     EffectContext *pContext = NULL;
     bool newBundle = false;
@@ -192,21 +209,26 @@ extern "C" int EffectCreate(const effect_uuid_t *uuid,
         LvmGlobalBundle_init();
     }
 
-    // Find next available sessionNo
+    // Find sessionNo: if one already exists for the sessionId use it,
+    // otherwise choose the first available empty slot.
     for(i=0; i<LVM_MAX_SESSIONS; i++){
-        if((SessionIndex[i] == LVM_UNUSED_SESSION)||(SessionIndex[i] == sessionId)){
-            sessionNo       = i;
-            SessionIndex[i] = sessionId;
-            ALOGV("\tEffectCreate: Allocating SessionNo %d for SessionId %d\n", sessionNo,sessionId);
+        if (SessionIndex[i] == sessionId) {
+            sessionNo = i;
             break;
         }
+        if (sessionNo < 0 && SessionIndex[i] == LVM_UNUSED_SESSION) {
+            sessionNo = i;
+            // do not break; allow loop to continue to search for a sessionId match.
+        }
     }
-
-    if(i==LVM_MAX_SESSIONS){
+    if (sessionNo < 0) {
         ALOGV("\tLVM_ERROR : Cannot find memory to allocate for current session");
         ret = -EINVAL;
         goto exit;
     }
+
+    SessionIndex[sessionNo] = sessionId;
+    ALOGV("\tEffectCreate: Allocating sessionNo %d for sessionId %d\n", sessionNo, sessionId);
 
     pContext = new EffectContext;
 
@@ -273,7 +295,10 @@ extern "C" int EffectCreate(const effect_uuid_t *uuid,
         pContext->pBundledContext->SamplesToExitCountVirt   = 0;
         pContext->pBundledContext->SamplesToExitCountBb     = 0;
         pContext->pBundledContext->SamplesToExitCountEq     = 0;
-
+#if defined(BUILD_FLOAT) && !defined(NATIVE_FLOAT_BUFFER)
+        pContext->pBundledContext->pInputBuffer             = NULL;
+        pContext->pBundledContext->pOutputBuffer            = NULL;
+#endif
         for (int i = 0; i < FIVEBAND_NUMBANDS; i++) {
             pContext->pBundledContext->bandGaindB[i] = EQNB_5BandSoftPresets[i];
         }
@@ -345,8 +370,10 @@ exit:
             }
             delete pContext;
         }
-        *pHandle = (effect_handle_t)NULL;
+        if (pHandle != NULL)
+          *pHandle = (effect_handle_t)NULL;
     } else {
+      if (pHandle != NULL)
         *pHandle = (effect_handle_t)pContext;
     }
     ALOGV("\tEffectCreate end..\n\n");
@@ -364,6 +391,12 @@ extern "C" int EffectRelease(effect_handle_t handle){
     }
 
     SessionContext *pSessionContext = &GlobalSessionMemory[pContext->pBundledContext->SessionNo];
+#if defined(MTK_AUDIO_FIX_DEFAULT_DEFECT)
+    if(pSessionContext->pBundledContext == LVM_NULL) {
+        ALOGD("EffectRelease Session Already removed pBundledContext = NULL");
+        return 0;
+    }
+#endif
 
     // Clear the instantiated flag for the effect
     // protect agains the case where an effect is un-instantiated without being disabled
@@ -408,7 +441,7 @@ extern "C" int EffectRelease(effect_handle_t handle){
             (pSessionContext->bEqualizerInstantiated ==LVM_FALSE) &&
             (pSessionContext->bVirtualizerInstantiated==LVM_FALSE))
     {
-        #ifdef LVM_PCM
+#ifdef LVM_PCM
         if (pContext->pBundledContext->PcmInPtr != NULL) {
             fclose(pContext->pBundledContext->PcmInPtr);
             pContext->pBundledContext->PcmInPtr = NULL;
@@ -417,7 +450,7 @@ extern "C" int EffectRelease(effect_handle_t handle){
             fclose(pContext->pBundledContext->PcmOutPtr);
             pContext->pBundledContext->PcmOutPtr = NULL;
         }
-        #endif
+#endif
 
 
         // Clear the SessionIndex
@@ -439,6 +472,10 @@ extern "C" int EffectRelease(effect_handle_t handle){
         if (pContext->pBundledContext->workBuffer != NULL) {
             free(pContext->pBundledContext->workBuffer);
         }
+#if defined(BUILD_FLOAT) && !defined(NATIVE_FLOAT_BUFFER)
+        free(pContext->pBundledContext->pInputBuffer);
+        free(pContext->pBundledContext->pOutputBuffer);
+#endif
         delete pContext->pBundledContext;
         pContext->pBundledContext = LVM_NULL;
     }
@@ -506,13 +543,11 @@ void LvmGlobalBundle_init(){
 //----------------------------------------------------------------------------
 
 int LvmBundle_init(EffectContext *pContext){
-    int status;
-
     ALOGV("\tLvmBundle_init start");
 
     pContext->config.inputCfg.accessMode                    = EFFECT_BUFFER_ACCESS_READ;
     pContext->config.inputCfg.channels                      = AUDIO_CHANNEL_OUT_STEREO;
-    pContext->config.inputCfg.format                        = AUDIO_FORMAT_PCM_16_BIT;
+    pContext->config.inputCfg.format                        = EFFECT_BUFFER_FORMAT;
     pContext->config.inputCfg.samplingRate                  = 44100;
     pContext->config.inputCfg.bufferProvider.getBuffer      = NULL;
     pContext->config.inputCfg.bufferProvider.releaseBuffer  = NULL;
@@ -520,7 +555,7 @@ int LvmBundle_init(EffectContext *pContext){
     pContext->config.inputCfg.mask                          = EFFECT_CONFIG_ALL;
     pContext->config.outputCfg.accessMode                   = EFFECT_BUFFER_ACCESS_ACCUMULATE;
     pContext->config.outputCfg.channels                     = AUDIO_CHANNEL_OUT_STEREO;
-    pContext->config.outputCfg.format                       = AUDIO_FORMAT_PCM_16_BIT;
+    pContext->config.outputCfg.format                       = EFFECT_BUFFER_FORMAT;
     pContext->config.outputCfg.samplingRate                 = 44100;
     pContext->config.outputCfg.bufferProvider.getBuffer     = NULL;
     pContext->config.outputCfg.bufferProvider.releaseBuffer = NULL;
@@ -621,6 +656,9 @@ int LvmBundle_init(EffectContext *pContext){
     params.SpeakerType            = LVM_HEADPHONES;
 
     pContext->pBundledContext->SampleRate = LVM_FS_44100;
+#ifdef SUPPORT_MC
+    pContext->pBundledContext->ChMask = AUDIO_CHANNEL_OUT_STEREO;
+#endif
 
     /* Concert Sound parameters */
     params.VirtualizerOperatingMode   = LVM_MODE_OFF;
@@ -666,6 +704,11 @@ int LvmBundle_init(EffectContext *pContext){
     params.TE_OperatingMode       = LVM_TE_OFF;
     params.TE_EffectLevel         = 0;
 
+#ifdef SUPPORT_MC
+    params.NrChannels             =
+        audio_channel_count_from_out_mask(AUDIO_CHANNEL_OUT_STEREO);
+    params.ChMask                 = AUDIO_CHANNEL_OUT_STEREO;
+#endif
     /* Activate the initial settings */
     LvmStatus = LVM_SetControlParameters(pContext->pBundledContext->hInstance,
                                          &params);
@@ -697,7 +740,6 @@ int LvmBundle_init(EffectContext *pContext){
     return 0;
 }   /* end LvmBundle_init */
 
-
 //----------------------------------------------------------------------------
 // LvmBundle_process()
 //----------------------------------------------------------------------------
@@ -705,8 +747,8 @@ int LvmBundle_init(EffectContext *pContext){
 // Apply LVM Bundle effects
 //
 // Inputs:
-//  pIn:        pointer to stereo 16 bit input data
-//  pOut:       pointer to stereo 16 bit output data
+//  pIn:        pointer to stereo float or 16 bit input data
+//  pOut:       pointer to stereo float or 16 bit output data
 //  frameCount: Frames to process
 //  pContext:   effect engine context
 //  strength    strength to be applied
@@ -715,42 +757,150 @@ int LvmBundle_init(EffectContext *pContext){
 //  pOut:       pointer to updated stereo 16 bit output data
 //
 //----------------------------------------------------------------------------
-
-int LvmBundle_process(LVM_INT16        *pIn,
-                      LVM_INT16        *pOut,
+#ifdef BUILD_FLOAT
+int LvmBundle_process(effect_buffer_t  *pIn,
+                      effect_buffer_t  *pOut,
                       int              frameCount,
                       EffectContext    *pContext){
 
-    LVM_ControlParams_t     ActiveParams;                           /* Current control Parameters */
     LVM_ReturnStatus_en     LvmStatus = LVM_SUCCESS;                /* Function call status */
-    LVM_INT16               *pOutTmp;
+    effect_buffer_t         *pOutTmp;
+    const LVM_INT32 NrChannels =
+        audio_channel_count_from_out_mask(pContext->config.inputCfg.channels);
+#ifndef NATIVE_FLOAT_BUFFER
+    if (pContext->pBundledContext->pInputBuffer == nullptr ||
+            pContext->pBundledContext->frameCount < frameCount) {
+        free(pContext->pBundledContext->pInputBuffer);
+        pContext->pBundledContext->pInputBuffer =
+                (LVM_FLOAT *)calloc(frameCount, sizeof(LVM_FLOAT) * NrChannels);
+    }
+
+    if (pContext->pBundledContext->pOutputBuffer == nullptr ||
+            pContext->pBundledContext->frameCount < frameCount) {
+        free(pContext->pBundledContext->pOutputBuffer);
+        pContext->pBundledContext->pOutputBuffer =
+                (LVM_FLOAT *)calloc(frameCount, sizeof(LVM_FLOAT) * NrChannels);
+    }
+
+    if (pContext->pBundledContext->pInputBuffer == nullptr ||
+            pContext->pBundledContext->pOutputBuffer == nullptr) {
+        ALOGE("LVM_ERROR : LvmBundle_process memory allocation for float buffer's failed");
+        return -EINVAL;
+    }
+
+    LVM_FLOAT * const pInputBuff = pContext->pBundledContext->pInputBuffer;
+    LVM_FLOAT * const pOutputBuff = pContext->pBundledContext->pOutputBuffer;
+#endif
 
     if (pContext->config.outputCfg.accessMode == EFFECT_BUFFER_ACCESS_WRITE){
         pOutTmp = pOut;
-    }else if (pContext->config.outputCfg.accessMode == EFFECT_BUFFER_ACCESS_ACCUMULATE){
+    } else if (pContext->config.outputCfg.accessMode == EFFECT_BUFFER_ACCESS_ACCUMULATE){
         if (pContext->pBundledContext->frameCount != frameCount) {
             if (pContext->pBundledContext->workBuffer != NULL) {
                 free(pContext->pBundledContext->workBuffer);
             }
             pContext->pBundledContext->workBuffer =
-                    (LVM_INT16 *)malloc(frameCount * sizeof(LVM_INT16) * 2);
+                    (effect_buffer_t *)calloc(frameCount, sizeof(effect_buffer_t) * NrChannels);
+            if (pContext->pBundledContext->workBuffer == NULL) {
+                return -ENOMEM;
+            }
             pContext->pBundledContext->frameCount = frameCount;
         }
         pOutTmp = pContext->pBundledContext->workBuffer;
-    }else{
+    } else {
         ALOGV("LVM_ERROR : LvmBundle_process invalid access mode");
         return -EINVAL;
     }
 
-    #ifdef LVM_PCM
-    fwrite(pIn, frameCount*sizeof(LVM_INT16)*2, 1, pContext->pBundledContext->PcmInPtr);
+#ifdef LVM_PCM
+    fwrite(pIn,
+           frameCount * sizeof(effect_buffer_t) * NrChannels,
+           1,
+           pContext->pBundledContext->PcmInPtr);
     fflush(pContext->pBundledContext->PcmInPtr);
-    #endif
-    //
-    //FILE *fp1 = fopen("sdcard/bundle_in.pcm","ab");
-    //fwrite(pIn, frameCount*sizeof(LVM_INT16)*2, 1, fp1);
-    //fclose(fp1);
-    //
+#endif
+
+#ifndef NATIVE_FLOAT_BUFFER
+    /* Converting input data from fixed point to float point */
+    memcpy_to_float_from_i16(pInputBuff, pIn, frameCount * NrChannels);
+
+    /* Process the samples */
+    LvmStatus = LVM_Process(pContext->pBundledContext->hInstance, /* Instance handle */
+                            pInputBuff,                           /* Input buffer */
+                            pOutputBuff,                          /* Output buffer */
+                            (LVM_UINT16)frameCount,               /* Number of samples to read */
+                            0);                                   /* Audio Time */
+
+    /* Converting output data from float point to fixed point */
+    memcpy_to_i16_from_float(pOutTmp, pOutputBuff, frameCount * NrChannels);
+
+#else
+    /* Process the samples */
+    LvmStatus = LVM_Process(pContext->pBundledContext->hInstance, /* Instance handle */
+                            pIn,                                  /* Input buffer */
+                            pOutTmp,                              /* Output buffer */
+                            (LVM_UINT16)frameCount,               /* Number of samples to read */
+                            0);                                   /* Audio Time */
+#endif
+    LVM_ERROR_CHECK(LvmStatus, "LVM_Process", "LvmBundle_process")
+    if(LvmStatus != LVM_SUCCESS) return -EINVAL;
+
+#ifdef LVM_PCM
+    fwrite(pOutTmp,
+           frameCount * sizeof(effect_buffer_t) * NrChannels,
+           1,
+           pContext->pBundledContext->PcmOutPtr);
+    fflush(pContext->pBundledContext->PcmOutPtr);
+#endif
+
+    if (pContext->config.outputCfg.accessMode == EFFECT_BUFFER_ACCESS_ACCUMULATE){
+        for (int i = 0; i < frameCount * NrChannels; i++) {
+#ifndef NATIVE_FLOAT_BUFFER
+            pOut[i] = clamp16((LVM_INT32)pOut[i] + (LVM_INT32)pOutTmp[i]);
+#else
+            pOut[i] = pOut[i] + pOutTmp[i];
+#endif
+        }
+    }
+    return 0;
+}    /* end LvmBundle_process */
+
+#else // BUILD_FLOAT
+
+int LvmBundle_process(LVM_INT16        *pIn,
+                      LVM_INT16        *pOut,
+                      int              frameCount,
+                      EffectContext    *pContext) {
+
+    LVM_ReturnStatus_en     LvmStatus = LVM_SUCCESS;                /* Function call status */
+    LVM_INT16               *pOutTmp;
+
+    if (pContext->config.outputCfg.accessMode == EFFECT_BUFFER_ACCESS_WRITE){
+        pOutTmp = pOut;
+    } else if (pContext->config.outputCfg.accessMode == EFFECT_BUFFER_ACCESS_ACCUMULATE){
+        if (pContext->pBundledContext->frameCount != frameCount) {
+            if (pContext->pBundledContext->workBuffer != NULL) {
+                free(pContext->pBundledContext->workBuffer);
+            }
+            pContext->pBundledContext->workBuffer =
+                    (effect_buffer_t *)calloc(frameCount, sizeof(effect_buffer_t) * FCC_2);
+            if (pContext->pBundledContext->workBuffer == NULL) {
+                return -ENOMEM;
+            }
+            pContext->pBundledContext->frameCount = frameCount;
+        }
+        pOutTmp = pContext->pBundledContext->workBuffer;
+    } else {
+        ALOGV("LVM_ERROR : LvmBundle_process invalid access mode");
+        return -EINVAL;
+    }
+
+#ifdef LVM_PCM
+    fwrite(pIn, frameCount * sizeof(*pIn) * FCC_2,
+            1 /* nmemb */, pContext->pBundledContext->PcmInPtr);
+    fflush(pContext->pBundledContext->PcmInPtr);
+#endif
+
     //ALOGV("Calling LVM_Process");
 
     /* Process the samples */
@@ -758,18 +908,17 @@ int LvmBundle_process(LVM_INT16        *pIn,
                             pIn,                                  /* Input buffer */
                             pOutTmp,                              /* Output buffer */
                             (LVM_UINT16)frameCount,               /* Number of samples to read */
-                            0);                                   /* Audo Time */
+                            0);                                   /* Audio Time */
 
     LVM_ERROR_CHECK(LvmStatus, "LVM_Process", "LvmBundle_process")
     if(LvmStatus != LVM_SUCCESS) return -EINVAL;
 
-    #ifdef LVM_PCM
-    fwrite(pOutTmp, frameCount*sizeof(LVM_INT16)*2, 1, pContext->pBundledContext->PcmOutPtr);
+#ifdef LVM_PCM
+    fwrite(pOutTmp, frameCount * sizeof(*pOutTmp) * FCC_2,
+            1 /* nmemb */, pContext->pBundledContext->PcmOutPtr);
     fflush(pContext->pBundledContext->PcmOutPtr);
-    #endif
-    //FILE *fp2 = fopen("sdcard/bundle_out.pcm","ab");
-    //fwrite(pOutTmp, frameCount*sizeof(LVM_INT16)*2, 1, fp2);
-    //fclose(fp2);
+#endif
+
     if (pContext->config.outputCfg.accessMode == EFFECT_BUFFER_ACCESS_ACCUMULATE){
         for (int i=0; i<frameCount*2; i++){
             pOut[i] = clamp16((LVM_INT32)pOut[i] + (LVM_INT32)pOutTmp[i]);
@@ -778,6 +927,7 @@ int LvmBundle_process(LVM_INT16        *pIn,
     return 0;
 }    /* end LvmBundle_process */
 
+#endif // BUILD_FLOAT
 
 //----------------------------------------------------------------------------
 // EqualizerUpdateActiveParams()
@@ -846,8 +996,12 @@ void LvmEffect_limitLevel(EffectContext *pContext) {
     float energyBassBoost = 0;
     float crossCorrection = 0;
 
+    bool eqEnabled = pContext->pBundledContext->bEqualizerEnabled == LVM_TRUE;
+    bool bbEnabled = pContext->pBundledContext->bBassEnabled == LVM_TRUE;
+    bool viEnabled = pContext->pBundledContext->bVirtualizerEnabled == LVM_TRUE;
+
     //EQ contribution
-    if (pContext->pBundledContext->bEqualizerEnabled == LVM_TRUE) {
+    if (eqEnabled) {
         for (int i = 0; i < FIVEBAND_NUMBANDS; i++) {
             float bandFactor = pContext->pBundledContext->bandGaindB[i]/15.0;
             float bandCoefficient = LimitLevel_bandEnergyCoefficient[i];
@@ -873,35 +1027,37 @@ void LvmEffect_limitLevel(EffectContext *pContext) {
         }
         bandFactorSum -= 1.0;
         if (bandFactorSum > 0)
-            crossCorrection = bandFactorSum * 0.7;
+          crossCorrection = bandFactorSum * 0.7;
     }
 
     //BassBoost contribution
-    if (pContext->pBundledContext->bBassEnabled == LVM_TRUE) {
+    if (bbEnabled) {
         float boostFactor = (pContext->pBundledContext->BassStrengthSaved)/1000.0;
         float boostCoefficient = LimitLevel_bassBoostEnergyCoefficient;
 
         energyContribution += boostFactor * boostCoefficient * boostCoefficient;
 
-        for (int i = 0; i < FIVEBAND_NUMBANDS; i++) {
-            float bandFactor = pContext->pBundledContext->bandGaindB[i]/15.0;
-            float bandCrossCoefficient = LimitLevel_bassBoostEnergyCrossCoefficient[i];
-            float bandEnergy = boostFactor * bandFactor *
+        if (eqEnabled) {
+            for (int i = 0; i < FIVEBAND_NUMBANDS; i++) {
+                float bandFactor = pContext->pBundledContext->bandGaindB[i]/15.0;
+                float bandCrossCoefficient = LimitLevel_bassBoostEnergyCrossCoefficient[i];
+                float bandEnergy = boostFactor * bandFactor *
                     bandCrossCoefficient;
-            if (bandEnergy > 0)
-                energyBassBoost += bandEnergy;
+                if (bandEnergy > 0)
+                  energyBassBoost += bandEnergy;
+            }
         }
     }
 
     //Virtualizer contribution
-    if (pContext->pBundledContext->bVirtualizerEnabled == LVM_TRUE) {
+    if (viEnabled) {
         energyContribution += LimitLevel_virtualizerContribution *
                 LimitLevel_virtualizerContribution;
     }
 
     double totalEnergyEstimation = sqrt(energyContribution + energyCross + energyBassBoost) -
             crossCorrection;
-    ALOGV(" TOTAL energy estimation: %0.2f", totalEnergyEstimation);
+    ALOGV(" TOTAL energy estimation: %0.2f dB", totalEnergyEstimation);
 
     //roundoff
     int maxLevelRound = (int)(totalEnergyEstimation + 0.99);
@@ -919,6 +1075,8 @@ void LvmEffect_limitLevel(EffectContext *pContext) {
     /* Activate the initial settings */
     LvmStatus = LVM_SetControlParameters(pContext->pBundledContext->hInstance, &ActiveParams);
     LVM_ERROR_CHECK(LvmStatus, "LVM_SetControlParameters", "LvmEffect_limitLevel")
+
+    ALOGV("LVM_SetControlParameters return:%d", (int)LvmStatus);
     //ALOGV("\tLvmEffect_limitLevel just Set -> %d\n",
     //          ActiveParams.pEQNB_BandDefinition[band].Gain);
 
@@ -1048,7 +1206,6 @@ int LvmEffect_disable(EffectContext *pContext){
 
 void LvmEffect_free(EffectContext *pContext){
     LVM_ReturnStatus_en     LvmStatus=LVM_SUCCESS;         /* Function call status */
-    LVM_ControlParams_t     params;                        /* Control Parameters */
     LVM_MemTab_t            MemTab;
 
     /* Free the algorithm memory */
@@ -1061,13 +1218,7 @@ void LvmEffect_free(EffectContext *pContext){
     for (int i=0; i<LVM_NR_MEMORY_REGIONS; i++){
         if (MemTab.Region[i].Size != 0){
             if (MemTab.Region[i].pBaseAddress != NULL){
-                ALOGV("\tLvmEffect_free - START freeing %" PRIu32 " bytes for region %u at %p\n",
-                        MemTab.Region[i].Size, i, MemTab.Region[i].pBaseAddress);
-
                 free(MemTab.Region[i].pBaseAddress);
-
-                ALOGV("\tLvmEffect_free - END   freeing %" PRIu32 " bytes for region %u at %p\n",
-                        MemTab.Region[i].Size, i, MemTab.Region[i].pBaseAddress);
             }else{
                 ALOGV("\tLVM_ERROR : LvmEffect_free - trying to free with NULL pointer %" PRIu32
                         " bytes for region %u at %p ERROR\n",
@@ -1101,44 +1252,71 @@ int Effect_setConfig(EffectContext *pContext, effect_config_t *pConfig){
     CHECK_ARG(pConfig->inputCfg.samplingRate == pConfig->outputCfg.samplingRate);
     CHECK_ARG(pConfig->inputCfg.channels == pConfig->outputCfg.channels);
     CHECK_ARG(pConfig->inputCfg.format == pConfig->outputCfg.format);
+#ifdef SUPPORT_MC
+    CHECK_ARG(audio_channel_count_from_out_mask(pConfig->inputCfg.channels) <= LVM_MAX_CHANNELS);
+#else
     CHECK_ARG(pConfig->inputCfg.channels == AUDIO_CHANNEL_OUT_STEREO);
+#endif
     CHECK_ARG(pConfig->outputCfg.accessMode == EFFECT_BUFFER_ACCESS_WRITE
               || pConfig->outputCfg.accessMode == EFFECT_BUFFER_ACCESS_ACCUMULATE);
-    CHECK_ARG(pConfig->inputCfg.format == AUDIO_FORMAT_PCM_16_BIT);
-
+    CHECK_ARG(pConfig->inputCfg.format == EFFECT_BUFFER_FORMAT);
     pContext->config = *pConfig;
+    const LVM_INT16 NrChannels = audio_channel_count_from_out_mask(pConfig->inputCfg.channels);
 
     switch (pConfig->inputCfg.samplingRate) {
     case 8000:
         SampleRate = LVM_FS_8000;
-        pContext->pBundledContext->SamplesPerSecond = 8000*2; // 2 secs Stereo
+        pContext->pBundledContext->SamplesPerSecond = 8000 * NrChannels;
         break;
     case 16000:
         SampleRate = LVM_FS_16000;
-        pContext->pBundledContext->SamplesPerSecond = 16000*2; // 2 secs Stereo
+        pContext->pBundledContext->SamplesPerSecond = 16000 * NrChannels;
         break;
     case 22050:
         SampleRate = LVM_FS_22050;
-        pContext->pBundledContext->SamplesPerSecond = 22050*2; // 2 secs Stereo
+        pContext->pBundledContext->SamplesPerSecond = 22050 * NrChannels;
         break;
     case 32000:
         SampleRate = LVM_FS_32000;
-        pContext->pBundledContext->SamplesPerSecond = 32000*2; // 2 secs Stereo
+        pContext->pBundledContext->SamplesPerSecond = 32000 * NrChannels;
         break;
     case 44100:
         SampleRate = LVM_FS_44100;
-        pContext->pBundledContext->SamplesPerSecond = 44100*2; // 2 secs Stereo
+        pContext->pBundledContext->SamplesPerSecond = 44100 * NrChannels;
         break;
     case 48000:
         SampleRate = LVM_FS_48000;
-        pContext->pBundledContext->SamplesPerSecond = 48000*2; // 2 secs Stereo
+        pContext->pBundledContext->SamplesPerSecond = 48000 * NrChannels;
         break;
+#if defined(BUILD_FLOAT) && defined(HIGHER_FS)
+    case 88200:
+        SampleRate = LVM_FS_88200;
+        pContext->pBundledContext->SamplesPerSecond = 88200 * NrChannels;
+        break;
+    case 96000:
+        SampleRate = LVM_FS_96000;
+        pContext->pBundledContext->SamplesPerSecond = 96000 * NrChannels;
+        break;
+    case 176400:
+        SampleRate = LVM_FS_176400;
+        pContext->pBundledContext->SamplesPerSecond = 176400 * NrChannels;
+        break;
+    case 192000:
+        SampleRate = LVM_FS_192000;
+        pContext->pBundledContext->SamplesPerSecond = 192000 * NrChannels;
+        break;
+#endif
     default:
         ALOGV("\tEffect_setConfig invalid sampling rate %d", pConfig->inputCfg.samplingRate);
         return -EINVAL;
     }
 
+#ifdef SUPPORT_MC
+    if (pContext->pBundledContext->SampleRate != SampleRate ||
+        pContext->pBundledContext->ChMask != pConfig->inputCfg.channels) {
+#else
     if(pContext->pBundledContext->SampleRate != SampleRate){
+#endif
 
         LVM_ControlParams_t     ActiveParams;
         LVM_ReturnStatus_en     LvmStatus = LVM_SUCCESS;
@@ -1154,11 +1332,21 @@ int Effect_setConfig(EffectContext *pContext, effect_config_t *pConfig){
 
         ActiveParams.SampleRate = SampleRate;
 
+#ifdef SUPPORT_MC
+        ActiveParams.NrChannels = NrChannels;
+        ActiveParams.ChMask = pConfig->inputCfg.channels;
+#endif
+
         LvmStatus = LVM_SetControlParameters(pContext->pBundledContext->hInstance, &ActiveParams);
 
         LVM_ERROR_CHECK(LvmStatus, "LVM_SetControlParameters", "Effect_setConfig")
         ALOGV("\tEffect_setConfig Succesfully called LVM_SetControlParameters\n");
         pContext->pBundledContext->SampleRate = SampleRate;
+#ifdef SUPPORT_MC
+        pContext->pBundledContext->ChMask = pConfig->inputCfg.channels;
+#endif
+
+        LvmEffect_limitLevel(pContext);
 
     }else{
         //ALOGV("\tEffect_setConfig keep sampling rate at %d", SampleRate);
@@ -1355,6 +1543,8 @@ int VirtualizerIsDeviceSupported(audio_devices_t deviceType) {
     case AUDIO_DEVICE_OUT_WIRED_HEADSET:
     case AUDIO_DEVICE_OUT_WIRED_HEADPHONE:
     case AUDIO_DEVICE_OUT_BLUETOOTH_A2DP_HEADPHONES:
+    case AUDIO_DEVICE_OUT_USB_HEADSET:
+    // case AUDIO_DEVICE_OUT_USB_DEVICE:  // For USB testing of the virtualizer only.
         return 0;
     default :
         return -EINVAL;
@@ -1377,10 +1567,9 @@ int VirtualizerIsDeviceSupported(audio_devices_t deviceType) {
 int VirtualizerIsConfigurationSupported(audio_channel_mask_t channelMask,
         audio_devices_t deviceType) {
     uint32_t channelCount = audio_channel_count_from_out_mask(channelMask);
-    if ((channelCount == 0) || (channelCount > 2)) {
+    if (channelCount < 1 || channelCount > FCC_2) { // TODO: update to 8 channels when supported.
         return -EINVAL;
     }
-
     return VirtualizerIsDeviceSupported(deviceType);
 }
 
@@ -1473,17 +1662,25 @@ int VirtualizerForceVirtualizationMode(EffectContext *pContext, audio_devices_t 
 //                            horizontal plane, +90 is directly above the user, -90 below
 //
 //----------------------------------------------------------------------------
-void VirtualizerGetSpeakerAngles(audio_channel_mask_t channelMask __unused,
+void VirtualizerGetSpeakerAngles(audio_channel_mask_t channelMask,
         audio_devices_t deviceType __unused, int32_t *pSpeakerAngles) {
     // the channel count is guaranteed to be 1 or 2
     // the device is guaranteed to be of type headphone
-    // this virtualizer is always 2in with speakers at -90 and 90deg of azimuth, 0deg of elevation
-    *pSpeakerAngles++ = (int32_t) AUDIO_CHANNEL_OUT_FRONT_LEFT;
-    *pSpeakerAngles++ = -90; // azimuth
-    *pSpeakerAngles++ = 0;   // elevation
-    *pSpeakerAngles++ = (int32_t) AUDIO_CHANNEL_OUT_FRONT_RIGHT;
-    *pSpeakerAngles++ = 90;  // azimuth
-    *pSpeakerAngles   = 0;   // elevation
+    // this virtualizer is always using 2 virtual speakers at -90 and 90deg of azimuth, 0deg of
+    // elevation but the return information is sized for nbChannels * 3, so we have to consider
+    // the (false here) case of a single channel, and return only 3 fields.
+    if (audio_channel_count_from_out_mask(channelMask) == 1) {
+        *pSpeakerAngles++ = (int32_t) AUDIO_CHANNEL_OUT_MONO; // same as FRONT_LEFT
+        *pSpeakerAngles++ = 0; // azimuth
+        *pSpeakerAngles = 0; // elevation
+    } else {
+        *pSpeakerAngles++ = (int32_t) AUDIO_CHANNEL_OUT_FRONT_LEFT;
+        *pSpeakerAngles++ = -90; // azimuth
+        *pSpeakerAngles++ = 0;   // elevation
+        *pSpeakerAngles++ = (int32_t) AUDIO_CHANNEL_OUT_FRONT_RIGHT;
+        *pSpeakerAngles++ = 90;  // azimuth
+        *pSpeakerAngles   = 0;   // elevation
+    }
 }
 
 //----------------------------------------------------------------------------
@@ -2008,61 +2205,54 @@ int32_t VolumeEnableStereoPosition(EffectContext *pContext, uint32_t enabled){
 //
 //----------------------------------------------------------------------------
 
-int BassBoost_getParameter(EffectContext     *pContext,
-                           void              *pParam,
-                           uint32_t          *pValueSize,
-                           void              *pValue){
+int BassBoost_getParameter(EffectContext *pContext,
+                           uint32_t       paramSize,
+                           void          *pParam,
+                           uint32_t      *pValueSize,
+                           void          *pValue) {
     int status = 0;
-    int32_t *pParamTemp = (int32_t *)pParam;
-    int32_t param = *pParamTemp++;
-    int32_t param2;
-    char *name;
+    int32_t *params = (int32_t *)pParam;
 
-    //ALOGV("\tBassBoost_getParameter start");
+    ALOGVV("%s start", __func__);
 
-    switch (param){
-        case BASSBOOST_PARAM_STRENGTH_SUPPORTED:
-            if (*pValueSize != sizeof(uint32_t)){
-                ALOGV("\tLVM_ERROR : BassBoost_getParameter() invalid pValueSize1 %d", *pValueSize);
-                return -EINVAL;
-            }
-            *pValueSize = sizeof(uint32_t);
-            break;
-        case BASSBOOST_PARAM_STRENGTH:
-            if (*pValueSize != sizeof(int16_t)){
-                ALOGV("\tLVM_ERROR : BassBoost_getParameter() invalid pValueSize2 %d", *pValueSize);
-                return -EINVAL;
-            }
-            *pValueSize = sizeof(int16_t);
-            break;
-
-        default:
-            ALOGV("\tLVM_ERROR : BassBoost_getParameter() invalid param %d", param);
-            return -EINVAL;
+    if (paramSize < sizeof(int32_t)) {
+        ALOGV("%s invalid paramSize: %u", __func__, paramSize);
+        return -EINVAL;
     }
-
-    switch (param){
+    switch (params[0]) {
         case BASSBOOST_PARAM_STRENGTH_SUPPORTED:
-            *(uint32_t *)pValue = 1;
+            if (*pValueSize != sizeof(uint32_t)) {  // legacy: check equality here.
+                ALOGV("%s BASSBOOST_PARAM_STRENGTH_SUPPORTED invalid *pValueSize %u",
+                        __func__, *pValueSize);
+                status = -EINVAL;
+                break;
+            }
+            // no need to set *pValueSize
 
-            //ALOGV("\tBassBoost_getParameter() BASSBOOST_PARAM_STRENGTH_SUPPORTED Value is %d",
-            //        *(uint32_t *)pValue);
+            *(uint32_t *)pValue = 1;
+            ALOGVV("%s BASSBOOST_PARAM_STRENGTH_SUPPORTED %u", __func__, *(uint32_t *)pValue);
             break;
 
         case BASSBOOST_PARAM_STRENGTH:
-            *(int16_t *)pValue = BassGetStrength(pContext);
+            if (*pValueSize != sizeof(int16_t)) {  // legacy: check equality here.
+                ALOGV("%s BASSBOOST_PARAM_STRENGTH invalid *pValueSize %u",
+                        __func__, *pValueSize);
+                status = -EINVAL;
+                break;
+            }
+            // no need to set *pValueSize
 
-            //ALOGV("\tBassBoost_getParameter() BASSBOOST_PARAM_STRENGTH Value is %d",
-            //        *(int16_t *)pValue);
+            *(int16_t *)pValue = BassGetStrength(pContext);
+            ALOGVV("%s BASSBOOST_PARAM_STRENGTH %d", __func__, *(int16_t *)pValue);
             break;
 
         default:
-            ALOGV("\tLVM_ERROR : BassBoost_getParameter() invalid param %d", param);
+            ALOGV("%s invalid param %d", __func__, params[0]);
             status = -EINVAL;
             break;
     }
 
-    //ALOGV("\tBassBoost_getParameter end");
+    ALOGVV("%s end param: %d, status: %d", __func__, params[0], status);
     return status;
 } /* end BassBoost_getParameter */
 
@@ -2081,27 +2271,42 @@ int BassBoost_getParameter(EffectContext     *pContext,
 //
 //----------------------------------------------------------------------------
 
-int BassBoost_setParameter (EffectContext *pContext, void *pParam, void *pValue){
+int BassBoost_setParameter(EffectContext *pContext,
+                           uint32_t       paramSize,
+                           void          *pParam,
+                           uint32_t       valueSize,
+                           void          *pValue) {
     int status = 0;
-    int16_t strength;
-    int32_t *pParamTemp = (int32_t *)pParam;
+    int32_t *params = (int32_t *)pParam;
 
-    //ALOGV("\tBassBoost_setParameter start");
+    ALOGVV("%s start", __func__);
 
-    switch (*pParamTemp){
-        case BASSBOOST_PARAM_STRENGTH:
-            strength = *(int16_t *)pValue;
-            //ALOGV("\tBassBoost_setParameter() BASSBOOST_PARAM_STRENGTH value is %d", strength);
-            //ALOGV("\tBassBoost_setParameter() Calling pBassBoost->BassSetStrength");
+    if (paramSize != sizeof(int32_t)) {  // legacy: check equality here.
+        ALOGV("%s invalid paramSize: %u", __func__, paramSize);
+        return -EINVAL;
+    }
+    switch (params[0]) {
+        case BASSBOOST_PARAM_STRENGTH: {
+            if (valueSize < sizeof(int16_t)) {
+                ALOGV("%s BASSBOOST_PARAM_STRENGTH invalid valueSize: %u", __func__, valueSize);
+                status = -EINVAL;
+                break;
+            }
+
+            const int16_t strength = *(int16_t *)pValue;
+            ALOGVV("%s BASSBOOST_PARAM_STRENGTH %d", __func__, strength);
+            ALOGVV("%s BASSBOOST_PARAM_STRENGTH Calling BassSetStrength", __func__);
             BassSetStrength(pContext, (int32_t)strength);
-            //ALOGV("\tBassBoost_setParameter() Called pBassBoost->BassSetStrength");
-           break;
+            ALOGVV("%s BASSBOOST_PARAM_STRENGTH Called BassSetStrength", __func__);
+        } break;
+
         default:
-            ALOGV("\tLVM_ERROR : BassBoost_setParameter() invalid param %d", *pParamTemp);
+            ALOGV("%s invalid param %d", __func__, params[0]);
+            status = -EINVAL;
             break;
     }
 
-    //ALOGV("\tBassBoost_setParameter end");
+    ALOGVV("%s end param: %d, status: %d", __func__, params[0], status);
     return status;
 } /* end BassBoost_setParameter */
 
@@ -2126,93 +2331,97 @@ int BassBoost_setParameter (EffectContext *pContext, void *pParam, void *pValue)
 //
 //----------------------------------------------------------------------------
 
-int Virtualizer_getParameter(EffectContext        *pContext,
-                             void                 *pParam,
-                             uint32_t             *pValueSize,
-                             void                 *pValue){
+int Virtualizer_getParameter(EffectContext *pContext,
+                             uint32_t       paramSize,
+                             void          *pParam,
+                             uint32_t      *pValueSize,
+                             void          *pValue) {
     int status = 0;
-    int32_t *pParamTemp = (int32_t *)pParam;
-    int32_t param = *pParamTemp++;
-    char *name;
+    int32_t *params = (int32_t *)pParam;
 
-    //ALOGV("\tVirtualizer_getParameter start");
+    ALOGVV("%s start", __func__);
 
-    switch (param){
-        case VIRTUALIZER_PARAM_STRENGTH_SUPPORTED:
-            if (*pValueSize != sizeof(uint32_t)){
-                ALOGV("\tLVM_ERROR : Virtualizer_getParameter() invalid pValueSize %d",*pValueSize);
-                return -EINVAL;
-            }
-            *pValueSize = sizeof(uint32_t);
-            break;
-        case VIRTUALIZER_PARAM_STRENGTH:
-            if (*pValueSize != sizeof(int16_t)){
-                ALOGV("\tLVM_ERROR : Virtualizer_getParameter() invalid pValueSize2 %d",*pValueSize);
-                return -EINVAL;
-            }
-            *pValueSize = sizeof(int16_t);
-            break;
-        case VIRTUALIZER_PARAM_VIRTUAL_SPEAKER_ANGLES:
-            // return value size can only be interpreted as relative to input value,
-            // deferring validity check to below
-            break;
-        case VIRTUALIZER_PARAM_VIRTUALIZATION_MODE:
-            if (*pValueSize != sizeof(uint32_t)){
-                ALOGV("\tLVM_ERROR : Virtualizer_getParameter() invalid pValueSize %d",*pValueSize);
-                return -EINVAL;
-            }
-            *pValueSize = sizeof(uint32_t);
-            break;
-        default:
-            ALOGV("\tLVM_ERROR : Virtualizer_getParameter() invalid param %d", param);
-            return -EINVAL;
+    if (paramSize < sizeof(int32_t)) {
+        ALOGV("%s invalid paramSize: %u", __func__, paramSize);
+        return -EINVAL;
     }
-
-    switch (param){
+    switch (params[0]) {
         case VIRTUALIZER_PARAM_STRENGTH_SUPPORTED:
-            *(uint32_t *)pValue = 1;
+            if (*pValueSize != sizeof(uint32_t)) { // legacy: check equality here.
+                ALOGV("%s VIRTUALIZER_PARAM_STRENGTH_SUPPORTED invalid *pValueSize %u",
+                        __func__, *pValueSize);
+                status = -EINVAL;
+                break;
+            }
+            // no need to set *pValueSize
 
-            //ALOGV("\tVirtualizer_getParameter() VIRTUALIZER_PARAM_STRENGTH_SUPPORTED Value is %d",
-            //        *(uint32_t *)pValue);
+            *(uint32_t *)pValue = 1;
+            ALOGVV("%s VIRTUALIZER_PARAM_STRENGTH_SUPPORTED %d", __func__, *(uint32_t *)pValue);
             break;
 
         case VIRTUALIZER_PARAM_STRENGTH:
+            if (*pValueSize != sizeof(int16_t)) { // legacy: check equality here.
+                ALOGV("%s VIRTUALIZER_PARAM_STRENGTH invalid *pValueSize %u",
+                        __func__, *pValueSize);
+                status = -EINVAL;
+                break;
+            }
+            // no need to set *pValueSize
+
             *(int16_t *)pValue = VirtualizerGetStrength(pContext);
 
-            //ALOGV("\tVirtualizer_getParameter() VIRTUALIZER_PARAM_STRENGTH Value is %d",
-            //        *(int16_t *)pValue);
+            ALOGVV("%s VIRTUALIZER_PARAM_STRENGTH %d", __func__, *(int16_t *)pValue);
             break;
 
         case VIRTUALIZER_PARAM_VIRTUAL_SPEAKER_ANGLES: {
-            const audio_channel_mask_t channelMask = (audio_channel_mask_t) *pParamTemp++;
-            const audio_devices_t deviceType = (audio_devices_t) *pParamTemp;
-            uint32_t nbChannels = audio_channel_count_from_out_mask(channelMask);
-            if (*pValueSize < 3 * nbChannels * sizeof(int32_t)){
-                ALOGV("\tLVM_ERROR : Virtualizer_getParameter() invalid pValueSize %d",*pValueSize);
-                return -EINVAL;
+            if (paramSize < 3 * sizeof(int32_t)) {
+                ALOGV("%s VIRTUALIZER_PARAM_SPEAKER_ANGLES invalid paramSize: %u",
+                        __func__, paramSize);
+                status = -EINVAL;
+                break;
             }
+
+            const audio_channel_mask_t channelMask = (audio_channel_mask_t) params[1];
+            const audio_devices_t deviceType = (audio_devices_t) params[2];
+            const uint32_t nbChannels = audio_channel_count_from_out_mask(channelMask);
+            const uint32_t valueSizeRequired = 3 * nbChannels * sizeof(int32_t);
+            if (*pValueSize < valueSizeRequired) {
+                ALOGV("%s VIRTUALIZER_PARAM_SPEAKER_ANGLES invalid *pValueSize %u",
+                        __func__, *pValueSize);
+                status = -EINVAL;
+                break;
+            }
+            *pValueSize = valueSizeRequired;
+
             // verify the configuration is supported
             status = VirtualizerIsConfigurationSupported(channelMask, deviceType);
             if (status == 0) {
-                ALOGV("VIRTUALIZER_PARAM_VIRTUAL_SPEAKER_ANGLES supports mask=0x%x device=0x%x",
-                        channelMask, deviceType);
+                ALOGV("%s VIRTUALIZER_PARAM_VIRTUAL_SPEAKER_ANGLES mask=0x%x device=0x%x",
+                        __func__, channelMask, deviceType);
                 // configuration is supported, get the angles
                 VirtualizerGetSpeakerAngles(channelMask, deviceType, (int32_t *)pValue);
             }
-            }
-            break;
+        } break;
 
         case VIRTUALIZER_PARAM_VIRTUALIZATION_MODE:
-            *(uint32_t *)pValue  = (uint32_t) VirtualizerGetVirtualizationMode(pContext);
+            if (*pValueSize != sizeof(uint32_t)) { // legacy: check equality here.
+                ALOGV("%s VIRTUALIZER_PARAM_VIRTUALIZATION_MODE invalid *pValueSize %u",
+                        __func__, *pValueSize);
+                status = -EINVAL;
+                break;
+            }
+            // no need to set *pValueSize
+
+            *(uint32_t *)pValue = (uint32_t) VirtualizerGetVirtualizationMode(pContext);
             break;
 
         default:
-            ALOGV("\tLVM_ERROR : Virtualizer_getParameter() invalid param %d", param);
+            ALOGV("%s invalid param %d", __func__, params[0]);
             status = -EINVAL;
             break;
     }
 
-    ALOGV("\tVirtualizer_getParameter end returning status=%d", status);
+    ALOGVV("%s end param: %d, status: %d", __func__, params[0], status);
     return status;
 } /* end Virtualizer_getParameter */
 
@@ -2231,37 +2440,57 @@ int Virtualizer_getParameter(EffectContext        *pContext,
 //
 //----------------------------------------------------------------------------
 
-int Virtualizer_setParameter (EffectContext *pContext, void *pParam, void *pValue){
+int Virtualizer_setParameter(EffectContext *pContext,
+                             uint32_t       paramSize,
+                             void          *pParam,
+                             uint32_t       valueSize,
+                             void          *pValue) {
     int status = 0;
-    int16_t strength;
-    int32_t *pParamTemp = (int32_t *)pParam;
-    int32_t param = *pParamTemp++;
+    int32_t *params = (int32_t *)pParam;
 
-    //ALOGV("\tVirtualizer_setParameter start");
+    ALOGVV("%s start", __func__);
 
-    switch (param){
-        case VIRTUALIZER_PARAM_STRENGTH:
-            strength = *(int16_t *)pValue;
-            //ALOGV("\tVirtualizer_setParameter() VIRTUALIZER_PARAM_STRENGTH value is %d", strength);
-            //ALOGV("\tVirtualizer_setParameter() Calling pVirtualizer->setStrength");
+    if (paramSize != sizeof(int32_t)) { // legacy: check equality here.
+        ALOGV("%s invalid paramSize: %u", __func__, paramSize);
+        return -EINVAL;
+    }
+    switch (params[0]) {
+        case VIRTUALIZER_PARAM_STRENGTH: {
+            if (valueSize < sizeof(int16_t)) {
+                ALOGV("%s VIRTUALIZER_PARAM_STRENGTH invalid valueSize: %u", __func__, valueSize);
+                status = -EINVAL;
+                break;
+            }
+
+            const int16_t strength = *(int16_t *)pValue;
+            ALOGVV("%s VIRTUALIZER_PARAM_STRENGTH %d", __func__, strength);
+            ALOGVV("%s VIRTUALIZER_PARAM_STRENGTH Calling VirtualizerSetStrength", __func__);
             VirtualizerSetStrength(pContext, (int32_t)strength);
-            //ALOGV("\tVirtualizer_setParameter() Called pVirtualizer->setStrength");
-           break;
+            ALOGVV("%s VIRTUALIZER_PARAM_STRENGTH Called VirtualizerSetStrength", __func__);
+        } break;
 
         case VIRTUALIZER_PARAM_FORCE_VIRTUALIZATION_MODE: {
-            const audio_devices_t deviceType = *(audio_devices_t *) pValue;
-            status = VirtualizerForceVirtualizationMode(pContext, deviceType);
-            //ALOGV("VIRTUALIZER_PARAM_FORCE_VIRTUALIZATION_MODE device=0x%x result=%d",
-            //        deviceType, status);
+            if (valueSize < sizeof(int32_t)) {
+                ALOGV("%s VIRTUALIZER_PARAM_FORCE_VIRTUALIZATION_MODE invalid valueSize: %u",
+                        __func__, valueSize);
+                android_errorWriteLog(0x534e4554, "64478003");
+                status = -EINVAL;
+                break;
             }
-            break;
+
+            const audio_devices_t deviceType = (audio_devices_t)*(int32_t *)pValue;
+            status = VirtualizerForceVirtualizationMode(pContext, deviceType);
+            ALOGVV("%s VIRTUALIZER_PARAM_FORCE_VIRTUALIZATION_MODE device=%#x result=%d",
+                    __func__, deviceType, status);
+        } break;
 
         default:
-            ALOGV("\tLVM_ERROR : Virtualizer_setParameter() invalid param %d", param);
+            ALOGV("%s invalid param %d", __func__, params[0]);
+            status = -EINVAL;
             break;
     }
 
-    //ALOGV("\tVirtualizer_setParameter end");
+    ALOGVV("%s end param: %d, status: %d", __func__, params[0], status);
     return status;
 } /* end Virtualizer_setParameter */
 
@@ -2285,168 +2514,215 @@ int Virtualizer_setParameter (EffectContext *pContext, void *pParam, void *pValu
 // Side Effects:
 //
 //----------------------------------------------------------------------------
-int Equalizer_getParameter(EffectContext     *pContext,
-                           void              *pParam,
-                           uint32_t          *pValueSize,
-                           void              *pValue){
+int Equalizer_getParameter(EffectContext *pContext,
+                           uint32_t       paramSize,
+                           void          *pParam,
+                           uint32_t      *pValueSize,
+                           void          *pValue) {
     int status = 0;
-    int bMute = 0;
-    int32_t *pParamTemp = (int32_t *)pParam;
-    int32_t param = *pParamTemp++;
-    int32_t param2;
-    char *name;
+    int32_t *params = (int32_t *)pParam;
 
-    //ALOGV("\tEqualizer_getParameter start");
+    ALOGVV("%s start", __func__);
 
-    switch (param) {
+    if (paramSize < sizeof(int32_t)) {
+        ALOGV("%s invalid paramSize: %u", __func__, paramSize);
+        return -EINVAL;
+    }
+    switch (params[0]) {
     case EQ_PARAM_NUM_BANDS:
+        if (*pValueSize < sizeof(uint16_t)) {
+            ALOGV("%s EQ_PARAM_NUM_BANDS invalid *pValueSize %u", __func__, *pValueSize);
+            status = -EINVAL;
+            break;
+        }
+        *pValueSize = sizeof(uint16_t);
+
+        *(uint16_t *)pValue = (uint16_t)FIVEBAND_NUMBANDS;
+        ALOGVV("%s EQ_PARAM_NUM_BANDS %u", __func__, *(uint16_t *)pValue);
+        break;
+
     case EQ_PARAM_CUR_PRESET:
+        if (*pValueSize < sizeof(uint16_t)) {
+            ALOGV("%s EQ_PARAM_CUR_PRESET invalid *pValueSize %u", __func__, *pValueSize);
+            status = -EINVAL;
+            break;
+        }
+        *pValueSize = sizeof(uint16_t);
+
+        *(uint16_t *)pValue = (uint16_t)EqualizerGetPreset(pContext);
+        ALOGVV("%s EQ_PARAM_CUR_PRESET %u", __func__, *(uint16_t *)pValue);
+        break;
+
     case EQ_PARAM_GET_NUM_OF_PRESETS:
-    case EQ_PARAM_BAND_LEVEL:
-    case EQ_PARAM_GET_BAND:
+        if (*pValueSize < sizeof(uint16_t)) {
+            ALOGV("%s EQ_PARAM_GET_NUM_OF_PRESETS invalid *pValueSize %u", __func__, *pValueSize);
+            status = -EINVAL;
+            break;
+        }
+        *pValueSize = sizeof(uint16_t);
+
+        *(uint16_t *)pValue = (uint16_t)EqualizerGetNumPresets();
+        ALOGVV("%s EQ_PARAM_GET_NUM_OF_PRESETS %u", __func__, *(uint16_t *)pValue);
+        break;
+
+    case EQ_PARAM_GET_BAND: {
+        if (paramSize < 2 * sizeof(int32_t)) {
+            ALOGV("%s EQ_PARAM_GET_BAND invalid paramSize: %u", __func__, paramSize);
+            status = -EINVAL;
+            break;
+        }
+        if (*pValueSize < sizeof(uint16_t)) {
+            ALOGV("%s EQ_PARAM_GET_BAND invalid *pValueSize %u", __func__, *pValueSize);
+            status = -EINVAL;
+            break;
+        }
+        *pValueSize = sizeof(uint16_t);
+
+        const int32_t frequency = params[1];
+        *(uint16_t *)pValue = (uint16_t)EqualizerGetBand(pContext, frequency);
+        ALOGVV("%s EQ_PARAM_GET_BAND frequency %d, band %u",
+                __func__, frequency, *(uint16_t *)pValue);
+    } break;
+
+    case EQ_PARAM_BAND_LEVEL: {
+        if (paramSize < 2 * sizeof(int32_t)) {
+            ALOGV("%s EQ_PARAM_BAND_LEVEL invalid paramSize %u", __func__, paramSize);
+            status = -EINVAL;
+            break;
+        }
         if (*pValueSize < sizeof(int16_t)) {
-            ALOGV("\tLVM_ERROR : Equalizer_getParameter() invalid pValueSize 1  %d", *pValueSize);
-            return -EINVAL;
+            ALOGV("%s EQ_PARAM_BAND_LEVEL invalid *pValueSize %u", __func__, *pValueSize);
+            status = -EINVAL;
+            break;
         }
         *pValueSize = sizeof(int16_t);
-        break;
+
+        const int32_t band = params[1];
+        if (band < 0 || band >= FIVEBAND_NUMBANDS) {
+            if (band < 0) {
+                android_errorWriteLog(0x534e4554, "32438598");
+                ALOGW("%s EQ_PARAM_BAND_LEVEL invalid band %d", __func__, band);
+            }
+            status = -EINVAL;
+            break;
+        }
+        *(int16_t *)pValue = (int16_t)EqualizerGetBandLevel(pContext, band);
+        ALOGVV("%s EQ_PARAM_BAND_LEVEL band %d, level %d",
+                __func__, band, *(int16_t *)pValue);
+    } break;
 
     case EQ_PARAM_LEVEL_RANGE:
         if (*pValueSize < 2 * sizeof(int16_t)) {
-            ALOGV("\tLVM_ERROR : Equalizer_getParameter() invalid pValueSize 2  %d", *pValueSize);
-            return -EINVAL;
+            ALOGV("%s EQ_PARAM_LEVEL_RANGE invalid *pValueSize %u", __func__, *pValueSize);
+            status = -EINVAL;
+            break;
         }
         *pValueSize = 2 * sizeof(int16_t);
-        break;
-    case EQ_PARAM_BAND_FREQ_RANGE:
-        if (*pValueSize < 2 * sizeof(int32_t)) {
-            ALOGV("\tLVM_ERROR : Equalizer_getParameter() invalid pValueSize 3  %d", *pValueSize);
-            return -EINVAL;
-        }
-        *pValueSize = 2 * sizeof(int32_t);
-        break;
 
-    case EQ_PARAM_CENTER_FREQ:
-        if (*pValueSize < sizeof(int32_t)) {
-            ALOGV("\tLVM_ERROR : Equalizer_getParameter() invalid pValueSize 5  %d", *pValueSize);
-            return -EINVAL;
-        }
-        *pValueSize = sizeof(int32_t);
-        break;
-
-    case EQ_PARAM_GET_PRESET_NAME:
-        break;
-
-    case EQ_PARAM_PROPERTIES:
-        if (*pValueSize < (2 + FIVEBAND_NUMBANDS) * sizeof(uint16_t)) {
-            ALOGV("\tLVM_ERROR : Equalizer_getParameter() invalid pValueSize 1  %d", *pValueSize);
-            return -EINVAL;
-        }
-        *pValueSize = (2 + FIVEBAND_NUMBANDS) * sizeof(uint16_t);
-        break;
-
-    default:
-        ALOGV("\tLVM_ERROR : Equalizer_getParameter unknown param %d", param);
-        return -EINVAL;
-    }
-
-    switch (param) {
-    case EQ_PARAM_NUM_BANDS:
-        *(uint16_t *)pValue = (uint16_t)FIVEBAND_NUMBANDS;
-        //ALOGV("\tEqualizer_getParameter() EQ_PARAM_NUM_BANDS %d", *(int16_t *)pValue);
-        break;
-
-    case EQ_PARAM_LEVEL_RANGE:
         *(int16_t *)pValue = -1500;
         *((int16_t *)pValue + 1) = 1500;
-        //ALOGV("\tEqualizer_getParameter() EQ_PARAM_LEVEL_RANGE min %d, max %d",
-        //      *(int16_t *)pValue, *((int16_t *)pValue + 1));
+        ALOGVV("%s EQ_PARAM_LEVEL_RANGE min %d, max %d",
+                __func__, *(int16_t *)pValue, *((int16_t *)pValue + 1));
         break;
 
-    case EQ_PARAM_BAND_LEVEL:
-        param2 = *pParamTemp;
-        if (param2 < 0 || param2 >= FIVEBAND_NUMBANDS) {
+    case EQ_PARAM_BAND_FREQ_RANGE: {
+        if (paramSize < 2 * sizeof(int32_t)) {
+            ALOGV("%s EQ_PARAM_BAND_FREQ_RANGE invalid paramSize: %u", __func__, paramSize);
             status = -EINVAL;
-            if (param2 < 0) {
-                android_errorWriteLog(0x534e4554, "32438598");
-                ALOGW("\tERROR Equalizer_getParameter() EQ_PARAM_BAND_LEVEL band %d", param2);
-            }
             break;
         }
-        *(int16_t *)pValue = (int16_t)EqualizerGetBandLevel(pContext, param2);
-        //ALOGV("\tEqualizer_getParameter() EQ_PARAM_BAND_LEVEL band %d, level %d",
-        //      param2, *(int32_t *)pValue);
-        break;
-
-    case EQ_PARAM_CENTER_FREQ:
-        param2 = *pParamTemp;
-        if (param2 < 0 || param2 >= FIVEBAND_NUMBANDS) {
+        if (*pValueSize < 2 * sizeof(int32_t)) {
+            ALOGV("%s EQ_PARAM_BAND_FREQ_RANGE invalid *pValueSize %u", __func__, *pValueSize);
             status = -EINVAL;
-            if (param2 < 0) {
-                android_errorWriteLog(0x534e4554, "32436341");
-                ALOGW("\tERROR Equalizer_getParameter() EQ_PARAM_CENTER_FREQ band %d", param2);
-            }
             break;
         }
-        *(int32_t *)pValue = EqualizerGetCentreFrequency(pContext, param2);
-        //ALOGV("\tEqualizer_getParameter() EQ_PARAM_CENTER_FREQ band %d, frequency %d",
-        //      param2, *(int32_t *)pValue);
-        break;
+        *pValueSize = 2 * sizeof(int32_t);
 
-    case EQ_PARAM_BAND_FREQ_RANGE:
-        param2 = *pParamTemp;
-        if (param2 < 0 || param2 >= FIVEBAND_NUMBANDS) {
-            status = -EINVAL;
-            if (param2 < 0) {
+        const int32_t band = params[1];
+        if (band < 0 || band >= FIVEBAND_NUMBANDS) {
+            if (band < 0) {
                 android_errorWriteLog(0x534e4554, "32247948");
-                ALOGW("\tERROR Equalizer_getParameter() EQ_PARAM_BAND_FREQ_RANGE band %d", param2);
+                ALOGW("%s EQ_PARAM_BAND_FREQ_RANGE invalid band %d",
+                        __func__, band);
             }
-            break;
-        }
-        EqualizerGetBandFreqRange(pContext, param2, (uint32_t *)pValue, ((uint32_t *)pValue + 1));
-        //ALOGV("\tEqualizer_getParameter() EQ_PARAM_BAND_FREQ_RANGE band %d, min %d, max %d",
-        //      param2, *(int32_t *)pValue, *((int32_t *)pValue + 1));
-        break;
-
-    case EQ_PARAM_GET_BAND:
-        param2 = *pParamTemp;
-        *(uint16_t *)pValue = (uint16_t)EqualizerGetBand(pContext, param2);
-        //ALOGV("\tEqualizer_getParameter() EQ_PARAM_GET_BAND frequency %d, band %d",
-        //      param2, *(uint16_t *)pValue);
-        break;
-
-    case EQ_PARAM_CUR_PRESET:
-        *(uint16_t *)pValue = (uint16_t)EqualizerGetPreset(pContext);
-        //ALOGV("\tEqualizer_getParameter() EQ_PARAM_CUR_PRESET %d", *(int32_t *)pValue);
-        break;
-
-    case EQ_PARAM_GET_NUM_OF_PRESETS:
-        *(uint16_t *)pValue = (uint16_t)EqualizerGetNumPresets();
-        //ALOGV("\tEqualizer_getParameter() EQ_PARAM_GET_NUM_OF_PRESETS %d", *(int16_t *)pValue);
-        break;
-
-    case EQ_PARAM_GET_PRESET_NAME:
-        param2 = *pParamTemp;
-        if ((param2 < 0 && param2 != PRESET_CUSTOM) ||  param2 >= EqualizerGetNumPresets()) {
             status = -EINVAL;
-            if (param2 < 0) {
-                android_errorWriteLog(0x534e4554, "32448258");
-                ALOGE("\tERROR Equalizer_getParameter() EQ_PARAM_GET_PRESET_NAME preset %d",
-                        param2);
+            break;
+        }
+        EqualizerGetBandFreqRange(pContext, band, (uint32_t *)pValue, ((uint32_t *)pValue + 1));
+        ALOGVV("%s EQ_PARAM_BAND_FREQ_RANGE band %d, min %d, max %d",
+                __func__, band, *(int32_t *)pValue, *((int32_t *)pValue + 1));
+
+    } break;
+
+    case EQ_PARAM_CENTER_FREQ: {
+        if (paramSize < 2 * sizeof(int32_t)) {
+            ALOGV("%s EQ_PARAM_CENTER_FREQ invalid paramSize: %u", __func__, paramSize);
+            status = -EINVAL;
+            break;
+        }
+        if (*pValueSize < sizeof(int32_t)) {
+            ALOGV("%s EQ_PARAM_CENTER_FREQ invalid *pValueSize %u", __func__, *pValueSize);
+            status = -EINVAL;
+            break;
+        }
+        *pValueSize = sizeof(int32_t);
+
+        const int32_t band = params[1];
+        if (band < 0 || band >= FIVEBAND_NUMBANDS) {
+            status = -EINVAL;
+            if (band < 0) {
+                android_errorWriteLog(0x534e4554, "32436341");
+                ALOGW("%s EQ_PARAM_CENTER_FREQ invalid band %d", __func__, band);
             }
             break;
         }
-        name = (char *)pValue;
-        strncpy(name, EqualizerGetPresetName(param2), *pValueSize - 1);
+        *(int32_t *)pValue = EqualizerGetCentreFrequency(pContext, band);
+        ALOGVV("%s EQ_PARAM_CENTER_FREQ band %d, frequency %d",
+                __func__, band, *(int32_t *)pValue);
+    } break;
+
+    case EQ_PARAM_GET_PRESET_NAME: {
+        if (paramSize < 2 * sizeof(int32_t)) {
+            ALOGV("%s EQ_PARAM_PRESET_NAME invalid paramSize: %u", __func__, paramSize);
+            status = -EINVAL;
+            break;
+        }
+        if (*pValueSize < 1) {
+            android_errorWriteLog(0x534e4554, "37536407");
+            status = -EINVAL;
+            break;
+        }
+
+        const int32_t preset = params[1];
+        if ((preset < 0 && preset != PRESET_CUSTOM) ||  preset >= EqualizerGetNumPresets()) {
+            if (preset < 0) {
+                android_errorWriteLog(0x534e4554, "32448258");
+                ALOGE("%s EQ_PARAM_GET_PRESET_NAME preset %d", __func__, preset);
+            }
+            status = -EINVAL;
+            break;
+        }
+
+        char * const name = (char *)pValue;
+        strncpy(name, EqualizerGetPresetName(preset), *pValueSize - 1);
         name[*pValueSize - 1] = 0;
         *pValueSize = strlen(name) + 1;
-        //ALOGV("\tEqualizer_getParameter() EQ_PARAM_GET_PRESET_NAME preset %d, name %s len %d",
-        //      param2, gEqualizerPresets[param2].name, *pValueSize);
-        break;
+        ALOGVV("%s EQ_PARAM_GET_PRESET_NAME preset %d, name %s len %d",
+                __func__, preset, gEqualizerPresets[preset].name, *pValueSize);
+
+    } break;
 
     case EQ_PARAM_PROPERTIES: {
+        constexpr uint32_t requiredValueSize = (2 + FIVEBAND_NUMBANDS) * sizeof(uint16_t);
+        if (*pValueSize < requiredValueSize) {
+            ALOGV("%s EQ_PARAM_PROPERTIES invalid *pValueSize %u", __func__, *pValueSize);
+            status = -EINVAL;
+            break;
+        }
+        *pValueSize = requiredValueSize;
+
         int16_t *p = (int16_t *)pValue;
-        ALOGV("\tEqualizer_getParameter() EQ_PARAM_PROPERTIES");
+        ALOGV("%s EQ_PARAM_PROPERTIES", __func__);
         p[0] = (int16_t)EqualizerGetPreset(pContext);
         p[1] = (int16_t)FIVEBAND_NUMBANDS;
         for (int i = 0; i < FIVEBAND_NUMBANDS; i++) {
@@ -2455,12 +2731,12 @@ int Equalizer_getParameter(EffectContext     *pContext,
     } break;
 
     default:
-        ALOGV("\tLVM_ERROR : Equalizer_getParameter() invalid param %d", param);
+        ALOGV("%s invalid param %d", __func__, params[0]);
         status = -EINVAL;
         break;
     }
 
-    //GV("\tEqualizer_getParameter end\n");
+    ALOGVV("%s end param: %d, status: %d", __func__, params[0], status);
     return status;
 } /* end Equalizer_getParameter */
 
@@ -2473,57 +2749,96 @@ int Equalizer_getParameter(EffectContext     *pContext,
 // Inputs:
 //  pEqualizer    - handle to instance data
 //  pParam        - pointer to parameter
+//  valueSize     - value size
 //  pValue        - pointer to value
+
 //
 // Outputs:
 //
 //----------------------------------------------------------------------------
-int Equalizer_setParameter (EffectContext *pContext, void *pParam, void *pValue){
+int Equalizer_setParameter(EffectContext *pContext,
+                           uint32_t       paramSize,
+                           void          *pParam,
+                           uint32_t       valueSize,
+                           void          *pValue) {
     int status = 0;
-    int32_t preset;
-    int32_t band;
-    int32_t level;
-    int32_t *pParamTemp = (int32_t *)pParam;
-    int32_t param = *pParamTemp++;
+    int32_t *params = (int32_t *)pParam;
 
+    ALOGVV("%s start", __func__);
 
-    //ALOGV("\tEqualizer_setParameter start");
-    switch (param) {
-    case EQ_PARAM_CUR_PRESET:
-        preset = (int32_t)(*(uint16_t *)pValue);
+    if (paramSize < sizeof(int32_t)) {
+        ALOGV("%s invalid paramSize: %u", __func__, paramSize);
+        return -EINVAL;
+    }
+    switch (params[0]) {
+    case EQ_PARAM_CUR_PRESET: {
+        if (valueSize < sizeof(int16_t)) {
+            ALOGV("%s EQ_PARAM_CUR_PRESET invalid valueSize %u", __func__, valueSize);
+            status = -EINVAL;
+            break;
+        }
+        const int32_t preset = (int32_t)*(uint16_t *)pValue;
 
-        //ALOGV("\tEqualizer_setParameter() EQ_PARAM_CUR_PRESET %d", preset);
-        if ((preset >= EqualizerGetNumPresets())||(preset < 0)) {
+        ALOGVV("%s EQ_PARAM_CUR_PRESET %d", __func__, preset);
+        if (preset >= EqualizerGetNumPresets() || preset < 0) {
+            ALOGV("%s EQ_PARAM_CUR_PRESET invalid preset %d", __func__, preset);
             status = -EINVAL;
             break;
         }
         EqualizerSetPreset(pContext, preset);
-        break;
-    case EQ_PARAM_BAND_LEVEL:
-        band =  *pParamTemp;
-        level = (int32_t)(*(int16_t *)pValue);
-        //ALOGV("\tEqualizer_setParameter() EQ_PARAM_BAND_LEVEL band %d, level %d", band, level);
-        if (band < 0 || band >= FIVEBAND_NUMBANDS) {
+    } break;
+
+    case EQ_PARAM_BAND_LEVEL: {
+        if (paramSize < 2 * sizeof(int32_t)) {
+            ALOGV("%s EQ_PARAM_BAND_LEVEL invalid paramSize: %u", __func__, paramSize);
             status = -EINVAL;
+            break;
+        }
+        if (valueSize < sizeof(int16_t)) {
+            ALOGV("%s EQ_PARAM_BAND_LEVEL invalid valueSize %u", __func__, valueSize);
+            status = -EINVAL;
+            break;
+        }
+        const int32_t band =  params[1];
+        const int32_t level = (int32_t)*(int16_t *)pValue;
+        ALOGVV("%s EQ_PARAM_BAND_LEVEL band %d, level %d", __func__, band, level);
+        if (band < 0 || band >= FIVEBAND_NUMBANDS) {
             if (band < 0) {
                 android_errorWriteLog(0x534e4554, "32095626");
-                ALOGE("\tERROR Equalizer_setParameter() EQ_PARAM_BAND_LEVEL band %d", band);
+                ALOGE("%s EQ_PARAM_BAND_LEVEL invalid band %d", __func__, band);
             }
+            status = -EINVAL;
             break;
         }
         EqualizerSetBandLevel(pContext, band, level);
-        break;
+    } break;
+
     case EQ_PARAM_PROPERTIES: {
-        //ALOGV("\tEqualizer_setParameter() EQ_PARAM_PROPERTIES");
+        ALOGVV("%s EQ_PARAM_PROPERTIES", __func__);
+        if (valueSize < sizeof(int16_t)) {
+            ALOGV("%s EQ_PARAM_PROPERTIES invalid valueSize %u", __func__, valueSize);
+            status = -EINVAL;
+            break;
+        }
         int16_t *p = (int16_t *)pValue;
         if ((int)p[0] >= EqualizerGetNumPresets()) {
+            ALOGV("%s EQ_PARAM_PROPERTIES invalid preset %d", __func__, (int)p[0]);
             status = -EINVAL;
             break;
         }
         if (p[0] >= 0) {
             EqualizerSetPreset(pContext, (int)p[0]);
         } else {
+            constexpr uint32_t valueSizeRequired = (2 + FIVEBAND_NUMBANDS) * sizeof(int16_t);
+            if (valueSize < valueSizeRequired) {
+              android_errorWriteLog(0x534e4554, "37563371");
+              ALOGE("%s EQ_PARAM_PROPERTIES invalid valueSize %u < %u",
+                      __func__, valueSize, valueSizeRequired);
+              status = -EINVAL;
+              break;
+            }
             if ((int)p[1] != FIVEBAND_NUMBANDS) {
+                ALOGV("%s EQ_PARAM_PROPERTIES invalid bands %d", __func__, (int)p[1]);
                 status = -EINVAL;
                 break;
             }
@@ -2532,13 +2847,14 @@ int Equalizer_setParameter (EffectContext *pContext, void *pParam, void *pValue)
             }
         }
     } break;
+
     default:
-        ALOGV("\tLVM_ERROR : Equalizer_setParameter() invalid param %d", param);
+        ALOGV("%s invalid param %d", __func__, params[0]);
         status = -EINVAL;
         break;
     }
 
-    //ALOGV("\tEqualizer_setParameter end");
+    ALOGVV("%s end param: %d, status: %d", __func__, params[0], status);
     return status;
 } /* end Equalizer_setParameter */
 
@@ -2563,81 +2879,92 @@ int Equalizer_setParameter (EffectContext *pContext, void *pParam, void *pValue)
 //
 //----------------------------------------------------------------------------
 
-int Volume_getParameter(EffectContext     *pContext,
-                        void              *pParam,
-                        uint32_t          *pValueSize,
-                        void              *pValue){
+int Volume_getParameter(EffectContext *pContext,
+                        uint32_t       paramSize,
+                        void          *pParam,
+                        uint32_t      *pValueSize,
+                        void          *pValue) {
     int status = 0;
-    int bMute = 0;
-    int32_t *pParamTemp = (int32_t *)pParam;
-    int32_t param = *pParamTemp++;;
-    char *name;
+    int32_t *params = (int32_t *)pParam;
 
-    //ALOGV("\tVolume_getParameter start");
+    ALOGVV("%s start", __func__);
 
-    switch (param){
+    if (paramSize < sizeof(int32_t)) {
+        ALOGV("%s invalid paramSize: %u", __func__, paramSize);
+        return -EINVAL;
+    }
+    switch (params[0]) {
         case VOLUME_PARAM_LEVEL:
-        case VOLUME_PARAM_MAXLEVEL:
-        case VOLUME_PARAM_STEREOPOSITION:
-            if (*pValueSize != sizeof(int16_t)){
-                ALOGV("\tLVM_ERROR : Volume_getParameter() invalid pValueSize 1  %d", *pValueSize);
-                return -EINVAL;
+            if (*pValueSize != sizeof(int16_t)) { // legacy: check equality here.
+                ALOGV("%s VOLUME_PARAM_LEVEL invalid *pValueSize %u", __func__, *pValueSize);
+                status = -EINVAL;
+                break;
             }
-            *pValueSize = sizeof(int16_t);
+            // no need to set *pValueSize
+
+            status = VolumeGetVolumeLevel(pContext, (int16_t *)(pValue));
+            ALOGVV("%s VOLUME_PARAM_LEVEL %d", __func__, *(int16_t *)pValue);
+            break;
+
+        case VOLUME_PARAM_MAXLEVEL:
+            if (*pValueSize != sizeof(int16_t)) { // legacy: check equality here.
+                ALOGV("%s VOLUME_PARAM_MAXLEVEL invalid *pValueSize %u", __func__, *pValueSize);
+                status = -EINVAL;
+                break;
+            }
+            // no need to set *pValueSize
+
+            // in millibel
+            *(int16_t *)pValue = 0;
+            ALOGVV("%s VOLUME_PARAM_MAXLEVEL %d", __func__, *(int16_t *)pValue);
+            break;
+
+        case VOLUME_PARAM_STEREOPOSITION:
+            if (*pValueSize != sizeof(int16_t)) { // legacy: check equality here.
+                ALOGV("%s VOLUME_PARAM_STEREOPOSITION invalid *pValueSize %u",
+                        __func__, *pValueSize);
+                status = -EINVAL;
+                break;
+            }
+            // no need to set *pValueSize
+
+            VolumeGetStereoPosition(pContext, (int16_t *)pValue);
+            ALOGVV("%s VOLUME_PARAM_STEREOPOSITION %d", __func__, *(int16_t *)pValue);
             break;
 
         case VOLUME_PARAM_MUTE:
+            if (*pValueSize < sizeof(uint32_t)) {
+                ALOGV("%s VOLUME_PARAM_MUTE invalid *pValueSize %u", __func__, *pValueSize);
+                status = -EINVAL;
+                break;
+            }
+            *pValueSize = sizeof(uint32_t);
+
+            status = VolumeGetMute(pContext, (uint32_t *)pValue);
+            ALOGV("%s VOLUME_PARAM_MUTE %u", __func__, *(uint32_t *)pValue);
+            break;
+
         case VOLUME_PARAM_ENABLESTEREOPOSITION:
-            if (*pValueSize < sizeof(int32_t)){
-                ALOGV("\tLVM_ERROR : Volume_getParameter() invalid pValueSize 2  %d", *pValueSize);
-                return -EINVAL;
+            if (*pValueSize < sizeof(int32_t)) {
+                ALOGV("%s VOLUME_PARAM_ENABLESTEREOPOSITION invalid *pValueSize %u",
+                        __func__, *pValueSize);
+                status = -EINVAL;
+                break;
             }
             *pValueSize = sizeof(int32_t);
-            break;
 
-        default:
-            ALOGV("\tLVM_ERROR : Volume_getParameter unknown param %d", param);
-            return -EINVAL;
-    }
-
-    switch (param){
-        case VOLUME_PARAM_LEVEL:
-            status = VolumeGetVolumeLevel(pContext, (int16_t *)(pValue));
-            //ALOGV("\tVolume_getParameter() VOLUME_PARAM_LEVEL Value is %d",
-            //        *(int16_t *)pValue);
-            break;
-
-        case VOLUME_PARAM_MAXLEVEL:
-            *(int16_t *)pValue = 0;
-            //ALOGV("\tVolume_getParameter() VOLUME_PARAM_MAXLEVEL Value is %d",
-            //        *(int16_t *)pValue);
-            break;
-
-        case VOLUME_PARAM_STEREOPOSITION:
-            VolumeGetStereoPosition(pContext, (int16_t *)pValue);
-            //ALOGV("\tVolume_getParameter() VOLUME_PARAM_STEREOPOSITION Value is %d",
-            //        *(int16_t *)pValue);
-            break;
-
-        case VOLUME_PARAM_MUTE:
-            status = VolumeGetMute(pContext, (uint32_t *)pValue);
-            ALOGV("\tVolume_getParameter() VOLUME_PARAM_MUTE Value is %d",
-                    *(uint32_t *)pValue);
-            break;
-
-        case VOLUME_PARAM_ENABLESTEREOPOSITION:
             *(int32_t *)pValue = pContext->pBundledContext->bStereoPositionEnabled;
-            //ALOGV("\tVolume_getParameter() VOLUME_PARAM_ENABLESTEREOPOSITION Value is %d",
-            //        *(uint32_t *)pValue);
+            ALOGVV("%s VOLUME_PARAM_ENABLESTEREOPOSITION %d", __func__, *(int32_t *)pValue);
+
             break;
 
         default:
-            ALOGV("\tLVM_ERROR : Volume_getParameter() invalid param %d", param);
+            ALOGV("%s invalid param %d", __func__, params[0]);
             status = -EINVAL;
             break;
     }
 
-    //ALOGV("\tVolume_getParameter end");
+    ALOGVV("%s end param: %d, status: %d", __func__, params[0], status);
     return status;
 } /* end Volume_getParameter */
 
@@ -2657,55 +2984,87 @@ int Volume_getParameter(EffectContext     *pContext,
 //
 //----------------------------------------------------------------------------
 
-int Volume_setParameter (EffectContext *pContext, void *pParam, void *pValue){
-    int      status = 0;
-    int16_t  level;
-    int16_t  position;
-    uint32_t mute;
-    uint32_t positionEnabled;
-    int32_t *pParamTemp = (int32_t *)pParam;
-    int32_t param = *pParamTemp++;
+int Volume_setParameter(EffectContext *pContext,
+                        uint32_t       paramSize,
+                        void          *pParam,
+                        uint32_t       valueSize,
+                        void          *pValue) {
+    int status = 0;
+    int32_t *params = (int32_t *)pParam;
 
-    //ALOGV("\tVolume_setParameter start");
+    ALOGVV("%s start", __func__);
 
-    switch (param){
-        case VOLUME_PARAM_LEVEL:
-            level = *(int16_t *)pValue;
-            //ALOGV("\tVolume_setParameter() VOLUME_PARAM_LEVEL value is %d", level);
-            //ALOGV("\tVolume_setParameter() Calling pVolume->setVolumeLevel");
-            status = VolumeSetVolumeLevel(pContext, (int16_t)level);
-            //ALOGV("\tVolume_setParameter() Called pVolume->setVolumeLevel");
-            break;
+    if (paramSize < sizeof(int32_t)) {
+        ALOGV("%s invalid paramSize: %u", __func__, paramSize);
+        return -EINVAL;
+    }
+    switch (params[0]) {
+        case VOLUME_PARAM_LEVEL: {
+            if (valueSize < sizeof(int16_t)) {
+                ALOGV("%s VOLUME_PARAM_LEVEL invalid valueSize %u", __func__, valueSize);
+                status = -EINVAL;
+                break;
+            }
 
-        case VOLUME_PARAM_MUTE:
-            mute = *(uint32_t *)pValue;
-            //ALOGV("\tVolume_setParameter() Calling pVolume->setMute, mute is %d", mute);
-            //ALOGV("\tVolume_setParameter() Calling pVolume->setMute");
+            const int16_t level = *(int16_t *)pValue;
+            ALOGVV("%s VOLUME_PARAM_LEVEL %d", __func__, level);
+            ALOGVV("%s VOLUME_PARAM_LEVEL Calling VolumeSetVolumeLevel", __func__);
+            status = VolumeSetVolumeLevel(pContext, level);
+            ALOGVV("%s VOLUME_PARAM_LEVEL Called VolumeSetVolumeLevel", __func__);
+        } break;
+
+        case VOLUME_PARAM_MUTE: {
+            if (valueSize < sizeof(uint32_t)) {
+                ALOGV("%s VOLUME_PARAM_MUTE invalid valueSize %u", __func__, valueSize);
+                android_errorWriteLog(0x534e4554, "64477217");
+                status = -EINVAL;
+                break;
+            }
+
+            const uint32_t mute = *(uint32_t *)pValue;
+            ALOGVV("%s VOLUME_PARAM_MUTE %d", __func__, mute);
+            ALOGVV("%s VOLUME_PARAM_MUTE Calling VolumeSetMute", __func__);
             status = VolumeSetMute(pContext, mute);
-            //ALOGV("\tVolume_setParameter() Called pVolume->setMute");
-            break;
+            ALOGVV("%s VOLUME_PARAM_MUTE Called VolumeSetMute", __func__);
+        } break;
 
-        case VOLUME_PARAM_ENABLESTEREOPOSITION:
-            positionEnabled = *(uint32_t *)pValue;
-            status = VolumeEnableStereoPosition(pContext, positionEnabled);
-            status = VolumeSetStereoPosition(pContext, pContext->pBundledContext->positionSaved);
-            //ALOGV("\tVolume_setParameter() VOLUME_PARAM_ENABLESTEREOPOSITION called");
-            break;
+        case VOLUME_PARAM_ENABLESTEREOPOSITION: {
+            if (valueSize < sizeof(uint32_t)) {
+                ALOGV("%s VOLUME_PARAM_ENABLESTEREOPOSITION invalid valueSize %u",
+                        __func__, valueSize);
+                status = -EINVAL;
+                break;
+            }
 
-        case VOLUME_PARAM_STEREOPOSITION:
-            position = *(int16_t *)pValue;
-            //ALOGV("\tVolume_setParameter() VOLUME_PARAM_STEREOPOSITION value is %d", position);
-            //ALOGV("\tVolume_setParameter() Calling pVolume->VolumeSetStereoPosition");
-            status = VolumeSetStereoPosition(pContext, (int16_t)position);
-            //ALOGV("\tVolume_setParameter() Called pVolume->VolumeSetStereoPosition");
-            break;
+            const uint32_t positionEnabled = *(uint32_t *)pValue;
+            status = VolumeEnableStereoPosition(pContext, positionEnabled)
+                    ?: VolumeSetStereoPosition(pContext, pContext->pBundledContext->positionSaved);
+            ALOGVV("%s VOLUME_PARAM_ENABLESTEREOPOSITION called", __func__);
+        } break;
+
+        case VOLUME_PARAM_STEREOPOSITION: {
+            if (valueSize < sizeof(int16_t)) {
+                ALOGV("%s VOLUME_PARAM_STEREOPOSITION invalid valueSize %u", __func__, valueSize);
+                status = -EINVAL;
+                break;
+            }
+
+            const int16_t position = *(int16_t *)pValue;
+            ALOGVV("%s VOLUME_PARAM_STEREOPOSITION %d", __func__, position);
+            ALOGVV("%s VOLUME_PARAM_STEREOPOSITION Calling VolumeSetStereoPosition",
+                    __func__);
+            status = VolumeSetStereoPosition(pContext, position);
+            ALOGVV("%s VOLUME_PARAM_STEREOPOSITION Called VolumeSetStereoPosition",
+                    __func__);
+        } break;
 
         default:
-            ALOGV("\tLVM_ERROR : Volume_setParameter() invalid param %d", param);
+            ALOGV("%s invalid param %d", __func__, params[0]);
+            status = -EINVAL;
             break;
     }
 
-    //ALOGV("\tVolume_setParameter end");
+    ALOGVV("%s end param: %d, status: %d", __func__, params[0], status);
     return status;
 } /* end Volume_setParameter */
 
@@ -2901,11 +3260,9 @@ int Effect_process(effect_handle_t     self,
                               audio_buffer_t         *inBuffer,
                               audio_buffer_t         *outBuffer){
     EffectContext * pContext = (EffectContext *) self;
-    LVM_ReturnStatus_en     LvmStatus = LVM_SUCCESS;                /* Function call status */
     int    status = 0;
-    int    lvmStatus = 0;
-    LVM_INT16   *in  = (LVM_INT16 *)inBuffer->raw;
-    LVM_INT16   *out = (LVM_INT16 *)outBuffer->raw;
+    int    processStatus = 0;
+    const int NrChannels = audio_channel_count_from_out_mask(pContext->config.inputCfg.channels);
 
 //ALOGV("\tEffect_process Start : Enabled = %d     Called = %d (%8d %8d %8d)",
 //pContext->pBundledContext->NumberEffectsEnabled,pContext->pBundledContext->NumberEffectsCalled,
@@ -2936,7 +3293,7 @@ int Effect_process(effect_handle_t     self,
         (pContext->EffectType == LVM_BASS_BOOST)){
         //ALOGV("\tEffect_process() LVM_BASS_BOOST Effect is not enabled");
         if(pContext->pBundledContext->SamplesToExitCountBb > 0){
-            pContext->pBundledContext->SamplesToExitCountBb -= outBuffer->frameCount * 2; // STEREO
+            pContext->pBundledContext->SamplesToExitCountBb -= outBuffer->frameCount * NrChannels;
             //ALOGV("\tEffect_process: Waiting to turn off BASS_BOOST, %d samples left",
             //    pContext->pBundledContext->SamplesToExitCountBb);
         }
@@ -2956,7 +3313,7 @@ int Effect_process(effect_handle_t     self,
         (pContext->EffectType == LVM_EQUALIZER)){
         //ALOGV("\tEffect_process() LVM_EQUALIZER Effect is not enabled");
         if(pContext->pBundledContext->SamplesToExitCountEq > 0){
-            pContext->pBundledContext->SamplesToExitCountEq -= outBuffer->frameCount * 2; // STEREO
+            pContext->pBundledContext->SamplesToExitCountEq -= outBuffer->frameCount * NrChannels;
             //ALOGV("\tEffect_process: Waiting to turn off EQUALIZER, %d samples left",
             //    pContext->pBundledContext->SamplesToExitCountEq);
         }
@@ -2970,7 +3327,8 @@ int Effect_process(effect_handle_t     self,
         (pContext->EffectType == LVM_VIRTUALIZER)){
         //ALOGV("\tEffect_process() LVM_VIRTUALIZER Effect is not enabled");
         if(pContext->pBundledContext->SamplesToExitCountVirt > 0){
-            pContext->pBundledContext->SamplesToExitCountVirt -= outBuffer->frameCount * 2;// STEREO
+            pContext->pBundledContext->SamplesToExitCountVirt -=
+                outBuffer->frameCount * NrChannels;
             //ALOGV("\tEffect_process: Waiting for to turn off VIRTUALIZER, %d samples left",
             //    pContext->pBundledContext->SamplesToExitCountVirt);
         }
@@ -2991,37 +3349,59 @@ int Effect_process(effect_handle_t     self,
         //pContext->pBundledContext->NumberEffectsEnabled,
         //pContext->pBundledContext->NumberEffectsCalled, pContext->EffectType);
 
-        if(status == -ENODATA){
+        if (status == -ENODATA){
             ALOGV("\tEffect_process() processing last frame");
         }
         pContext->pBundledContext->NumberEffectsCalled = 0;
         /* Process all the available frames, block processing is
            handled internalLY by the LVM bundle */
-        lvmStatus = android::LvmBundle_process(    (LVM_INT16 *)inBuffer->raw,
-                                                (LVM_INT16 *)outBuffer->raw,
-                                                outBuffer->frameCount,
-                                                pContext);
-        if(lvmStatus != LVM_SUCCESS){
-            ALOGV("\tLVM_ERROR : LvmBundle_process returned error %d", lvmStatus);
-            return lvmStatus;
+#ifdef NATIVE_FLOAT_BUFFER
+        processStatus = android::LvmBundle_process(inBuffer->f32,
+                                                   outBuffer->f32,
+                                                   outBuffer->frameCount,
+                                                   pContext);
+#else
+        processStatus = android::LvmBundle_process(inBuffer->s16,
+                                                   outBuffer->s16,
+                                                   outBuffer->frameCount,
+                                                   pContext);
+#endif
+        if (processStatus != 0){
+            ALOGV("\tLVM_ERROR : LvmBundle_process returned error %d", processStatus);
+            if (status == 0) {
+                status = processStatus;
+            }
+            return status;
         }
     } else {
         //ALOGV("\tEffect_process Not Calling process with %d effects enabled, %d called: Effect %d",
         //pContext->pBundledContext->NumberEffectsEnabled,
         //pContext->pBundledContext->NumberEffectsCalled, pContext->EffectType);
-        // 2 is for stereo input
+
         if (pContext->config.outputCfg.accessMode == EFFECT_BUFFER_ACCESS_ACCUMULATE) {
-            for (size_t i=0; i < outBuffer->frameCount*2; i++){
-                outBuffer->s16[i] =
-                        clamp16((LVM_INT32)outBuffer->s16[i] + (LVM_INT32)inBuffer->s16[i]);
-                    }
+            for (size_t i = 0; i < outBuffer->frameCount * NrChannels; ++i) {
+#ifdef NATIVE_FLOAT_BUFFER
+                outBuffer->f32[i] += inBuffer->f32[i];
+#else
+                outBuffer->s16[i] = clamp16((LVM_INT32)outBuffer->s16[i] + inBuffer->s16[i]);
+#endif
+            }
         } else if (outBuffer->raw != inBuffer->raw) {
-            memcpy(outBuffer->raw, inBuffer->raw, outBuffer->frameCount*sizeof(LVM_INT16)*2);
+            memcpy(outBuffer->raw,
+                    inBuffer->raw,
+                    outBuffer->frameCount * sizeof(effect_buffer_t) * FCC_2);
         }
     }
 
     return status;
 }   /* end Effect_process */
+
+// The value offset of an effect parameter is computed by rounding up
+// the parameter size to the next 32 bit alignment.
+static inline uint32_t computeParamVOffset(const effect_param_t *p) {
+    return ((p->psize + sizeof(int32_t) - 1) / sizeof(int32_t)) *
+            sizeof(int32_t);
+}
 
 /* Effect Control Interface Implementation: Command */
 int Effect_command(effect_handle_t  self,
@@ -3031,7 +3411,6 @@ int Effect_command(effect_handle_t  self,
                               uint32_t            *replySize,
                               void                *pReplyData){
     EffectContext * pContext = (EffectContext *) self;
-    int retsize;
 
     //ALOGV("\t\nEffect_command start");
 
@@ -3134,8 +3513,7 @@ int Effect_command(effect_handle_t  self,
                 ALOGV("\tLVM_ERROR : EFFECT_CMD_GET_PARAM: psize too big");
                 return -EINVAL;
             }
-            uint32_t paddedParamSize = ((p->psize + sizeof(int32_t) - 1) / sizeof(int32_t)) *
-                    sizeof(int32_t);
+            const uint32_t paddedParamSize = computeParamVOffset(p);
             if ((EFFECT_PARAM_SIZE_MAX - sizeof(effect_param_t) < paddedParamSize) ||
                 (EFFECT_PARAM_SIZE_MAX - sizeof(effect_param_t) - paddedParamSize <
                     p->vsize)) {
@@ -3157,6 +3535,7 @@ int Effect_command(effect_handle_t  self,
             uint32_t voffset = paddedParamSize;
             if(pContext->EffectType == LVM_BASS_BOOST){
                 p->status = android::BassBoost_getParameter(pContext,
+                                                            p->psize,
                                                             p->data,
                                                             &p->vsize,
                                                             p->data + voffset);
@@ -3169,6 +3548,7 @@ int Effect_command(effect_handle_t  self,
 
             if(pContext->EffectType == LVM_VIRTUALIZER){
                 p->status = android::Virtualizer_getParameter(pContext,
+                                                              p->psize,
                                                               (void *)p->data,
                                                               &p->vsize,
                                                               p->data + voffset);
@@ -3183,6 +3563,7 @@ int Effect_command(effect_handle_t  self,
                 //ALOGV("\tEqualizer_command cmdCode Case: "
                 //        "EFFECT_CMD_GET_PARAM start");
                 p->status = android::Equalizer_getParameter(pContext,
+                                                            p->psize,
                                                             p->data,
                                                             &p->vsize,
                                                             p->data + voffset);
@@ -3197,6 +3578,7 @@ int Effect_command(effect_handle_t  self,
             if(pContext->EffectType == LVM_VOLUME){
                 //ALOGV("\tVolume_command cmdCode Case: EFFECT_CMD_GET_PARAM start");
                 p->status = android::Volume_getParameter(pContext,
+                                                         p->psize,
                                                          (void *)p->data,
                                                          &p->vsize,
                                                          p->data + voffset);
@@ -3226,13 +3608,9 @@ int Effect_command(effect_handle_t  self,
                             "EFFECT_CMD_SET_PARAM: ERROR");
                     return -EINVAL;
                 }
-                effect_param_t *p = (effect_param_t *) pCmdData;
 
-                if (p->psize != sizeof(int32_t)){
-                    ALOGV("\tLVM_ERROR : BassBoost_command cmdCode Case: "
-                            "EFFECT_CMD_SET_PARAM: ERROR, psize is not sizeof(int32_t)");
-                    return -EINVAL;
-                }
+                effect_param_t * const p = (effect_param_t *) pCmdData;
+                const uint32_t voffset = computeParamVOffset(p);
 
                 //ALOGV("\tnBassBoost_command cmdSize is %d\n"
                 //        "\tsizeof(effect_param_t) is  %d\n"
@@ -3242,8 +3620,10 @@ int Effect_command(effect_handle_t  self,
                 //        cmdSize, sizeof(effect_param_t), p->psize, p->vsize );
 
                 *(int *)pReplyData = android::BassBoost_setParameter(pContext,
-                                                                    (void *)p->data,
-                                                                    p->data + p->psize);
+                                                                     p->psize,
+                                                                     (void *)p->data,
+                                                                     p->vsize,
+                                                                     p->data + voffset);
             }
             if(pContext->EffectType == LVM_VIRTUALIZER){
               // Warning this log will fail to properly read an int32_t value, assumes int16_t
@@ -3261,13 +3641,9 @@ int Effect_command(effect_handle_t  self,
                             "EFFECT_CMD_SET_PARAM: ERROR");
                     return -EINVAL;
                 }
-                effect_param_t *p = (effect_param_t *) pCmdData;
 
-                if (p->psize != sizeof(int32_t)){
-                    ALOGV("\tLVM_ERROR : Virtualizer_command cmdCode Case: "
-                            "EFFECT_CMD_SET_PARAM: ERROR, psize is not sizeof(int32_t)");
-                    return -EINVAL;
-                }
+                effect_param_t * const p = (effect_param_t *) pCmdData;
+                const uint32_t voffset = computeParamVOffset(p);
 
                 //ALOGV("\tnVirtualizer_command cmdSize is %d\n"
                 //        "\tsizeof(effect_param_t) is  %d\n"
@@ -3277,8 +3653,10 @@ int Effect_command(effect_handle_t  self,
                 //        cmdSize, sizeof(effect_param_t), p->psize, p->vsize );
 
                 *(int *)pReplyData = android::Virtualizer_setParameter(pContext,
-                                                                      (void *)p->data,
-                                                                       p->data + p->psize);
+                                                                       p->psize,
+                                                                       (void *)p->data,
+                                                                       p->vsize,
+                                                                       p->data + voffset);
             }
             if(pContext->EffectType == LVM_EQUALIZER){
                //ALOGV("\tEqualizer_command cmdCode Case: "
@@ -3294,11 +3672,15 @@ int Effect_command(effect_handle_t  self,
                             "EFFECT_CMD_SET_PARAM: ERROR");
                     return -EINVAL;
                 }
-                effect_param_t *p = (effect_param_t *) pCmdData;
+
+                effect_param_t * const p = (effect_param_t *) pCmdData;
+                const uint32_t voffset = computeParamVOffset(p);
 
                 *(int *)pReplyData = android::Equalizer_setParameter(pContext,
-                                                                    (void *)p->data,
-                                                                     p->data + p->psize);
+                                                                     p->psize,
+                                                                     (void *)p->data,
+                                                                     p->vsize,
+                                                                     p->data + voffset);
             }
             if(pContext->EffectType == LVM_VOLUME){
                 //ALOGV("\tVolume_command cmdCode Case: EFFECT_CMD_SET_PARAM start");
@@ -3315,11 +3697,15 @@ int Effect_command(effect_handle_t  self,
                             "EFFECT_CMD_SET_PARAM: ERROR");
                     return -EINVAL;
                 }
-                effect_param_t *p = (effect_param_t *) pCmdData;
+
+                effect_param_t * const p = (effect_param_t *) pCmdData;
+                const uint32_t voffset = computeParamVOffset(p);
 
                 *(int *)pReplyData = android::Volume_setParameter(pContext,
-                                                                 (void *)p->data,
-                                                                 p->data + p->psize);
+                                                                  p->psize,
+                                                                  (void *)p->data,
+                                                                  p->vsize,
+                                                                  p->data + voffset);
             }
             //ALOGV("\tEffect_command cmdCode Case: EFFECT_CMD_SET_PARAM end");
         } break;
@@ -3427,13 +3813,12 @@ int Effect_command(effect_handle_t  self,
         case EFFECT_CMD_SET_VOLUME:
         {
             uint32_t leftVolume, rightVolume;
-#ifdef MTK_AUDIO
+#if defined(MTK_AUDIO_FIX_DEFAULT_DEFECT)
             uint32_t firstVolume;
 #endif
             int16_t  leftdB, rightdB;
             int16_t  maxdB, pandB;
             int32_t  vol_ret[2] = {1<<24,1<<24}; // Apply no volume
-            int      status = 0;
             LVM_ControlParams_t     ActiveParams;           /* Current control Parameters */
             LVM_ReturnStatus_en     LvmStatus=LVM_SUCCESS;  /* Function call status */
 
@@ -3442,7 +3827,7 @@ int Effect_command(effect_handle_t  self,
                 break;
             }
 
-#ifdef MTK_AUDIO
+#if defined(MTK_AUDIO_FIX_DEFAULT_DEFECT)
             if (pCmdData == NULL ||
                     (cmdSize != 2 * sizeof(uint32_t) && cmdSize != 3 * sizeof(uint32_t)) ||
                     pReplyData == NULL || replySize == NULL || *replySize < 2 * sizeof(int32_t)) {
@@ -3464,7 +3849,6 @@ int Effect_command(effect_handle_t  self,
                         "EFFECT_CMD_SET_VOLUME: ERROR");
                 return -EINVAL;
             }
-
 #endif
 
             leftVolume  = ((*(uint32_t *)pCmdData));
@@ -3488,10 +3872,10 @@ int Effect_command(effect_handle_t  self,
             if(rightdB > maxdB){
                 maxdB = rightdB;
             }
-            //ALOGV("\tEFFECT_CMD_SET_VOLUME Session: %d, SessionID: %d VOLUME is %d dB (%d), "
+            //ALOGV("\tEFFECT_CMD_SET_VOLUME Session: %d, SessionID: %d VOLUME is %d dB, "
             //      "effect is %d",
             //pContext->pBundledContext->SessionNo, pContext->pBundledContext->SessionId,
-            //(int32_t)maxdB, maxVol<<7, pContext->EffectType);
+            //(int32_t)maxdB, pContext->EffectType);
             //ALOGV("\tEFFECT_CMD_SET_VOLUME: Left is %d, Right is %d", leftVolume, rightVolume);
             //ALOGV("\tEFFECT_CMD_SET_VOLUME: Left %ddB, Right %ddB, Position %ddB",
             //        leftdB, rightdB, pandB);
@@ -3516,19 +3900,6 @@ int Effect_command(effect_handle_t  self,
          }
         case EFFECT_CMD_SET_AUDIO_MODE:
             break;
-
-        //MTK80721 2011-05-22 fix: CR:ALPS00041097
-#ifdef MTK_AOSP_ENHANCEMENT
-        case EFFECT_CMD_CLEARBUF:
-        {
-            LVM_ReturnStatus_en lstatus_c = LVM_SUCCESS;
-            lstatus_c = LVM_ClearAudioBuffers(pContext->pBundledContext->hInstance);
-            if(lstatus_c != LVM_SUCCESS)
-                return -EINVAL;
-            break;
-        }
-#endif
-
         default:
             return -EINVAL;
     }

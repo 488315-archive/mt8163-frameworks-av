@@ -21,7 +21,7 @@
 #include "WebmFrameThread.h"
 #include "LinkedBlockingQueue.h"
 
-#include <media/stagefright/MediaSource.h>
+#include <media/MediaSource.h>
 #include <media/stagefright/MediaWriter.h>
 
 #include <utils/Errors.h>
@@ -36,7 +36,7 @@ namespace android {
 
 class WebmWriter : public MediaWriter {
 public:
-    WebmWriter(int fd);
+    explicit WebmWriter(int fd);
     ~WebmWriter() { reset(); }
 
 
@@ -110,6 +110,7 @@ private:
         }
     };
     WebmStream mStreams[kMaxStreams];
+    Vector<sp<WebmElement>> mStreamsInOrder;
 
     sp<WebmFrameSinkThread> mSinkThread;
 

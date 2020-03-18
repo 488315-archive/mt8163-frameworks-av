@@ -1,10 +1,4 @@
 /*
-* Copyright (C) 2014 MediaTek Inc.
-* Modification based on code covered by the mentioned copyright
-* and/or permission notice(s).
-*/
-
-/*
  * Copyright (C) 2009 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,6 +17,8 @@
 //#define LOG_NDEBUG 0
 #define LOG_TAG "ESDS"
 #include <utils/Log.h>
+
+#include <media/stagefright/foundation/ByteUtils.h>
 
 #include "include/ESDS.h"
 
@@ -103,11 +99,6 @@ status_t ESDS::skipDescriptorHeader(
         return ERROR_MALFORMED;
     }
 
-#ifdef MTK_AOSP_ENHANCEMENT//hai.li
-    if ((*tag == kTag_ESDescriptor) || (*tag == kTag_DecoderConfigDescriptor)) {
-    *data_size = size;
-    }
-#endif
     *data_offset = offset;
 
     return OK;
@@ -205,12 +196,25 @@ status_t ESDS::parseESDescriptor(size_t offset, size_t size) {
     return err;
 }
 
+status_t ESDS::getBitRate(uint32_t *brateMax, uint32_t *brateAvg) const {
+    if (mInitCheck != OK) {
+        return mInitCheck;
+    }
+
+    *brateMax = mBitRateMax;
+    *brateAvg = mBitRateAvg;
+
+    return OK;
+};
+
 status_t ESDS::parseDecoderConfigDescriptor(size_t offset, size_t size) {
     if (size < 13) {
         return ERROR_MALFORMED;
     }
 
     mObjectTypeIndication = mData[offset];
+    mBitRateMax = U32_AT(mData + offset + 5);
+    mBitRateAvg = U32_AT(mData + offset + 9);
 
     offset += 13;
     size -= 13;
@@ -231,13 +235,7 @@ status_t ESDS::parseDecoderConfigDescriptor(size_t offset, size_t size) {
     }
 
     if (tag != kTag_DecoderSpecificInfo) {
-#ifdef MTK_AOSP_ENHANCEMENT
-    ALOGW("No Decoder Specific Info(0x05) in esds");
-    if (mObjectTypeIndication != 0x6B && mObjectTypeIndication != 0x69)
-        return ERROR_UNSUPPORTED;
-#else
         return ERROR_MALFORMED;
-#endif
     }
 
     mDecoderSpecificOffset = sub_offset;

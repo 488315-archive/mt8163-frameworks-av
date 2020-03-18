@@ -19,6 +19,7 @@
 #define NU_PLAYER_H_
 
 #include <media/AudioResamplerPublic.h>
+#include <media/ICrypto.h>
 #include <media/MediaPlayerInterface.h>
 #include <media/stagefright/foundation/AHandler.h>
 
@@ -29,15 +30,16 @@ struct AMessage;
 struct AudioPlaybackRate;
 struct AVSyncSettings;
 class IDataSource;
+struct MediaClock;
 class MetaData;
 struct NuPlayerDriver;
 
 struct NuPlayer : public AHandler {
-    NuPlayer(pid_t pid);
+    explicit NuPlayer(pid_t pid, const sp<MediaClock> &mediaClock);
 
     void setUID(uid_t uid);
 
-    void setDriver(const wp<NuPlayerDriver> &driver);
+    void init(const wp<NuPlayerDriver> &driver);
 
     void setDataSourceAsync(const sp<IStreamSource> &source);
 
@@ -49,6 +51,9 @@ struct NuPlayer : public AHandler {
     void setDataSourceAsync(int fd, int64_t offset, int64_t length);
 
     void setDataSourceAsync(const sp<DataSource> &source);
+
+    status_t getBufferingSettings(BufferingSettings* buffering /* nonnull */);
+    status_t setBufferingSettings(const BufferingSettings& buffering);
 
     void prepareAsync();
 
@@ -68,19 +73,33 @@ struct NuPlayer : public AHandler {
     // Will notify the driver through "notifyResetComplete" once finished.
     void resetAsync();
 
+    // Request a notification when specified media time is reached.
+    status_t notifyAt(int64_t mediaTimeUs);
+
     // Will notify the driver through "notifySeekComplete" once finished
     // and needNotify is true.
-    void seekToAsync(int64_t seekTimeUs, bool needNotify = false);
+    void seekToAsync(
+            int64_t seekTimeUs,
+            MediaPlayerSeekMode mode = MediaPlayerSeekMode::SEEK_PREVIOUS_SYNC,
+            bool needNotify = false);
 
     status_t setVideoScalingMode(int32_t mode);
     status_t getTrackInfo(Parcel* reply) const;
     status_t getSelectedTrack(int32_t type, Parcel* reply) const;
     status_t selectTrack(size_t trackIndex, bool select, int64_t timeUs);
     status_t getCurrentPosition(int64_t *mediaUs);
-    void getStats(Vector<sp<AMessage> > *mTrackStats);
+    void getStats(Vector<sp<AMessage> > *trackStats);
 
     sp<MetaData> getFileMeta();
     float getFrameRate();
+
+    // Modular DRM
+    status_t prepareDrm(const uint8_t uuid[16], const Vector<uint8_t> &drmSessionId);
+    status_t releaseDrm();
+
+    const char *getDataSourceType();
+
+    void updateInternalTimers();
 
 protected:
     virtual ~NuPlayer();
@@ -126,6 +145,7 @@ private:
         kWhatClosedCaptionNotify        = 'capN',
         kWhatRendererNotify             = 'renN',
         kWhatReset                      = 'rset',
+        kWhatNotifyTime                 = 'nfyT',
         kWhatSeek                       = 'seek',
         kWhatPause                      = 'paus',
         kWhatResume                     = 'rsme',
@@ -134,15 +154,19 @@ private:
         kWhatGetTrackInfo               = 'gTrI',
         kWhatGetSelectedTrack           = 'gSel',
         kWhatSelectTrack                = 'selT',
-#ifdef MTK_AOSP_ENHANCEMENT
-        kWhatStop                       = 'stop',
-#endif
+        kWhatGetBufferingSettings       = 'gBus',
+        kWhatSetBufferingSettings       = 'sBuS',
+        kWhatPrepareDrm                 = 'pDrm',
+        kWhatReleaseDrm                 = 'rDrm',
+        kWhatMediaClockNotify           = 'mckN',
     };
 
     wp<NuPlayerDriver> mDriver;
     bool mUIDValid;
     uid_t mUID;
     pid_t mPID;
+    const sp<MediaClock> mMediaClock;
+    Mutex mSourceLock;  // guard |mSource|.
     sp<Source> mSource;
     uint32_t mSourceFlags;
     sp<Surface> mSurface;
@@ -150,12 +174,22 @@ private:
     sp<DecoderBase> mVideoDecoder;
     bool mOffloadAudio;
     sp<DecoderBase> mAudioDecoder;
+    Mutex mDecoderLock;  // guard |mAudioDecoder| and |mVideoDecoder|.
     sp<CCDecoder> mCCDecoder;
     sp<Renderer> mRenderer;
     sp<ALooper> mRendererLooper;
     int32_t mAudioDecoderGeneration;
     int32_t mVideoDecoderGeneration;
     int32_t mRendererGeneration;
+
+    Mutex mPlayingTimeLock;
+    int64_t mLastStartedPlayingTimeNs;
+    void updatePlaybackTimer(bool stopping, const char *where);
+    void startPlaybackTimer(const char *where);
+
+    int64_t mLastStartedRebufferingTimeNs;
+    void startRebufferingTimer();
+    void updateRebufferingTimer(bool stopping, bool exitingPlayback);
 
     int64_t mPreviousSeekTimeUs;
 
@@ -200,7 +234,11 @@ private:
     AVSyncSettings mSyncSettings;
     float mVideoFpsHint;
     bool mStarted;
+    bool mPrepared;
+    bool mResetting;
     bool mSourceStarted;
+    bool mAudioDecoderError;
+    bool mVideoDecoderError;
 
     // Actual pause state, either as requested by client or due to buffering.
     bool mPaused;
@@ -213,6 +251,22 @@ private:
     // Pause state as requested by source (internally) due to buffering
     bool mPausedForBuffering;
 
+    // Modular DRM
+    sp<ICrypto> mCrypto;
+    bool mIsDrmProtected;
+
+    typedef enum {
+        DATA_SOURCE_TYPE_NONE,
+        DATA_SOURCE_TYPE_HTTP_LIVE,
+        DATA_SOURCE_TYPE_RTSP,
+        DATA_SOURCE_TYPE_GENERIC_URL,
+        DATA_SOURCE_TYPE_GENERIC_FD,
+        DATA_SOURCE_TYPE_MEDIA,
+        DATA_SOURCE_TYPE_STREAM,
+    } DATA_SOURCE_TYPE;
+
+    std::atomic<DATA_SOURCE_TYPE> mDataSourceType;
+
     inline const sp<DecoderBase> &getDecoder(bool audio) {
         return audio ? mAudioDecoder : mVideoDecoder;
     }
@@ -224,11 +278,15 @@ private:
         mFlushComplete[1][1] = false;
     }
 
-    void tryOpenAudioSinkForOffload(const sp<AMessage> &format, bool hasVideo);
+    void tryOpenAudioSinkForOffload(
+            const sp<AMessage> &format, const sp<MetaData> &audioMeta, bool hasVideo);
     void closeAudioSink();
-    void determineAudioModeChange();
+    void restartAudio(
+            int64_t currentPositionUs, bool forceNonOffload, bool needsToCreateAudioDecoder);
+    void determineAudioModeChange(const sp<AMessage> &audioFormat);
 
-    status_t instantiateDecoder(bool audio, sp<DecoderBase> *decoder);
+    status_t instantiateDecoder(
+            bool audio, sp<DecoderBase> *decoder, bool checkAudioModeChange = true);
 
     status_t onInstantiateSecureDecoders();
 
@@ -241,7 +299,9 @@ private:
     void handleFlushComplete(bool audio, bool isDecoder);
     void finishFlushIfPossible();
 
-    void onStart(int64_t startPositionUs = -1);
+    void onStart(
+            int64_t startPositionUs = -1,
+            MediaPlayerSeekMode mode = MediaPlayerSeekMode::SEEK_PREVIOUS_SYNC);
     void onResume();
     void onPause();
 
@@ -259,7 +319,7 @@ private:
 
     void processDeferredActions();
 
-    void performSeek(int64_t seekTimeUs);
+    void performSeek(int64_t seekTimeUs, MediaPlayerSeekMode mode);
     void performDecoderFlush(FlushCommand audio, FlushCommand video);
     void performReset();
     void performScanSources();
@@ -276,104 +336,13 @@ private:
     void sendTimedMetaData(const sp<ABuffer> &buffer);
     void sendTimedTextData(const sp<ABuffer> &buffer);
 
-    void writeTrackInfo(Parcel* reply, const sp<AMessage> format) const;
-#ifdef MTK_AOSP_ENHANCEMENT
-public:
-    void stop();
-    sp<MetaData> getMetaData() const;
-    void enableClearMotion(int32_t enable);
+    void writeTrackInfo(Parcel* reply, const sp<AMessage>& format) const;
 
-    void getDRMClientProc(const Parcel *request);
-    sp<MetaData> getFormatMeta (bool audio) const;
-    status_t setsmspeed(int32_t speed);
-    status_t setslowmotionsection(int64_t slowmotion_start,int64_t slowmotion_end);
-    void setIsMtkPlayback(bool setting);
-private:
-    enum PrepareState {
-        UNPREPARED,
-        PREPARING,
-        PREPARED,
-        PREPARE_CANCELED
-    };
-    enum DataSourceType {
-        SOURCE_Default,
-        SOURCE_HttpLive,
-        SOURCE_Local,
-        SOURCE_Rtsp,
-        SOURCE_Http,
-    };
-    enum PlayState {
-        STOPPED,
-        PLAYSENDING,
-        PLAYING,
-        PAUSING,
-        PAUSED
-    };
+    status_t onPrepareDrm(const sp<AMessage> &msg);
+    status_t onReleaseDrm();
 
-    bool IsHttpURL(const char *url);
-
-    bool IsRtspURL(const char *url) ;
-
-    bool IsRtspSDP(const char *url) ;
-    void init_ext();
-    void updataVideoSize_ext(const sp<AMessage> &outputFormat,int32_t *displayWidth,int32_t *displayHeight);
-    DataSourceType getDataSourceType();
-    void setDataSourceType(const DataSourceType dataSourceType);
-    bool isRTSPSource();
-    bool isHttpLiveSource();
-    void finishFlushIfPossible_l();
-
-    status_t setDataSourceAsync_proCheck(sp<AMessage> &msg, sp<AMessage> &notify);
-    bool tyrToChangeDataSourceForLocalSdp();
-    bool onScanSources();
-    void onStop();
-    bool isPausing();
-    bool onResume_l();
-    void handleForACodecError(bool audio,const sp<AMessage> &msg);
-    void handleForRenderError1(int32_t finalResult,int32_t audio);
-    bool handleForRenderError2(int32_t finalResult,int32_t audio);
-    void scanSource_l(const sp<AMessage> &msg);
-    void finishPrepare(int err = OK);
-    void finishSeek();
-    bool isSeeking();
-    void setVideoProperties(sp<AMessage> &format);
-    void reviseNotifyErrorCode(int msg,int *ext1,int *ext2);
-    void performSeek_l(int64_t seekTimeUs);
-    void onSourcePrepard(int32_t err);
-    void onSourceNotify_l(const sp<AMessage> &msg);
-    bool onSourceNotify_ext(const sp<AMessage> &msg);
-    static bool IsFlushingState(FlushStatus state);
-    uint32_t mFlags;
-    PrepareState mPrepare;
-    DataSourceType mDataSourceType;
-    PlayState mPlayState;
-    bool mAudioOnly;
-    bool mVideoOnly;
-    int64_t mSeekTimeUs;
-    mutable Mutex mLock;
-    volatile int32_t mEnClearMotion;
-    int mDebugDisableTrackId;       // only debug
-    int64_t mslowmotion_start;
-    int64_t mslowmotion_end;
-    int32_t mslowmotion_speed;
-    bool mIsStreamSource;
-    bool mVideoinfoNotify;
-    bool mAudioinfoNotify;
-    static int32_t mPlayerCnt;
-    int32_t mDeferTriggerSeekTimes;
-    int32_t m_i4ContainerWidth;
-    int32_t m_i4ContainerHeight;
-    bool mIsMtkPlayback;            // for control some mtk notify
-    bool mNotifyListenerVideodecoderIsNull;//for notiflistener
-    bool mSourceSeekDone;
-    bool mHaveSanSources; // for ALPS02318704; when audio decoder config error, suspend/resume video can not play.
-    int32_t mhandledSubtitleSeqNum;
-    bool mIsReseting;
-#endif
     DISALLOW_EVIL_CONSTRUCTORS(NuPlayer);
 };
-
-
 
 }  // namespace android
 

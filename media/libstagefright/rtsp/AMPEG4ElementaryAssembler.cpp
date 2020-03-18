@@ -1,10 +1,4 @@
 /*
-* Copyright (C) 2014 MediaTek Inc.
-* Modification based on code covered by the mentioned copyright
-* and/or permission notice(s).
-*/
-
-/*
  * Copyright (C) 2010 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -33,8 +27,8 @@
 #include <media/stagefright/foundation/ABuffer.h>
 #include <media/stagefright/foundation/ADebug.h>
 #include <media/stagefright/foundation/AMessage.h>
+#include <media/stagefright/foundation/ByteUtils.h>
 #include <media/stagefright/foundation/hexdump.h>
-#include <media/stagefright/Utils.h>
 
 #include <ctype.h>
 #include <stdint.h>
@@ -108,10 +102,6 @@ static bool GetSampleRateIndex(int32_t sampleRate, size_t *tableIndex) {
         }
     }
 
-#ifdef MTK_AOSP_ENHANCEMENT
-    ALOGW("unsupport sample rate %d", sampleRate);
-    return true;
-#endif
     return false;
 }
 
@@ -136,20 +126,11 @@ AMPEG4ElementaryAssembler::AMPEG4ElementaryAssembler(
       mNextExpectedSeqNoValid(false),
       mNextExpectedSeqNo(0),
       mAccessUnitDamaged(false) {
-#ifdef MTK_AOSP_ENHANCEMENT
-    mAccessUnitDamaged = false;
-    mIsAAC = false;
-#endif
     mIsGeneric = !strncasecmp(desc.c_str(),"mpeg4-generic/", 14);
 
     if (mIsGeneric) {
         AString value;
         CHECK(GetAttribute(params.c_str(), "mode", &value));
-#ifdef MTK_AOSP_ENHANCEMENT
-        if (!strcasecmp(value.c_str(), "AAC-lbr") ||
-                !strcasecmp(value.c_str(), "AAC-hbr"))
-            mIsAAC = true;
-#endif // #ifdef MTK_AOSP_ENHANCEMENT
 
         if (!GetIntegerAttribute(params.c_str(), "sizeLength", &mSizeLength)) {
             mSizeLength = 0;
@@ -195,10 +176,6 @@ AMPEG4ElementaryAssembler::AMPEG4ElementaryAssembler(
                     &mAuxiliaryDataSizeLength)) {
             mAuxiliaryDataSizeLength = 0;
         }
-
-#ifdef MTK_AOSP_ENHANCEMENT
-        getConstantSize(params);
-#endif
 
         mHasAUHeader =
             mSizeLength > 0
@@ -257,11 +234,7 @@ ARTPAssembler::AssemblyStatus AMPEG4ElementaryAssembler::addPacket(
     } else if ((uint32_t)buffer->int32Data() != mNextExpectedSeqNo) {
         ALOGV("Not the sequence number I expected");
 
-#ifdef MTK_AOSP_ENHANCEMENT
-        return getAssembleStatus(queue, mNextExpectedSeqNo);
-#else
         return WRONG_SEQUENCE_NUMBER;
-#endif // #ifdef MTK_AOSP_ENHANCEMENT
     }
 
     uint32_t rtpTime;
@@ -277,30 +250,14 @@ ARTPAssembler::AssemblyStatus AMPEG4ElementaryAssembler::addPacket(
     } else {
         // hexdump(buffer->data(), buffer->size());
         if (buffer->size() < 2) {
-#ifdef MTK_AOSP_ENHANCEMENT
-            ALOGD("Ignoring malformed buffer: (size = %zu)", buffer->size());
-            queue->erase(queue->begin());
-            ++mNextExpectedSeqNo;
-#endif
             return MALFORMED_PACKET;
         }
 
         unsigned AU_headers_length = U16_AT(buffer->data());  // in bits
+
         if (buffer->size() < 2 + (AU_headers_length + 7) / 8) {
-#ifdef MTK_AOSP_ENHANCEMENT
-            ALOGD("Ignoring malformed buffer: (size = %zu, header length = %u)",
-                    buffer->size(), AU_headers_length);
-            queue->erase(queue->begin());
-            ++mNextExpectedSeqNo;
-#endif
             return MALFORMED_PACKET;
         }
-
-#ifdef MTK_AOSP_ENHANCEMENT
-        size_t totalSize = 0;
-#endif
-
-
 
         List<AUHeader> headers;
 
@@ -373,9 +330,6 @@ ARTPAssembler::AssemblyStatus AMPEG4ElementaryAssembler::addPacket(
             header.mSize = AU_size;
             header.mSerial = AU_serial;
             headers.push_back(header);
-#ifdef MTK_AOSP_ENHANCEMENT
-            totalSize += AU_size;
-#endif // #ifdef MTK_AOSP_ENHANCEMENT
         }
 
         size_t offset = 2 + (AU_headers_length + 7) / 8;
@@ -388,31 +342,13 @@ ARTPAssembler::AssemblyStatus AMPEG4ElementaryAssembler::addPacket(
             offset += (mAuxiliaryDataSizeLength + auxSize + 7) / 8;
         }
 
-#ifdef MTK_AOSP_ENHANCEMENT
-        if (mSizeLength == 0 && mConstantSize == 0) {
-            totalSize = buffer->size() - offset;
-            AUHeader header;
-            header.mSize = totalSize;
-            header.mSerial = 0;
-            headers.clear();
-            headers.push_back(header);
-        }
-#endif // #ifndef MTK_AOSP_ENHANCEMENT
-
         for (List<AUHeader>::iterator it = headers.begin();
              it != headers.end(); ++it) {
             const AUHeader &header = *it;
 
-                        if (buffer->size() < offset + header.mSize) {
-#ifdef MTK_AOSP_ENHANCEMENT
-                    ALOGD("Ignoring malformed buffer: (size = %zu, offset%zu header.mSize = %u)",
-                            buffer->size(), offset,header.mSize);
-                    queue->erase(queue->begin());
-                    ++mNextExpectedSeqNo;
-#endif
-                            return MALFORMED_PACKET;
+            if (buffer->size() < offset + header.mSize) {
+                return MALFORMED_PACKET;
             }
-
 
             sp<ABuffer> accessUnit = new ABuffer(header.mSize);
             memcpy(accessUnit->data(), buffer->data() + offset, header.mSize);
@@ -494,48 +430,4 @@ void AMPEG4ElementaryAssembler::onByeReceived() {
     msg->post();
 }
 
-#ifdef MTK_AOSP_ENHANCEMENT
-void AMPEG4ElementaryAssembler::getConstantSize(const AString &params) {
-    if (!GetIntegerAttribute(
-                params.c_str(), "constantSize",
-                &mConstantSize)) {
-        mConstantSize = 0;
-    }
-
-    if (mSizeLength == 0 && mConstantSize == 0) {
-        ALOGI("signal AU/fragment mode");
-    }
-
-}
-
-void AMPEG4ElementaryAssembler::evaluateDuration(const sp<ARTPSource>& source,
-        const sp<ABuffer>& buffer) {
-    if (!mIsAAC)
-        return;
-
-    size_t size = buffer->size();
-    if (size < 2)
-        return;
-
-    unsigned AU_headers_length = U16_AT(buffer->data());  // in bits
-    unsigned bitsPerHeader = mSizeLength + mIndexDeltaLength;
-
-    if (mCTSDeltaLength > 0)
-        bitsPerHeader += 1 + mCTSDeltaLength;
-
-    if (mDTSDeltaLength > 0)
-        bitsPerHeader += 1 + mDTSDeltaLength;
-
-    if (mRandomAccessIndication)
-        bitsPerHeader++;
-
-    if (mStreamStateIndication > 0)
-        bitsPerHeader += mStreamStateIndication;
-
-    int32_t num = (AU_headers_length + bitsPerHeader - 1) / bitsPerHeader;
-    // assume frameLength of AAC is 1024
-    source->updateExpectedTimeoutUs((int32_t)(num * 1024));
-    return;
-}
-#endif // #ifdef MTK_AOSP_ENHANCEMENT
 }  // namespace android

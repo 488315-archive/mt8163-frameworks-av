@@ -21,23 +21,24 @@
 #include "HTTPDownloader.h"
 #include "M3UParser.h"
 
-#include <media/IMediaHTTPConnection.h>
-#include <media/IMediaHTTPService.h>
+#include <media/DataSource.h>
+#include <media/MediaHTTPConnection.h>
+#include <media/MediaHTTPService.h>
 #include <media/stagefright/foundation/ABuffer.h>
 #include <media/stagefright/foundation/ADebug.h>
-#include <media/stagefright/MediaHTTP.h>
-#include <media/stagefright/DataSource.h>
-#include <media/stagefright/FileSource.h>
+#include <media/stagefright/ClearMediaHTTP.h>
+#include <media/stagefright/ClearFileSource.h>
 #include <openssl/aes.h>
 #include <openssl/md5.h>
 #include <utils/Mutex.h>
+#include <inttypes.h>
 
 namespace android {
 
 HTTPDownloader::HTTPDownloader(
-        const sp<IMediaHTTPService> &httpService,
+        const sp<MediaHTTPService> &httpService,
         const KeyedVector<String8, String8> &headers) :
-    mHTTPDataSource(new MediaHTTP(httpService->makeHTTPConnection())),
+    mHTTPDataSource(new ClearMediaHTTP(httpService->makeHTTPConnection())),
     mExtraHeaders(headers),
     mDisconnecting(false) {
 }
@@ -90,7 +91,7 @@ ssize_t HTTPDownloader::fetchBlock(
 
     if (reconnect) {
         if (!strncasecmp(url, "file://", 7)) {
-            mDataSource = new FileSource(url + 7);
+            mDataSource = new ClearFileSource(url + 7);
         } else if (strncasecmp(url, "http://", 7)
                 && strncasecmp(url, "https://", 8)) {
             return ERROR_UNSUPPORTED;
@@ -156,6 +157,12 @@ ssize_t HTTPDownloader::fetchBlock(
                  buffer->size() + bufferRemaining);
 
             sp<ABuffer> copy = new ABuffer(buffer->size() + bufferRemaining);
+            if (copy->data() == NULL) {
+                android_errorWriteLog(0x534e4554, "68399439");
+                ALOGE("not enough memory to download: requesting %zu + %zu",
+                        buffer->size(), bufferRemaining);
+                return NO_MEMORY;
+            }
             memcpy(copy->data(), buffer->data(), buffer->size());
             copy->setRange(0, buffer->size());
 
@@ -165,7 +172,10 @@ ssize_t HTTPDownloader::fetchBlock(
         size_t maxBytesToRead = bufferRemaining;
         if (range_length >= 0) {
             int64_t bytesLeftInRange = range_length - buffer->size();
-            if (bytesLeftInRange < (int64_t)maxBytesToRead) {
+            if (bytesLeftInRange < 0) {
+                ALOGE("range_length %" PRId64 " wrapped around", range_length);
+                return ERROR_OUT_OF_RANGE;
+            } else if (bytesLeftInRange < (int64_t)maxBytesToRead) {
                 maxBytesToRead = bytesLeftInRange;
 
                 if (bytesLeftInRange == 0) {
@@ -234,13 +244,10 @@ sp<M3UParser> HTTPDownloader::fetchPlaylist(
         return NULL;
     }
 
-#ifdef MTK_AOSP_ENHANCEMENT
-    dumpPlaylist(buffer);
-#endif
     // MD5 functionality is not available on the simulator, treat all
     // playlists as changed.
 
-#if defined(HAVE_ANDROID_OS)
+#if defined(__ANDROID__)
     uint8_t hash[16];
 
     MD5_CTX m;
@@ -255,10 +262,6 @@ sp<M3UParser> HTTPDownloader::fetchPlaylist(
 
         return NULL;
     }
-
-    if (curPlaylistHash != NULL) {
-        memcpy(curPlaylistHash, hash, sizeof(hash));
-    }
 #endif
 
     sp<M3UParser> playlist =
@@ -270,19 +273,14 @@ sp<M3UParser> HTTPDownloader::fetchPlaylist(
         return NULL;
     }
 
+#if defined(__ANDROID__)
+    if (curPlaylistHash != NULL) {
+
+        memcpy(curPlaylistHash, hash, sizeof(hash));
+    }
+#endif
+
     return playlist;
 }
 
-#ifdef MTK_AOSP_ENHANCEMENT
-void HTTPDownloader::dumpPlaylist(sp<ABuffer> &buffer) {
-    const int32_t nDumpSize = 3072;
-    char dumpM3U8[nDumpSize];
-    ALOGD("Playlist (size in zu = %zu) :\n", buffer->size());
-    size_t dumpSize = (buffer->size() > (nDumpSize - 1)) ? (nDumpSize - 1) : buffer->size();
-    memcpy(dumpM3U8, buffer->data(), dumpSize);
-    dumpM3U8[dumpSize] = '\0';
-    ALOGD("%s", dumpM3U8);
-    ALOGD(" %s", ((buffer->size() < (nDumpSize - 1)) ? " " : "trunked because larger than dumpsize"));
-}
-#endif
 }  // namespace android

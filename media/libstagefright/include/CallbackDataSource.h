@@ -17,7 +17,7 @@
 #ifndef ANDROID_CALLBACKDATASOURCE_H
 #define ANDROID_CALLBACKDATASOURCE_H
 
-#include <media/stagefright/DataSource.h>
+#include <media/DataSource.h>
 #include <media/stagefright/foundation/ADebug.h>
 
 namespace android {
@@ -29,17 +29,26 @@ class IMemory;
 // DataSource because it calls back to the IDataSource for data.
 class CallbackDataSource : public DataSource {
 public:
-    CallbackDataSource(const sp<IDataSource>& iDataSource);
+    explicit CallbackDataSource(const sp<IDataSource>& iDataSource);
     virtual ~CallbackDataSource();
 
     // DataSource implementation.
     virtual status_t initCheck() const;
     virtual ssize_t readAt(off64_t offset, void *data, size_t size);
     virtual status_t getSize(off64_t *size);
+    virtual uint32_t flags();
+    virtual void close();
+    virtual String8 toString() {
+        return mName;
+    }
+    virtual sp<DecryptHandle> DrmInitialization(const char *mime = NULL);
+    virtual sp<IDataSource> getIDataSource() const;
 
 private:
     sp<IDataSource> mIDataSource;
     sp<IMemory> mMemory;
+    bool mIsClosed;
+    String8 mName;
 
     DISALLOW_EVIL_CONSTRUCTORS(CallbackDataSource);
 };
@@ -51,12 +60,18 @@ private:
 // impact on time taken for filetype sniffing and metadata extraction.
 class TinyCacheSource : public DataSource {
 public:
-    TinyCacheSource(const sp<DataSource>& source);
+    explicit TinyCacheSource(const sp<DataSource>& source);
 
     virtual status_t initCheck() const;
     virtual ssize_t readAt(off64_t offset, void* data, size_t size);
     virtual status_t getSize(off64_t* size);
     virtual uint32_t flags();
+    virtual void close() { mSource->close(); }
+    virtual String8 toString() {
+        return mName;
+    }
+    virtual sp<DecryptHandle> DrmInitialization(const char *mime = NULL);
+    virtual sp<IDataSource> getIDataSource() const;
 
 private:
     // 2kb comes from experimenting with the time-to-first-frame from a MediaPlayer
@@ -70,6 +85,11 @@ private:
     uint8_t mCache[kCacheSize];
     off64_t mCachedOffset;
     size_t mCachedSize;
+    String8 mName;
+
+    Mutex mLock;
+    ssize_t readAt2(off64_t offset, void* data, size_t size);
+
 
     DISALLOW_EVIL_CONSTRUCTORS(TinyCacheSource);
 };

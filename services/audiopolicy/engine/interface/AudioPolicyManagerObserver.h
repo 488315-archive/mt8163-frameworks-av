@@ -25,10 +25,7 @@
 #include <AudioOutputDescriptor.h>
 #include <AudioPolicyMix.h>
 #include <SoundTriggerSession.h>
-#include <StreamDescriptor.h>
-//<MTK_AUDIO_ADD
-#include <AudioPolicyVendorControl.h>
-//MTK_AUDIO_ADD>
+#include "custom_extensions/AudioPolicyVendorControl.h" // MTK_AUDIO
 
 namespace android {
 
@@ -50,18 +47,17 @@ public:
 
     virtual const AudioInputCollection &getInputs() const = 0;
 
-    virtual const DeviceVector &getAvailableOutputDevices() const = 0;
+    virtual const DeviceVector getAvailableOutputDevices() const = 0;
 
-    virtual const DeviceVector &getAvailableInputDevices() const = 0;
-
-    virtual StreamDescriptorCollection &getStreamDescriptors() = 0;
+    virtual const DeviceVector getAvailableInputDevices() const = 0;
 
     virtual const sp<DeviceDescriptor> &getDefaultOutputDevice() const = 0;
-    //<MTK_AUDIO_ADD
+
+    // MTK_AUDIO
     virtual AudioPolicyVendorControl &getAudioPolicyVendorControl() = 0;
-    //MTK_AUDIO_ADD>
+
 protected:
     virtual ~AudioPolicyManagerObserver() {}
 };
 
-}; // namespace android
+} // namespace android

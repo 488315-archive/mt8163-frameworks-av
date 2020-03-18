@@ -18,7 +18,7 @@
 
 #define SOFT_RAW_H_
 
-#include "SimpleSoftOMXComponent.h"
+#include <media/stagefright/omx/SimpleSoftOMXComponent.h>
 
 struct tPVMP4AudioDecoderExternal;
 
@@ -50,6 +50,8 @@ private:
 
     int32_t mChannelCount;
     int32_t mSampleRate;
+    int32_t mNumericalData;
+    int32_t mBitsPerSample;
 
     void initPorts();
     status_t initDecoder();

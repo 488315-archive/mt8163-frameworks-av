@@ -16,9 +16,23 @@
 
 #pragma once
 
+#include <media/AudioCommonTypes.h>
 #include <system/audio.h>
 #include <utils/Log.h>
 #include <math.h>
+
+namespace android {
+
+/**
+ * VolumeSource is the discriminent for volume management on an output.
+ * It used to be the stream type by legacy, it may be host volume group or a volume curves if
+ * we allow to have more than one curve per volume group (mandatory to get rid of AudioServer
+ * stream aliases.
+ */
+enum VolumeSource : std::underlying_type<volume_group_t>::type;
+static const VolumeSource VOLUME_SOURCE_NONE = static_cast<VolumeSource>(VOLUME_GROUP_NONE);
+
+} // namespace android
 
 // Absolute min volume in dB (can be represented in single precision normal float value)
 #define VOLUME_MIN_DB (-758)
@@ -28,6 +42,18 @@ class VolumeCurvePoint
 public:
     int mIndex;
     float mDBAttenuation;
+};
+
+/**
+ * device categories used for volume curve management.
+ */
+enum device_category {
+    DEVICE_CATEGORY_HEADSET,
+    DEVICE_CATEGORY_SPEAKER,
+    DEVICE_CATEGORY_EARPIECE,
+    DEVICE_CATEGORY_EXT_MEDIA,
+    DEVICE_CATEGORY_HEARING_AID,
+    DEVICE_CATEGORY_CNT
 };
 
 class Volume
@@ -47,17 +73,6 @@ public:
         VOLMAX = 3,
 
         VOLCNT = 4
-    };
-
-    /**
-     * device categories used for volume curve management.
-     */
-    enum device_category {
-        DEVICE_CATEGORY_HEADSET,
-        DEVICE_CATEGORY_SPEAKER,
-        DEVICE_CATEGORY_EARPIECE,
-        DEVICE_CATEGORY_EXT_MEDIA,
-        DEVICE_CATEGORY_CNT
     };
 
     /**
@@ -81,13 +96,8 @@ public:
             // selection if not the speaker.
             //  - HDMI-CEC system audio mode only output: give priority to available item in order.
             if (device & AUDIO_DEVICE_OUT_SPEAKER) {
-//MTK_CROSSMOUNT_SUPPORT //ALPS02193613
-                if (device & AUDIO_DEVICE_OUT_REMOTE_SUBMIX) {
-                    device = AUDIO_DEVICE_OUT_REMOTE_SUBMIX;
-                } else {
-                    device = AUDIO_DEVICE_OUT_SPEAKER;
-                }
-              } else if (device & AUDIO_DEVICE_OUT_SPEAKER_SAFE) {
+                device = AUDIO_DEVICE_OUT_SPEAKER;
+            } else if (device & AUDIO_DEVICE_OUT_SPEAKER_SAFE) {
                 device = AUDIO_DEVICE_OUT_SPEAKER_SAFE;
             } else if (device & AUDIO_DEVICE_OUT_HDMI_ARC) {
                 device = AUDIO_DEVICE_OUT_HDMI_ARC;
@@ -129,17 +139,21 @@ public:
         case AUDIO_DEVICE_OUT_BLUETOOTH_SCO_HEADSET:
         case AUDIO_DEVICE_OUT_BLUETOOTH_A2DP:
         case AUDIO_DEVICE_OUT_BLUETOOTH_A2DP_HEADPHONES:
+        case AUDIO_DEVICE_OUT_USB_HEADSET:
             return DEVICE_CATEGORY_HEADSET;
+        case AUDIO_DEVICE_OUT_HEARING_AID:
+            return DEVICE_CATEGORY_HEARING_AID;
         case AUDIO_DEVICE_OUT_LINE:
         case AUDIO_DEVICE_OUT_AUX_DIGITAL:
-            /*USB?  Remote submix?*/
+        case AUDIO_DEVICE_OUT_USB_DEVICE:
             return DEVICE_CATEGORY_EXT_MEDIA;
         case AUDIO_DEVICE_OUT_SPEAKER:
+        case AUDIO_DEVICE_OUT_SPEAKER_SAFE:
         case AUDIO_DEVICE_OUT_BLUETOOTH_SCO_CARKIT:
         case AUDIO_DEVICE_OUT_BLUETOOTH_A2DP_SPEAKER:
         case AUDIO_DEVICE_OUT_USB_ACCESSORY:
-        case AUDIO_DEVICE_OUT_USB_DEVICE:
         case AUDIO_DEVICE_OUT_REMOTE_SUBMIX:
+        case AUDIO_DEVICE_OUT_BUS:  // MTK_USB_PHONECALL
         default:
             return DEVICE_CATEGORY_SPEAKER;
         }

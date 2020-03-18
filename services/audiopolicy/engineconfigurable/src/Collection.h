@@ -18,8 +18,6 @@
 
 #include "Element.h"
 #include "Stream.h"
-#include "Strategy.h"
-#include "Usage.h"
 #include "InputSource.h"
 #include <utils/Errors.h>
 #include <system/audio.h>
@@ -28,10 +26,8 @@
 #include <stdint.h>
 #include <string>
 
-namespace android
-{
-namespace audio_policy
-{
+namespace android {
+namespace audio_policy {
 
 /**
  * Collection of policy element as a map indexed with a their UID type.
@@ -47,6 +43,7 @@ template <typename Key>
 class Collection : public std::map<Key, Element<Key> *>
 {
 private:
+    typedef std::map<Key, Element<Key> *> Base;
     typedef Element<Key> T;
     typedef typename std::map<Key, T *>::iterator CollectionIterator;
     typedef typename std::map<Key, T *>::const_iterator CollectionConstIterator;
@@ -127,7 +124,7 @@ public:
         for (it = (*this).begin(); it != (*this).end(); ++it) {
             delete it->second;
         }
-        (*this).clear();
+        Base::clear();
     }
 
 private:
@@ -148,15 +145,9 @@ struct Collection<audio_stream_type_t>::collectionSupported {};
 template <>
 struct Collection<std::string>::collectionSupported {};
 template <>
-struct Collection<audio_usage_t>::collectionSupported {};
-template <>
 struct Collection<audio_source_t>::collectionSupported {};
-template <>
-struct Collection<routing_strategy>::collectionSupported {};
 
-typedef Collection<routing_strategy> StrategyCollection;
 typedef Collection<audio_stream_type_t> StreamCollection;
-typedef Collection<audio_usage_t> UsageCollection;
 typedef Collection<audio_source_t> InputSourceCollection;
 
 } // namespace audio_policy

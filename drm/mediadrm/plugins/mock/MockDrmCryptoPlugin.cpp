@@ -19,7 +19,7 @@
 #include <utils/Log.h>
 
 
-#include "drm/DrmAPI.h"
+#include "media/drm/DrmAPI.h"
 #include "MockDrmCryptoPlugin.h"
 #include "media/stagefright/MediaErrors.h"
 
@@ -56,7 +56,8 @@ namespace android {
         return true;
     }
 
-    status_t MockDrmFactory::createDrmPlugin(const uint8_t /* uuid */[16], DrmPlugin **plugin)
+    status_t MockDrmFactory::createDrmPlugin(const uint8_t /* uuid */[16],
+                                             DrmPlugin **plugin)
     {
         *plugin = new MockDrmPlugin();
         return OK;
@@ -309,12 +310,6 @@ namespace android {
         //   byte[] response            -> mock-response
 
         mByteArrayProperties.add(String8("mock-response"), response);
-        return OK;
-    }
-
-    status_t MockDrmPlugin::unprovisionDevice()
-    {
-        ALOGD("MockDrmPlugin::unprovisionDevice()");
         return OK;
     }
 
@@ -735,7 +730,7 @@ namespace android {
 
     ssize_t MockDrmPlugin::findSession(Vector<uint8_t> const &sessionId) const
     {
-        ALOGD("findSession: nsessions=%d, size=%d", mSessions.size(), sessionId.size());
+        ALOGD("findSession: nsessions=%zu, size=%zu", mSessions.size(), sessionId.size());
         for (size_t i = 0; i < mSessions.size(); ++i) {
             if (memcmp(mSessions[i].array(), sessionId.array(), sessionId.size()) == 0) {
                 return i;
@@ -746,7 +741,7 @@ namespace android {
 
     ssize_t MockDrmPlugin::findKeySet(Vector<uint8_t> const &keySetId) const
     {
-        ALOGD("findKeySet: nkeySets=%d, size=%d", mKeySets.size(), keySetId.size());
+        ALOGD("findKeySet: nkeySets=%zu, size=%zu", mKeySets.size(), keySetId.size());
         for (size_t i = 0; i < mKeySets.size(); ++i) {
             if (memcmp(mKeySets[i].array(), keySetId.array(), keySetId.size()) == 0) {
                 return i;
@@ -772,7 +767,7 @@ namespace android {
         return result;
     }
 
-    String8 MockDrmPlugin::stringMapToString(KeyedVector<String8, String8> map) const
+    String8 MockDrmPlugin::stringMapToString(const KeyedVector<String8, String8>& map) const
     {
         String8 result("{ ");
         for (size_t i = 0; i < map.size(); i++) {
@@ -797,16 +792,19 @@ namespace android {
     }
 
     ssize_t
-    MockCryptoPlugin::decrypt(bool secure, const uint8_t key[16], const uint8_t iv[16],
-                              Mode mode, const void *srcPtr, const SubSample *subSamples,
-                              size_t numSubSamples, void *dstPtr, AString * /* errorDetailMsg */)
+    MockCryptoPlugin::decrypt(bool secure, const uint8_t key[DECRYPT_KEY_SIZE],
+            const uint8_t iv[DECRYPT_KEY_SIZE], Mode mode,
+            const Pattern &pattern, const void *srcPtr,
+            const SubSample *subSamples, size_t numSubSamples,
+            void *dstPtr, AString * /* errorDetailMsg */)
     {
-        ALOGD("MockCryptoPlugin::decrypt(secure=%d, key=%s, iv=%s, mode=%d, src=%p, "
+        ALOGD("MockCryptoPlugin::decrypt(secure=%d, key=%s, iv=%s, mode=%d, "
+              "pattern:{encryptBlocks=%d, skipBlocks=%d} src=%p, "
               "subSamples=%s, dst=%p)",
               (int)secure,
-              arrayToString(key, sizeof(key)).string(),
-              arrayToString(iv, sizeof(iv)).string(),
-              (int)mode, srcPtr,
+              arrayToString(key, DECRYPT_KEY_SIZE).string(),
+              arrayToString(iv, DECRYPT_KEY_SIZE).string(),
+              (int)mode, pattern.mEncryptBlocks, pattern.mSkipBlocks, srcPtr,
               subSamplesToString(subSamples, numSubSamples).string(),
               dstPtr);
         return OK;

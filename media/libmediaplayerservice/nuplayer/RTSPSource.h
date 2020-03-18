@@ -1,9 +1,4 @@
 /*
-* Copyright (C) 2014 MediaTek Inc.
-* Modification based on code covered by the mentioned copyright
-* and/or permission notice(s).
-*/
-/*
  * Copyright (C) 2010 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -45,18 +40,22 @@ struct NuPlayer::RTSPSource : public NuPlayer::Source {
             uid_t uid = 0,
             bool isSDP = false);
 
+    virtual status_t getBufferingSettings(
+            BufferingSettings* buffering /* nonnull */) override;
+    virtual status_t setBufferingSettings(const BufferingSettings& buffering) override;
+
     virtual void prepareAsync();
     virtual void start();
     virtual void stop();
-    virtual void pause();
-    virtual void resume();
 
     virtual status_t feedMoreTSData();
 
     virtual status_t dequeueAccessUnit(bool audio, sp<ABuffer> *accessUnit);
 
     virtual status_t getDuration(int64_t *durationUs);
-    virtual status_t seekTo(int64_t seekTimeUs);
+    virtual status_t seekTo(
+            int64_t seekTimeUs,
+            MediaPlayerSeekMode mode = MediaPlayerSeekMode::SEEK_PREVIOUS_SYNC) override;
 
     void onMessageReceived(const sp<AMessage> &msg);
 
@@ -70,12 +69,8 @@ private:
         kWhatNotify          = 'noti',
         kWhatDisconnect      = 'disc',
         kWhatPerformSeek     = 'seek',
-#ifdef MTK_AOSP_ENHANCEMENT
-        kWhatSendPlay        = 'play',
-        kWhatSendPause         = 'paus',
-        kWhatBufferingUpdate = 'buff',
-        kWhatStopTrack       = 'rmtk'
-#endif
+        kWhatPollBuffering   = 'poll',
+        kWhatSignalEOS       = 'eos ',
     };
 
     enum State {
@@ -111,6 +106,11 @@ private:
     sp<AReplyToken> mDisconnectReplyID;
     Mutex mBufferingLock;
     bool mBuffering;
+    bool mInPreparationPhase;
+    bool mEOSPending;
+
+    Mutex mBufferingSettingsLock;
+    BufferingSettings mBufferingSettings;
 
     sp<ALooper> mLooper;
     sp<MyHandler> mHandler;
@@ -137,6 +137,14 @@ private:
     void finishDisconnectIfPossible();
 
     void performSeek(int64_t seekTimeUs);
+    void schedulePollBuffering();
+    void checkBuffering(
+            bool *prepared,
+            bool *underflow,
+            bool *overflow,
+            bool *startServer,
+            bool *finished);
+    void onPollBuffering();
 
     bool haveSufficientDataOnAllTracks();
 
@@ -146,73 +154,12 @@ private:
     bool stopBufferingIfNecessary();
     void finishSeek(status_t err);
 
+    void postSourceEOSIfNecessary();
+    void signalSourceEOS(status_t result);
+    void onSignalEOS(const sp<AMessage> &msg);
 
-
-#ifdef MTK_AOSP_ENHANCEMENT
-public:
-    //as in the RTSPSOurce contruction API, this httpService param is a reference sp ,
-    //it can not be passed with NULL.so add a new construction
-    RTSPSource(
-        const sp<AMessage> &notify,
-        const char *url,
-        const KeyedVector<String8, String8> *headers,
-        bool uidValid = false,
-        uid_t uid = 0,
-     bool isSDP = false);
-
-
-    sp<RefBase>        msdp;
-
-    virtual void    setParams(const sp<MetaData>& meta);
-    void            setSDP(sp<RefBase> &sdp);
-    void            stopTrack(bool audio);
-    virtual DataSourceType getDataSourceType();
-    virtual bool notifyCanNotConnectServerIfPossible(int64_t curPositionUs);
-
-private:
-    bool            mAllTrackEOS;
-    size_t          mEOSTrackCount;
-    int64_t         mSeekPosition;
-    int64_t         mHighWaterMarkUs;
-    bool            mQuitRightNow;
-        //The following are for sync call
-    // >>>
-    Mutex             mLock;
-    Condition         mCondition;
-    status_t         mSyncCallResult;
-    bool             mSyncCallDone;
-    void             prepareSyncCall();
-    void             completeSyncCall(const sp<AMessage>& msg);
-    status_t         finishSyncCall();
-    // <<<
-    int64_t         mLastSeekCompletedTimeUs;
-    //for bitrate adaptation
-    size_t m_BufQueSize; //Whole Buffer queue size
-    size_t m_TargetTime;  // target protected time of buffer queue duration for interrupt-free playback
-    // mtk80902: standalone looper for MyHander
-    sp<ALooper> mHandlerLooper;
-
-    void            init();
-    void            registerHandlerLooper();
-    void            setHandler();
-    void            setMeta(bool audio, sp<MetaData>& meta);
-    void            notifyBufRate(int64_t durationUs);
-    status_t         generalBufferedDurationUs(int64_t *durationUs);
-    void             notifyAsyncDone(uint32_t notify, status_t err = OK);
-    bool             removeSpecificHeaders(const String8 MyKey,
-                                                                                 KeyedVector<String8,
-                                                                                 String8> *headers,
-                                                                                 String8 *pMyHeader);
-    //The following are sync call method, using prepareSyncCall+finishSyncCall
-    status_t         preSeekSync(int64_t timeUs);
-    void             prepareMeta();
-    void            onStopTrack(const sp<AMessage> &msg);
-    void            notifySourceError(int32_t err);
-    void            prepareMyHandler();
-    status_t        mtkSeekTo(int64_t seekTimeUs);
-    void            notifyBeginningVideoSizeChanged();
-    sp<AnotherPacketSource> initAnotherPacketSource(int32_t index, sp<MetaData> format, bool isAudio);
-#endif
+    bool sourceNearEOS(bool audio);
+    bool sourceReachedEOS(bool audio);
 
     DISALLOW_EVIL_CONSTRUCTORS(RTSPSource);
 };

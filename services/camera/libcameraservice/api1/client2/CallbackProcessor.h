@@ -33,7 +33,7 @@ class CameraDeviceBase;
 
 namespace camera2 {
 
-class Parameters;
+struct Parameters;
 
 /***
  * Still image capture output image processing
@@ -41,13 +41,13 @@ class Parameters;
 class CallbackProcessor:
             public Thread, public CpuConsumer::FrameAvailableListener {
   public:
-    CallbackProcessor(sp<Camera2Client> client);
+    explicit CallbackProcessor(sp<Camera2Client> client);
     ~CallbackProcessor();
 
     void onFrameAvailable(const BufferItem& item);
 
     // Set to NULL to disable the direct-to-app callback window
-    status_t setCallbackWindow(sp<Surface> callbackWindow);
+    status_t setCallbackWindow(const sp<Surface>& callbackWindow);
     status_t updateStream(const Parameters &params);
     status_t deleteStream();
     int getStreamId() const;
@@ -75,7 +75,6 @@ class CallbackProcessor:
     sp<CpuConsumer>    mCallbackConsumer;
     sp<Surface>        mCallbackWindow;
     sp<Camera2Heap>    mCallbackHeap;
-    int mCallbackHeapId;
     size_t mCallbackHeapHead, mCallbackHeapFree;
 
     virtual bool threadLoop();

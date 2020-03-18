@@ -22,15 +22,16 @@
 #include <sys/resource.h>
 #include <unistd.h>
 
+#include <bionic_malloc.h>
+
 #include "MediaUtils.h"
+
+extern "C" void __scudo_set_rss_limit(size_t, int) __attribute__((weak));
 
 namespace android {
 
-void limitProcessMemory(
-    const char *property,
-    size_t numberOfBytes,
-    size_t percentageOfTotalMem) {
-
+void limitProcessMemory(const char *property, size_t numberOfBytes,
+                        size_t percentageOfTotalMem) {
     long pageSize = sysconf(_SC_PAGESIZE);
     long numPages = sysconf(_SC_PHYS_PAGES);
     size_t maxMem = SIZE_MAX;
@@ -57,18 +58,18 @@ void limitProcessMemory(
     if (propVal > 0 && uint64_t(propVal) <= SIZE_MAX) {
         maxMem = propVal;
     }
-    ALOGV("actual limit: %zu", maxMem);
 
-    struct rlimit limit;
-    getrlimit(RLIMIT_AS, &limit);
-    ALOGV("original limits: %lld/%lld", (long long)limit.rlim_cur, (long long)limit.rlim_max);
-    limit.rlim_cur = maxMem;
-    setrlimit(RLIMIT_AS, &limit);
-    limit.rlim_cur = -1;
-    limit.rlim_max = -1;
-    getrlimit(RLIMIT_AS, &limit);
-    ALOGV("new limits: %lld/%lld", (long long)limit.rlim_cur, (long long)limit.rlim_max);
+    // If Scudo is in use, enforce the hard RSS limit (in MB).
+    if (maxMem != SIZE_MAX && &__scudo_set_rss_limit != 0) {
+      __scudo_set_rss_limit(maxMem >> 20, 1);
+      ALOGV("Scudo hard RSS limit set to %zu MB", maxMem >> 20);
+      return;
+    }
 
+    if (!android_mallopt(M_SET_ALLOCATION_LIMIT_BYTES, &maxMem,
+                         sizeof(maxMem))) {
+      ALOGW("couldn't set allocation limit");
+    }
 }
 
 } // namespace android

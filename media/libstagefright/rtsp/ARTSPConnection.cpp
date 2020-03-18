@@ -1,10 +1,4 @@
 /*
-* Copyright (C) 2014 MediaTek Inc.
-* Modification based on code covered by the mentioned copyright
-* and/or permission notice(s).
-*/
-
-/*
  * Copyright (C) 2010 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,6 +19,7 @@
 #include <utils/Log.h>
 
 #include "ARTSPConnection.h"
+#include "NetworkUtils.h"
 
 #include <media/stagefright/foundation/ABuffer.h>
 #include <media/stagefright/foundation/ADebug.h>
@@ -39,31 +34,16 @@
 #include <openssl/md5.h>
 #include <sys/socket.h>
 
-#ifdef MTK_AOSP_ENHANCEMENT
-#include <cutils/properties.h>
-#include "ARTPSource.h"
-#ifdef CUSTOM_UASTRING_FROM_PROPERTY
-#include "custom_prop.h"
-#endif
-#include <linux/tcp.h>
-#define MTK_SEND_FLAG (MSG_NOSIGNAL)
-#endif // #ifdef MTK_AOSP_ENHANCEMENT
 #include "include/HTTPBase.h"
 
 namespace android {
 
 // static
-const int64_t ARTSPConnection::kSelectTimeoutUs = 1000ll;
+const int64_t ARTSPConnection::kSelectTimeoutUs = 1000LL;
 
-#ifdef MTK_AOSP_ENHANCEMENT
-// 15s is service ANR timeout, we choose 14s for request timeout
-const int64_t ARTSPConnection::kRequestTimeout = 60000000ll;
-static int64_t kAccessUnitTimeoutUs = ARTPSource::kAccessUnitTimeoutUs;
-#else
 // static
 const AString ARTSPConnection::sUserAgent =
     AStringPrintf("User-Agent: %s\r\n", MakeUserAgent().c_str());
-#endif // #ifdef MTK_AOSP_ENHANCEMENT
 
 ARTSPConnection::ARTSPConnection(bool uidValid, uid_t uid)
     : mUIDValid(uidValid),
@@ -74,17 +54,14 @@ ARTSPConnection::ARTSPConnection(bool uidValid, uid_t uid)
       mConnectionID(0),
       mNextCSeq(0),
       mReceiveResponseEventPending(false) {
-#ifdef MTK_AOSP_ENHANCEMENT
-    init();
-#endif // #ifdef MTK_AOSP_ENHANCEMENT
 }
 
 ARTSPConnection::~ARTSPConnection() {
     if (mSocket >= 0) {
         ALOGE("Connection is still open, closing the socket.");
         if (mUIDValid) {
-            HTTPBase::UnRegisterSocketUserTag(mSocket);
-            HTTPBase::UnRegisterSocketUserMark(mSocket);
+            NetworkUtils::UnRegisterSocketUserTag(mSocket);
+            NetworkUtils::UnRegisterSocketUserMark(mSocket);
         }
         close(mSocket);
         mSocket = -1;
@@ -109,13 +86,6 @@ void ARTSPConnection::sendRequest(
     sp<AMessage> msg = new AMessage(kWhatSendRequest, this);
     msg->setString("request", request);
     msg->setMessage("reply", reply);
-#ifdef MTK_AOSP_ENHANCEMENT
-    msg->setInt32("backup-keep-tcp", mForceQuitTCP);
-    int keep;
-    if (!reply->findInt32("keep-tcp", &keep)) {
-        mForceQuitTCP = true;
-    }
-#endif // #ifdef MTK_AOSP_ENHANCEMENT
     msg->post();
 }
 
@@ -153,18 +123,6 @@ void ARTSPConnection::onMessageReceived(const sp<AMessage> &msg) {
             break;
         }
 
-#ifdef MTK_AOSP_ENHANCEMENT
-        case kWhatTimeout:
-        {
-            onTimeout(msg);
-            break;
-        }
-        case kWhatInjectPacket:
-        {
-            onInjectPacket(msg);
-            break;
-        }
-#endif // #ifdef MTK_AOSP_ENHANCEMENT
         default:
             TRESPASS();
             break;
@@ -257,8 +215,8 @@ void ARTSPConnection::onConnect(const sp<AMessage> &msg) {
 
     if (mState != DISCONNECTED) {
         if (mUIDValid) {
-            HTTPBase::UnRegisterSocketUserTag(mSocket);
-            HTTPBase::UnRegisterSocketUserMark(mSocket);
+            NetworkUtils::UnRegisterSocketUserTag(mSocket);
+            NetworkUtils::UnRegisterSocketUserMark(mSocket);
         }
         close(mSocket);
         mSocket = -1;
@@ -295,22 +253,11 @@ void ARTSPConnection::onConnect(const sp<AMessage> &msg) {
         ALOGV("user = '%s', pass = '%s'", mUser.c_str(), mPass.c_str());
     }
 
-#ifdef MTK_AOSP_ENHANCEMENT
-    if (!mProxyHost.empty()) {
-        ALOGI("connect through proxy %s:%d", mProxyHost.c_str(), mProxyPort);
-        host = mProxyHost;
-        port = mProxyPort;
-    }
-#endif // #ifdef MTK_AOSP_ENHANCEMENT
     struct hostent *ent = gethostbyname(host.c_str());
     if (ent == NULL) {
-        ALOGE("Unknown host %s", host.c_str());
+        ALOGE("Unknown host %s", uriDebugString(host).c_str());
 
-#ifdef MTK_AOSP_ENHANCEMENT
-        reply->setInt32("result", -EHOSTUNREACH);
-#else
         reply->setInt32("result", -ENOENT);
-#endif // #ifdef MTK_AOSP_ENHANCEMENT
         reply->post();
 
         mState = DISCONNECTED;
@@ -320,9 +267,9 @@ void ARTSPConnection::onConnect(const sp<AMessage> &msg) {
     mSocket = socket(AF_INET, SOCK_STREAM, 0);
 
     if (mUIDValid) {
-        HTTPBase::RegisterSocketUserTag(mSocket, mUID,
+        NetworkUtils::RegisterSocketUserTag(mSocket, mUID,
                                         (uint32_t)*(uint32_t*) "RTSP");
-        HTTPBase::RegisterSocketUserMark(mSocket, mUID);
+        NetworkUtils::RegisterSocketUserMark(mSocket, mUID);
     }
 
     MakeSocketBlocking(mSocket, false);
@@ -332,12 +279,6 @@ void ARTSPConnection::onConnect(const sp<AMessage> &msg) {
     remote.sin_family = AF_INET;
     remote.sin_addr.s_addr = *(in_addr_t *)ent->h_addr;
     remote.sin_port = htons(port);
-#ifdef MTK_AOSP_ENHANCEMENT
-    mRemote = remote;
-    setSocketFlag(msg);
-    ALOGI("connecting %s, %s:%d now",
-        host.c_str(), inet_ntoa(remote.sin_addr), port);
-#endif // #ifdef MTK_AOSP_ENHANCEMENT
 
     int err = ::connect(
             mSocket, (const struct sockaddr *)&remote, sizeof(remote));
@@ -349,10 +290,6 @@ void ARTSPConnection::onConnect(const sp<AMessage> &msg) {
             sp<AMessage> msg = new AMessage(kWhatCompleteConnection, this);
             msg->setMessage("reply", reply);
             msg->setInt32("connection-id", mConnectionID);
-#ifdef MTK_AOSP_ENHANCEMENT
-            msg->setInt64("timestamp", ALooper::GetNowUs());
-            ALOGI("connection EINPROGRESS");
-#endif // #ifdef MTK_AOSP_ENHANCEMENT
             msg->post();
             return;
         }
@@ -361,8 +298,8 @@ void ARTSPConnection::onConnect(const sp<AMessage> &msg) {
         mState = DISCONNECTED;
 
         if (mUIDValid) {
-            HTTPBase::UnRegisterSocketUserTag(mSocket);
-            HTTPBase::UnRegisterSocketUserMark(mSocket);
+            NetworkUtils::UnRegisterSocketUserTag(mSocket);
+            NetworkUtils::UnRegisterSocketUserMark(mSocket);
         }
         close(mSocket);
         mSocket = -1;
@@ -379,8 +316,8 @@ void ARTSPConnection::onConnect(const sp<AMessage> &msg) {
 
 void ARTSPConnection::performDisconnect() {
     if (mUIDValid) {
-        HTTPBase::UnRegisterSocketUserTag(mSocket);
-        HTTPBase::UnRegisterSocketUserMark(mSocket);
+        NetworkUtils::UnRegisterSocketUserTag(mSocket);
+        NetworkUtils::UnRegisterSocketUserMark(mSocket);
     }
     close(mSocket);
     mSocket = -1;
@@ -391,10 +328,6 @@ void ARTSPConnection::performDisconnect() {
     mPass.clear();
     mAuthType = NONE;
     mNonce.clear();
-#ifdef MTK_AOSP_ENHANCEMENT
-    mRealm.clear();
-    ALOGI("performDisconnect");
-#endif // #ifdef MTK_AOSP_ENHANCEMENT
 
     mState = DISCONNECTED;
 }
@@ -440,13 +373,7 @@ void ARTSPConnection::onCompleteConnection(const sp<AMessage> &msg) {
 
     if (res == 0) {
         // Timed out. Not yet connected.
-#ifdef MTK_AOSP_ENHANCEMENT
-        if(isConnTimeout(msg))
-            return;
 
-        if(mExited)
-            return;
-#endif // #ifdef MTK_AOSP_ENHANCEMENT
         msg->post();
         return;
     }
@@ -463,8 +390,8 @@ void ARTSPConnection::onCompleteConnection(const sp<AMessage> &msg) {
 
         mState = DISCONNECTED;
         if (mUIDValid) {
-            HTTPBase::UnRegisterSocketUserTag(mSocket);
-            HTTPBase::UnRegisterSocketUserMark(mSocket);
+            NetworkUtils::UnRegisterSocketUserTag(mSocket);
+            NetworkUtils::UnRegisterSocketUserMark(mSocket);
         }
         close(mSocket);
         mSocket = -1;
@@ -480,12 +407,6 @@ void ARTSPConnection::onCompleteConnection(const sp<AMessage> &msg) {
 }
 
 void ARTSPConnection::onSendRequest(const sp<AMessage> &msg) {
-#ifdef MTK_AOSP_ENHANCEMENT
-    int32_t backup;
-    if (msg->findInt32("backup-keep-tcp", &backup)) {
-        mForceQuitTCP = backup;
-    }
-#endif
     sp<AMessage> reply;
     CHECK(msg->findMessage("reply", &reply));
 
@@ -501,16 +422,7 @@ void ARTSPConnection::onSendRequest(const sp<AMessage> &msg) {
     // Just in case we need to re-issue the request with proper authentication
     // later, stash it away.
     reply->setString("original-request", request.c_str(), request.size());
-#ifdef MTK_AOSP_ENHANCEMENT
-    // mtk80902: ALPS01139972 - SETUP resp with a wrong Session "xxx\0\0\0.."
-    // so the followed \r\n is ignored by find's strstr operation
-    if (request.find("\r\n\r\n") < 0) {
-        ALOGW("what the hell with this req?");  // seems print str is useless..
-        reply->setInt32("result", -EBADMSG);
-        reply->post();
-        return;
-    }
-#endif
+
     addAuthentication(&request);
     addUserAgent(&request);
 
@@ -531,13 +443,8 @@ void ARTSPConnection::onSendRequest(const sp<AMessage> &msg) {
     size_t numBytesSent = 0;
     while (numBytesSent < request.size()) {
         ssize_t n =
-#ifdef MTK_AOSP_ENHANCEMENT
-            send(mSocket, request.c_str() + numBytesSent,
-                 request.size() - numBytesSent, MTK_SEND_FLAG);
-#else
             send(mSocket, request.c_str() + numBytesSent,
                  request.size() - numBytesSent, 0);
-#endif
 
         if (n < 0 && errno == EINTR) {
             continue;
@@ -565,9 +472,6 @@ void ARTSPConnection::onSendRequest(const sp<AMessage> &msg) {
     }
 
     mPendingRequests.add(cseq, reply);
-#ifdef MTK_AOSP_ENHANCEMENT
-    postTimeoutMsg(reply, cseq);
-#endif // #ifdef MTK_AOSP_ENHANCEMENT
 }
 
 void ARTSPConnection::onReceiveResponse() {
@@ -628,12 +532,7 @@ void ARTSPConnection::postReceiveReponseEvent() {
 
 status_t ARTSPConnection::receive(void *data, size_t size) {
     size_t offset = 0;
-#ifdef MTK_AOSP_ENHANCEMENT
-     while (offset < size && !mExited)
-#else
-    while (offset < size)
-#endif
-  {
+    while (offset < size) {
         ssize_t n = recv(mSocket, (uint8_t *)data + offset, size - offset, 0);
 
         if (n < 0 && errno == EINTR) {
@@ -641,12 +540,6 @@ status_t ARTSPConnection::receive(void *data, size_t size) {
         }
 
         if (n <= 0) {
-#ifdef MTK_AOSP_ENHANCEMENT
-            ALOGW("receive %zd errno %d trying %d, force %d", n, errno, mKeepTCPTrying, mForceQuitTCP);
-            if (errno == EAGAIN && mKeepTCPTrying && !mForceQuitTCP) {
-                continue;
-            }
-#endif // #ifdef MTK_AOSP_ENHANCEMENT
             performDisconnect();
 
             if (n == 0) {
@@ -661,10 +554,7 @@ status_t ARTSPConnection::receive(void *data, size_t size) {
 
         offset += (size_t)n;
     }
-#ifdef MTK_AOSP_ENHANCEMENT
-     if(offset < size)
-              return ERROR_IO;
-#endif
+
     return OK;
 }
 
@@ -714,9 +604,6 @@ sp<ABuffer> ARTSPConnection::receiveBinaryData() {
 }
 
 static bool IsRTSPVersion(const AString &s) {
-#ifdef MTK_AOSP_ENHANCEMENT
-    return s.find("/1.0") >= 0;
-#endif
     return s == "RTSP/1.0";
 }
 
@@ -726,24 +613,9 @@ bool ARTSPConnection::receiveRTSPReponse() {
     if (!receiveLine(&statusLine)) {
         return false;
     }
-#ifdef MTK_AOSP_ENHANCEMENT
-    if(statusLine.empty()){
-        ALOGW("received blank row at the beginning of a response, ignore it.");
-        if (!receiveLine(&statusLine)) {
-            return false;
-        }
-    }
-#endif
-
 
     if (statusLine == "$") {
-#ifdef MTK_AOSP_ENHANCEMENT
-        mKeepTCPTrying = true;
         sp<ABuffer> buffer = receiveBinaryData();
-        mKeepTCPTrying = false;
-#else
-        sp<ABuffer> buffer = receiveBinaryData();
-#endif // #ifdef MTK_AOSP_ENHANCEMENT
 
         if (buffer == NULL) {
             return false;
@@ -777,23 +649,12 @@ bool ARTSPConnection::receiveRTSPReponse() {
     bool isRequest = false;
 
     if (!IsRTSPVersion(AString(response->mStatusLine, 0, space1))) {
-#ifdef MTK_AOSP_ENHANCEMENT
-        // mtk80902: ALPS01122651: received mess..
-        if (!IsRTSPVersion(
-                   AString(
-                       response->mStatusLine,
-                       space2 + 1,
-                       response->mStatusLine.size() - space2 - 1))) {
-            ALOGW("what mess r u receiving?");
-            return false;
-        }
-#else
         CHECK(IsRTSPVersion(
                     AString(
                         response->mStatusLine,
                         space2 + 1,
                         response->mStatusLine.size() - space2 - 1)));
-#endif
+
         isRequest = true;
 
         response->mStatusCode = 0;
@@ -933,13 +794,8 @@ bool ARTSPConnection::handleServerRequest(const sp<ARTSPResponse> &request) {
     size_t numBytesSent = 0;
     while (numBytesSent < response.size()) {
         ssize_t n =
-#ifdef MTK_AOSP_ENHANCEMENT
-            send(mSocket, response.c_str() + numBytesSent,
-                 response.size() - numBytesSent, MTK_SEND_FLAG);
-#else
             send(mSocket, response.c_str() + numBytesSent,
                  response.size() - numBytesSent, 0);
-#endif
 
         if (n < 0 && errno == EINTR) {
             continue;
@@ -1018,16 +874,7 @@ bool ARTSPConnection::notifyResponseListener(
     }
 
     if (err != OK) {
-#ifdef MTK_AOSP_ENHANCEMENT
-    // mtk80902: for ALPS00868762
-    // the 'OPTION' resp arrived after timeout
-    // and we have already removed it
-    // here just do nothing and return true
-        ALOGW("No corresponding req pending..it's all right.");
-        return true;
-#else
         return false;
-#endif
     }
 
     sp<AMessage> reply = mPendingRequests.valueAt(i);
@@ -1052,18 +899,10 @@ bool ARTSPConnection::parseAuthMethod(const sp<ARTSPResponse> &response) {
     if (!strncmp(value.c_str(), "Basic", 5)) {
         mAuthType = BASIC;
     } else {
-#if !defined(HAVE_ANDROID_OS)
-        // We don't have access to the MD5 implementation on the simulator,
-        // so we won't support digest authentication.
-        return false;
-#endif
 
         CHECK(!strncmp(value.c_str(), "Digest", 6));
         mAuthType = DIGEST;
 
-#ifdef MTK_AOSP_ENHANCEMENT
-        getRealm(value);
-#endif // #ifdef MTK_AOSP_ENHANCEMENT
         i = value.find("nonce=");
         CHECK_GE(i, 0);
         CHECK_EQ(value.c_str()[i + 6], '\"');
@@ -1076,7 +915,6 @@ bool ARTSPConnection::parseAuthMethod(const sp<ARTSPResponse> &response) {
     return true;
 }
 
-#if defined(HAVE_ANDROID_OS)
 static void H(const AString &s, AString *out) {
     out->clear();
 
@@ -1105,7 +943,6 @@ static void H(const AString &s, AString *out) {
         out->append(&nibble, 1);
     }
 }
-#endif
 
 static void GetMethodAndURL(
         const AString &request, AString *method, AString *url) {
@@ -1116,11 +953,7 @@ static void GetMethodAndURL(
     CHECK_GE(space2, 0);
 
     method->setTo(request, 0, space1);
-#ifdef MTK_AOSP_ENHANCEMENT
-    url->setTo(request, space1 + 1, space2 - space1 - 1);
-#else
     url->setTo(request, space1 + 1, space2 - space1);
-#endif // #ifdef MTK_AOSP_ENHANCEMENT
 }
 
 void ARTSPConnection::addAuthentication(AString *request) {
@@ -1151,7 +984,6 @@ void ARTSPConnection::addAuthentication(AString *request) {
         return;
     }
 
-#if defined(HAVE_ANDROID_OS)
     CHECK_EQ((int)mAuthType, (int)DIGEST);
 
     AString method, url;
@@ -1160,11 +992,7 @@ void ARTSPConnection::addAuthentication(AString *request) {
     AString A1;
     A1.append(mUser);
     A1.append(":");
-#ifdef MTK_AOSP_ENHANCEMENT
-    A1.append(mRealm);
-#else
     A1.append("Streaming Server");
-#endif // #ifdef MTK_AOSP_ENHANCEMENT
     A1.append(":");
     A1.append(mPass);
 
@@ -1189,22 +1017,12 @@ void ARTSPConnection::addAuthentication(AString *request) {
 
     AString fragment;
     fragment.append("Authorization: Digest ");
-#ifndef MTK_AOSP_ENHANCEMENT
     fragment.append("nonce=\"");
     fragment.append(mNonce);
     fragment.append("\", ");
-#endif // #ifdef MTK_AOSP_ENHANCEMENT
     fragment.append("username=\"");
     fragment.append(mUser);
     fragment.append("\", ");
-#ifdef MTK_AOSP_ENHANCEMENT
-    fragment.append("realm=\"");
-    fragment.append(mRealm);
-    fragment.append("\", ");
-    fragment.append("nonce=\"");
-    fragment.append(mNonce);
-    fragment.append("\", ");
-#endif // #ifdef MTK_AOSP_ENHANCEMENT
     fragment.append("uri=\"");
     fragment.append(url);
     fragment.append("\", ");
@@ -1214,7 +1032,6 @@ void ARTSPConnection::addAuthentication(AString *request) {
     fragment.append("\r\n");
 
     request->insert(fragment, i + 2);
-#endif
 }
 
 void ARTSPConnection::addUserAgent(AString *request) const {
@@ -1222,196 +1039,7 @@ void ARTSPConnection::addUserAgent(AString *request) const {
     ssize_t i = request->find("\r\n\r\n");
     CHECK_GE(i, 0);
 
-#ifdef MTK_AOSP_ENHANCEMENT
-    request->insert(mUserAgent, i + 2);
-#else
     request->insert(sUserAgent, i + 2);
-#endif  //#ifdef MTK_AOSP_ENHANCEMENT
 }
 
-#ifdef MTK_AOSP_ENHANCEMENT
-void ARTSPConnection::init() {
-    mKeepTCPTrying = false;
-    mForceQuitTCP = false;
-    mExited = false;
-
-    MakeUserAgent(&mUserAgent);
-
-}
-
-void ARTSPConnection::setSocketFlag(const sp<AMessage> &msg) {
-
-    sp<AMessage> reply;
-    CHECK(msg->findMessage("reply", &reply));
-
-    int ret_tmp = 0;
-    int flag_t = 1;
-    ret_tmp = setsockopt(mSocket, IPPROTO_TCP, TCP_NODELAY, (char*)&flag_t, sizeof(flag_t));
-    ALOGI("set nodelay return %d\n", ret_tmp);
-
-    struct timeval tv;
-    tv.tv_sec = kAccessUnitTimeoutUs / 1000000LL;
-    tv.tv_usec = 0;
-    if (setsockopt(mSocket, SOL_SOCKET, SO_RCVTIMEO, (char *)&tv, sizeof(tv)) < 0) {
-        ALOGE("can not set recv timeout");
-        reply->setInt32("result", -errno);
-        mState = DISCONNECTED;
-
-        close(mSocket);
-        mSocket = -1;
-        reply->post();
-        return;
-    }
-}
-
-bool ARTSPConnection::isConnTimeout(const sp<AMessage> &msg) {
-    sp<AMessage> reply;
-    CHECK(msg->findMessage("reply", &reply));
-
-    int64_t then, now = ALooper::GetNowUs();
-    if (msg->findInt64("timestamp", &then) && now - then > kRequestTimeout) {
-        ALOGE("connection timeout %lld > %lld", (long long)now, (long long)then);
-        reply->setInt32("result", -110 /*ETIMEDOUT*/);
-        reply->post();
-        mState = DISCONNECTED;
-        close(mSocket);
-        mSocket = -1;
-        return true;
-    }
-
-    return false;
-}
-
-void ARTSPConnection::postTimeoutMsg(sp<AMessage> msg, int32_t cseq) {
-    sp<AMessage> timeout = new AMessage(kWhatTimeout, this);
-    timeout->setInt32("cseq", cseq);
-    timeout->setMessage("reply", msg);
-    int64_t t;
-    if (msg->findInt64("timeout", &t)) {
-        timeout->post(t);
-    } else {
-        timeout->post(kRequestTimeout);
-    }
-}
-
-void ARTSPConnection::getRealm(AString value) {
-    ssize_t i = value.find("realm=");
-    CHECK_GE(i, 0);
-    CHECK_EQ(value.c_str()[i + 6], '\"');
-    ssize_t j = value.find("\"", i + 7);
-    CHECK_GE(j, 0);
-
-    mRealm.setTo(value, i + 7, j - i - 7);
-}
-
-
-// static
-void ARTSPConnection::MakeUserAgent(AString *userAgent) {
-    userAgent->clear();
-#ifdef CUSTOM_UASTRING_FROM_PROPERTY
-    char value[MAX_VALUE_LEN];
-    if (0 < custom_get_string(MODULE_RTSP_STREAMING, USER_AGENT, value, NULL)) {
-        userAgent->setTo("User-Agent: ");
-        userAgent->append(value);
-        userAgent->append("\r\n");
-    } else {
-        userAgent->setTo("User-Agent: stagefright/1.1 (Linux;Android ");
-        #if (PROPERTY_VALUE_MAX < 8)
-        #error "PROPERTY_VALUE_MAX must be at least 8"
-        #endif
-        char prop[PROPERTY_VALUE_MAX];
-        property_get("ro.build.version.release", prop, "Unknown");
-        userAgent->append(prop);
-        userAgent->append(")\r\n");
-    }
-    memset(value, 0, sizeof(value));
-    if (0 < custom_get_string(MODULE_RTSP_STREAMING, UAPROF_URL, value, NULL)) {
-        userAgent->append("x-wap-profile: ");
-        userAgent->append(value);
-        userAgent->append("\r\n");
-    } else {
-        userAgent->append("x-wap-profile: http://218.249.47.94/Xianghe/MTK_Athens15_UAProfile.xml\r\n");
-    }
-#else //#ifdef CUSTOM_UASTRING_FROM_PROPERTY
-#ifdef STR_RTSP_USER_AGENT
-    //userAgent->setTo("User-Agent: Athens15_TD/V2 Linux/3.0.13 Android/4.0 Release/02.15.2012 Browser/AppleWebKit534.30 Mobile Safari/534.30 MBBMS/2.2\r\n");
-    userAgent->setTo("User-Agent: ");
-    userAgent->append(STR_RTSP_USER_AGENT);
-    userAgent->append("\r\n");
-#else
-    userAgent->setTo("User-Agent: stagefright/1.1 (Linux;Android ");
-    #if (PROPERTY_VALUE_MAX < 8)
-    #error "PROPERTY_VALUE_MAX must be at least 8"
-    #endif
-    char value[PROPERTY_VALUE_MAX];
-    property_get("ro.build.version.release", value, "Unknown");
-    userAgent->append(value);
-    userAgent->append(")\r\n");
-#endif
-
-#ifdef STR_RTSP_WAP_PROFILE
-    userAgent->append("x-wap-profile: ");
-    userAgent->append(STR_RTSP_WAP_PROFILE);
-    userAgent->append("\r\n");
-#else
-    userAgent->append("x-wap-profile: http://218.249.47.94/Xianghe/MTK_Athens15_UAProfile.xml\r\n");
-#endif
-#endif //#ifdef CUSTOM_UASTRING_FROM_PROPERTY
-}
-
-void ARTSPConnection::onTimeout(const sp<AMessage> &msg) {
-
-    unsigned long cseq;
-    CHECK(msg->findInt32("cseq", (int32_t*)&cseq));
-    sp<AMessage> reply1;
-    CHECK(msg->findMessage("reply", &reply1));
-
-    ssize_t i = mPendingRequests.indexOfKey(cseq);
-    if (i < 0) {
-        return;
-    }
-    sp<AMessage> reply2 = mPendingRequests.valueAt(i);
-
-    if(reply1->what() != reply2->what()){
-        //ALOGE("timeout is old(cseq=%lu), ignore", cseq);
-        return;
-    }
-
-    mPendingRequests.removeItemsAt(i);
-
-    reply2->setInt32("result", -110 /*ETIMEDOUT*/);
-    reply2->post();
-}
-
-void ARTSPConnection::injectPacket(const sp<ABuffer> &buffer) {
-    sp<AMessage> msg = new AMessage(kWhatInjectPacket, this);
-    msg->setObject("buffer", buffer);
-    msg->post();
-}
-
-void ARTSPConnection::onInjectPacket(const sp<AMessage> &msg) {
-    sp<RefBase> obj;
-    CHECK(msg->findObject("buffer", &obj));
-
-    sp<ABuffer> buffer = static_cast<ABuffer *>(obj.get());
-    ssize_t n = send(mSocket, buffer->data(), buffer->size(), MTK_SEND_FLAG);
-    if (n == 0) {
-        ALOGW("Server unexpectedly closed the connection when sending RTCP.");
-    } else if (n < 0) {
-        ALOGW("errno when sending RTCP %d (%s)", errno, strerror(errno));
-    }
-    return;
-}
-
-void ARTSPConnection::stopTCPTrying() {
-    ALOGI("stopTCPTrying");
-    mForceQuitTCP = true;
-}
-
-void ARTSPConnection::exit(){
-    ALOGI("exit");
-    mExited = true;
-}
-
-#endif // #ifdef MTK_AOSP_ENHANCEMENT
 }  // namespace android

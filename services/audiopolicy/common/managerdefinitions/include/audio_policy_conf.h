@@ -38,10 +38,6 @@
 // hw modules descriptions
 #define AUDIO_HW_MODULE_TAG "audio_hw_modules"
 
-//MTK_AUDIO
-#define MODULE_A2DP_TAG "a2dp"
-#define COMPRESS_OFFLOAD_TAG "compress_offload"
-
 #define OUTPUTS_TAG "outputs"
 #define INPUTS_TAG "inputs"
 
@@ -50,10 +46,6 @@
 #define CHANNELS_TAG "channel_masks"
 #define DEVICES_TAG "devices"
 #define FLAGS_TAG "flags"
-
-#define DYNAMIC_VALUE_TAG "dynamic" // special value for "channel_masks", "sampling_rates" and
-                                    // "formats" in outputs descriptors indicating that supported
-                                    // values should be queried after opening the output.
 
 #define APM_DEVICES_TAG "devices"
 #define APM_DEVICE_TYPE "type"
@@ -73,3 +65,7 @@
 #define GAIN_STEP_VALUE "step_value_mB"
 #define GAIN_MIN_RAMP_MS "min_ramp_ms"
 #define GAIN_MAX_RAMP_MS "max_ramp_ms"
+
+#define DYNAMIC_VALUE_TAG "dynamic" // special value for "channel_masks", "sampling_rates" and
+                                    // "formats" in outputs descriptors indicating that supported
+                                    // values should be queried after opening the output.

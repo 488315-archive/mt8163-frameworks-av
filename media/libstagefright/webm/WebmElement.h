@@ -24,6 +24,8 @@
 
 namespace android {
 
+class MetaData;
+
 struct WebmElement : public LightRefBase<WebmElement> {
     const uint64_t mId, mSize;
 
@@ -48,6 +50,7 @@ struct WebmElement : public LightRefBase<WebmElement> {
     static sp<WebmElement> SegmentInfo(uint64_t scale = 1000000, double dur = 0);
 
     static sp<WebmElement> AudioTrackEntry(
+            const char *codec,
             int chans,
             double rate,
             const sp<ABuffer> &buf,
@@ -57,8 +60,10 @@ struct WebmElement : public LightRefBase<WebmElement> {
             const char *lang = "und");
 
     static sp<WebmElement> VideoTrackEntry(
+            const char *codec,
             uint64_t width,
             uint64_t height,
+            const sp<MetaData> &md,
             uint64_t uid = 0,
             bool lacing = false,
             const char *lang = "und");
@@ -110,14 +115,14 @@ struct WebmSimpleBlock : public WebmElement {
 
 struct EbmlVoid : public WebmElement {
     const uint64_t mSizeWidth;
-    EbmlVoid(uint64_t totalSize);
+    explicit EbmlVoid(uint64_t totalSize);
     int serializePayloadSize(uint8_t *buf);
     void serializePayload(uint8_t *buf);
 };
 
 struct WebmMaster : public WebmElement {
     const List<sp<WebmElement> > mChildren;
-    WebmMaster(uint64_t id);
+    explicit WebmMaster(uint64_t id);
     WebmMaster(uint64_t id, const List<sp<WebmElement> > &children);
     int serializePayloadSize(uint8_t *buf);
     void serializePayload(uint8_t *buf);

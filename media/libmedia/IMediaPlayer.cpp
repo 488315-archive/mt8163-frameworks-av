@@ -1,9 +1,4 @@
 /*
-* Copyright (C) 2014 MediaTek Inc.
-* Modification based on code covered by the mentioned copyright
-* and/or permission notice(s).
-*/
-/*
 **
 ** Copyright 2008, The Android Open Source Project
 **
@@ -28,6 +23,7 @@
 
 #include <media/AudioResamplerPublic.h>
 #include <media/AVSyncSettings.h>
+#include <media/BufferingSettings.h>
 
 #include <media/IDataSource.h>
 #include <media/IMediaHTTPService.h>
@@ -39,12 +35,16 @@
 
 namespace android {
 
+using media::VolumeShaper;
+
 enum {
     DISCONNECT = IBinder::FIRST_CALL_TRANSACTION,
     SET_DATA_SOURCE_URL,
     SET_DATA_SOURCE_FD,
     SET_DATA_SOURCE_STREAM,
     SET_DATA_SOURCE_CALLBACK,
+    SET_BUFFERING_SETTINGS,
+    GET_BUFFERING_SETTINGS,
     PREPARE_ASYNC,
     START,
     STOP,
@@ -58,6 +58,7 @@ enum {
     GET_CURRENT_POSITION,
     GET_DURATION,
     RESET,
+    NOTIFY_AT,
     SET_AUDIO_STREAM_TYPE,
     SET_LOOPING,
     SET_VOLUME,
@@ -72,12 +73,33 @@ enum {
     SET_RETRANSMIT_ENDPOINT,
     GET_RETRANSMIT_ENDPOINT,
     SET_NEXT_PLAYER,
+    APPLY_VOLUME_SHAPER,
+    GET_VOLUME_SHAPER_STATE,
+    // Modular DRM
+    PREPARE_DRM,
+    RELEASE_DRM,
+    // AudioRouting
+    SET_OUTPUT_DEVICE,
+    GET_ROUTED_DEVICE_ID,
+    ENABLE_AUDIO_DEVICE_CALLBACK,
 };
+
+// ModDrm helpers
+static void readVector(const Parcel& reply, Vector<uint8_t>& vector) {
+    uint32_t size = reply.readUint32();
+    vector.insertAt((size_t)0, size);
+    reply.read(vector.editArray(), size);
+}
+
+static void writeVector(Parcel& data, Vector<uint8_t> const& vector) {
+    data.writeUint32(vector.size());
+    data.write(vector.array(), vector.size());
+}
 
 class BpMediaPlayer: public BpInterface<IMediaPlayer>
 {
 public:
-    BpMediaPlayer(const sp<IBinder>& impl)
+    explicit BpMediaPlayer(const sp<IBinder>& impl)
         : BpInterface<IMediaPlayer>(impl)
     {
     }
@@ -151,6 +173,32 @@ public:
         data.writeStrongBinder(b);
         remote()->transact(SET_VIDEO_SURFACETEXTURE, data, &reply);
         return reply.readInt32();
+    }
+
+    status_t setBufferingSettings(const BufferingSettings& buffering)
+    {
+        Parcel data, reply;
+        data.writeInterfaceToken(IMediaPlayer::getInterfaceDescriptor());
+        data.writeInt32(buffering.mInitialMarkMs);
+        data.writeInt32(buffering.mResumePlaybackMarkMs);
+        remote()->transact(SET_BUFFERING_SETTINGS, data, &reply);
+        return reply.readInt32();
+    }
+
+    status_t getBufferingSettings(BufferingSettings* buffering /* nonnull */)
+    {
+        if (buffering == nullptr) {
+            return BAD_VALUE;
+        }
+        Parcel data, reply;
+        data.writeInterfaceToken(IMediaPlayer::getInterfaceDescriptor());
+        remote()->transact(GET_BUFFERING_SETTINGS, data, &reply);
+        status_t err = reply.readInt32();
+        if (err == OK) {
+            buffering->mInitialMarkMs = reply.readInt32();
+            buffering->mResumePlaybackMarkMs = reply.readInt32();
+        }
+        return err;
     }
 
     status_t prepareAsync()
@@ -251,11 +299,12 @@ public:
         return reply.readInt32();
     }
 
-    status_t seekTo(int msec)
+    status_t seekTo(int msec, MediaPlayerSeekMode mode)
     {
         Parcel data, reply;
         data.writeInterfaceToken(IMediaPlayer::getInterfaceDescriptor());
         data.writeInt32(msec);
+        data.writeInt32(mode);
         remote()->transact(SEEK_TO, data, &reply);
         return reply.readInt32();
     }
@@ -283,6 +332,15 @@ public:
         Parcel data, reply;
         data.writeInterfaceToken(IMediaPlayer::getInterfaceDescriptor());
         remote()->transact(RESET, data, &reply);
+        return reply.readInt32();
+    }
+
+    status_t notifyAt(int64_t mediaTimeUs)
+    {
+        Parcel data, reply;
+        data.writeInterfaceToken(IMediaPlayer::getInterfaceDescriptor());
+        data.writeInt64(mediaTimeUs);
+        remote()->transact(NOTIFY_AT, data, &reply);
         return reply.readInt32();
     }
 
@@ -424,6 +482,142 @@ public:
 
         return err;
     }
+
+    virtual VolumeShaper::Status applyVolumeShaper(
+            const sp<VolumeShaper::Configuration>& configuration,
+            const sp<VolumeShaper::Operation>& operation) {
+        Parcel data, reply;
+        data.writeInterfaceToken(IMediaPlayer::getInterfaceDescriptor());
+
+        status_t tmp;
+        status_t status = configuration.get() == nullptr
+                ? data.writeInt32(0)
+                : (tmp = data.writeInt32(1)) != NO_ERROR
+                    ? tmp : configuration->writeToParcel(&data);
+        if (status != NO_ERROR) {
+            return VolumeShaper::Status(status);
+        }
+
+        status = operation.get() == nullptr
+                ? status = data.writeInt32(0)
+                : (tmp = data.writeInt32(1)) != NO_ERROR
+                    ? tmp : operation->writeToParcel(&data);
+        if (status != NO_ERROR) {
+            return VolumeShaper::Status(status);
+        }
+
+        int32_t remoteVolumeShaperStatus;
+        status = remote()->transact(APPLY_VOLUME_SHAPER, data, &reply);
+        if (status == NO_ERROR) {
+            status = reply.readInt32(&remoteVolumeShaperStatus);
+        }
+        if (status != NO_ERROR) {
+            return VolumeShaper::Status(status);
+        }
+        return VolumeShaper::Status(remoteVolumeShaperStatus);
+    }
+
+    virtual sp<VolumeShaper::State> getVolumeShaperState(int id) {
+        Parcel data, reply;
+        data.writeInterfaceToken(IMediaPlayer::getInterfaceDescriptor());
+
+        data.writeInt32(id);
+        status_t status = remote()->transact(GET_VOLUME_SHAPER_STATE, data, &reply);
+        if (status != NO_ERROR) {
+            return nullptr;
+        }
+        sp<VolumeShaper::State> state = new VolumeShaper::State();
+        status = state->readFromParcel(&reply);
+        if (status != NO_ERROR) {
+            return nullptr;
+        }
+        return state;
+    }
+
+    // Modular DRM
+    status_t prepareDrm(const uint8_t uuid[16], const Vector<uint8_t>& drmSessionId)
+    {
+        Parcel data, reply;
+        data.writeInterfaceToken(IMediaPlayer::getInterfaceDescriptor());
+
+        data.write(uuid, 16);
+        writeVector(data, drmSessionId);
+
+        status_t status = remote()->transact(PREPARE_DRM, data, &reply);
+        if (status != OK) {
+            ALOGE("prepareDrm: binder call failed: %d", status);
+            return status;
+        }
+
+        return reply.readInt32();
+    }
+
+    status_t releaseDrm()
+    {
+        Parcel data, reply;
+        data.writeInterfaceToken(IMediaPlayer::getInterfaceDescriptor());
+
+        status_t status = remote()->transact(RELEASE_DRM, data, &reply);
+        if (status != OK) {
+            ALOGE("releaseDrm: binder call failed: %d", status);
+            return status;
+        }
+
+        return reply.readInt32();
+    }
+
+    status_t setOutputDevice(audio_port_handle_t deviceId)
+    {
+        Parcel data, reply;
+        data.writeInterfaceToken(IMediaPlayer::getInterfaceDescriptor());
+
+        data.writeInt32(deviceId);
+
+        status_t status = remote()->transact(SET_OUTPUT_DEVICE, data, &reply);
+        if (status != OK) {
+            ALOGE("setOutputDevice: binder call failed: %d", status);
+            return status;
+        }
+
+        return reply.readInt32();
+    }
+
+    status_t getRoutedDeviceId(audio_port_handle_t* deviceId)
+    {
+        Parcel data, reply;
+        data.writeInterfaceToken(IMediaPlayer::getInterfaceDescriptor());
+
+        status_t status = remote()->transact(GET_ROUTED_DEVICE_ID, data, &reply);
+        if (status != OK) {
+            ALOGE("getRoutedDeviceid: binder call failed: %d", status);
+            *deviceId = AUDIO_PORT_HANDLE_NONE;
+            return status;
+        }
+
+        status = reply.readInt32();
+        if (status != NO_ERROR) {
+            *deviceId = AUDIO_PORT_HANDLE_NONE;
+        } else {
+            *deviceId = reply.readInt32();
+        }
+        return status;
+    }
+
+    status_t enableAudioDeviceCallback(bool enabled)
+    {
+        Parcel data, reply;
+        data.writeInterfaceToken(IMediaPlayer::getInterfaceDescriptor());
+
+        data.writeBool(enabled);
+
+        status_t status = remote()->transact(ENABLE_AUDIO_DEVICE_CALLBACK, data, &reply);
+        if (status != OK) {
+            ALOGE("enableAudioDeviceCallback: binder call failed: %d, %d", enabled, status);
+            return status;
+        }
+
+        return reply.readInt32();
+    }
 };
 
 IMPLEMENT_META_INTERFACE(MediaPlayer, "android.media.IMediaPlayer");
@@ -449,6 +643,10 @@ status_t BnMediaPlayer::onTransact(
             }
 
             const char* url = data.readCString();
+            if (url == NULL) {
+                reply->writeInt32(BAD_VALUE);
+                return NO_ERROR;
+            }
             KeyedVector<String8, String8> headers;
             int32_t numHeaders = data.readInt32();
             for (int i = 0; i < numHeaders; ++i) {
@@ -472,14 +670,22 @@ status_t BnMediaPlayer::onTransact(
             CHECK_INTERFACE(IMediaPlayer, data, reply);
             sp<IStreamSource> source =
                 interface_cast<IStreamSource>(data.readStrongBinder());
-            reply->writeInt32(setDataSource(source));
+            if (source == NULL) {
+                reply->writeInt32(BAD_VALUE);
+            } else {
+                reply->writeInt32(setDataSource(source));
+            }
             return NO_ERROR;
         }
         case SET_DATA_SOURCE_CALLBACK: {
             CHECK_INTERFACE(IMediaPlayer, data, reply);
             sp<IDataSource> source =
                 interface_cast<IDataSource>(data.readStrongBinder());
-            reply->writeInt32(setDataSource(source));
+            if (source == NULL) {
+                reply->writeInt32(BAD_VALUE);
+            } else {
+                reply->writeInt32(setDataSource(source));
+            }
             return NO_ERROR;
         }
         case SET_VIDEO_SURFACETEXTURE: {
@@ -487,6 +693,25 @@ status_t BnMediaPlayer::onTransact(
             sp<IGraphicBufferProducer> bufferProducer =
                     interface_cast<IGraphicBufferProducer>(data.readStrongBinder());
             reply->writeInt32(setVideoSurfaceTexture(bufferProducer));
+            return NO_ERROR;
+        } break;
+        case SET_BUFFERING_SETTINGS: {
+            CHECK_INTERFACE(IMediaPlayer, data, reply);
+            BufferingSettings buffering;
+            buffering.mInitialMarkMs = data.readInt32();
+            buffering.mResumePlaybackMarkMs = data.readInt32();
+            reply->writeInt32(setBufferingSettings(buffering));
+            return NO_ERROR;
+        } break;
+        case GET_BUFFERING_SETTINGS: {
+            CHECK_INTERFACE(IMediaPlayer, data, reply);
+            BufferingSettings buffering;
+            status_t err = getBufferingSettings(&buffering);
+            reply->writeInt32(err);
+            if (err == OK) {
+                reply->writeInt32(buffering.mInitialMarkMs);
+                reply->writeInt32(buffering.mResumePlaybackMarkMs);
+            }
             return NO_ERROR;
         } break;
         case PREPARE_ASYNC: {
@@ -566,7 +791,9 @@ status_t BnMediaPlayer::onTransact(
         } break;
         case SEEK_TO: {
             CHECK_INTERFACE(IMediaPlayer, data, reply);
-            reply->writeInt32(seekTo(data.readInt32()));
+            int msec = data.readInt32();
+            MediaPlayerSeekMode mode = (MediaPlayerSeekMode)data.readInt32();
+            reply->writeInt32(seekTo(msec, mode));
             return NO_ERROR;
         } break;
         case GET_CURRENT_POSITION: {
@@ -588,6 +815,11 @@ status_t BnMediaPlayer::onTransact(
         case RESET: {
             CHECK_INTERFACE(IMediaPlayer, data, reply);
             reply->writeInt32(reset());
+            return NO_ERROR;
+        } break;
+        case NOTIFY_AT: {
+            CHECK_INTERFACE(IMediaPlayer, data, reply);
+            reply->writeInt32(notifyAt(data.readInt64()));
             return NO_ERROR;
         } break;
         case SET_AUDIO_STREAM_TYPE: {
@@ -687,6 +919,99 @@ status_t BnMediaPlayer::onTransact(
 
             return NO_ERROR;
         } break;
+
+        case APPLY_VOLUME_SHAPER: {
+            CHECK_INTERFACE(IMediaPlayer, data, reply);
+            sp<VolumeShaper::Configuration> configuration;
+            sp<VolumeShaper::Operation> operation;
+
+            int32_t present;
+            status_t status = data.readInt32(&present);
+            if (status == NO_ERROR && present != 0) {
+                configuration = new VolumeShaper::Configuration();
+                status = configuration->readFromParcel(&data);
+            }
+            if (status == NO_ERROR) {
+                status = data.readInt32(&present);
+            }
+            if (status == NO_ERROR && present != 0) {
+                operation = new VolumeShaper::Operation();
+                status = operation->readFromParcel(&data);
+            }
+            if (status == NO_ERROR) {
+                status = (status_t)applyVolumeShaper(configuration, operation);
+            }
+            reply->writeInt32(status);
+            return NO_ERROR;
+        } break;
+        case GET_VOLUME_SHAPER_STATE: {
+            CHECK_INTERFACE(IMediaPlayer, data, reply);
+            int id;
+            status_t status = data.readInt32(&id);
+            if (status == NO_ERROR) {
+                sp<VolumeShaper::State> state = getVolumeShaperState(id);
+                if (state.get() != nullptr) {
+                     status = state->writeToParcel(reply);
+                }
+            }
+            return NO_ERROR;
+        } break;
+
+        // Modular DRM
+        case PREPARE_DRM: {
+            CHECK_INTERFACE(IMediaPlayer, data, reply);
+
+            uint8_t uuid[16];
+            data.read(uuid, sizeof(uuid));
+            Vector<uint8_t> drmSessionId;
+            readVector(data, drmSessionId);
+
+            uint32_t result = prepareDrm(uuid, drmSessionId);
+            reply->writeInt32(result);
+            return OK;
+        }
+        case RELEASE_DRM: {
+            CHECK_INTERFACE(IMediaPlayer, data, reply);
+
+            uint32_t result = releaseDrm();
+            reply->writeInt32(result);
+            return OK;
+        }
+
+        // AudioRouting
+        case SET_OUTPUT_DEVICE: {
+            CHECK_INTERFACE(IMediaPlayer, data, reply);
+            int deviceId;
+            status_t status = data.readInt32(&deviceId);
+            if (status == NO_ERROR) {
+                reply->writeInt32(setOutputDevice(deviceId));
+            } else {
+                reply->writeInt32(BAD_VALUE);
+            }
+            return NO_ERROR;
+        }
+        case GET_ROUTED_DEVICE_ID: {
+            CHECK_INTERFACE(IMediaPlayer, data, reply);
+            audio_port_handle_t deviceId;
+            status_t ret = getRoutedDeviceId(&deviceId);
+            reply->writeInt32(ret);
+            if (ret == NO_ERROR) {
+                reply->writeInt32(deviceId);
+            }
+            return NO_ERROR;
+        } break;
+        case ENABLE_AUDIO_DEVICE_CALLBACK: {
+            CHECK_INTERFACE(IMediaPlayer, data, reply);
+            bool enabled;
+            status_t status = data.readBool(&enabled);
+            if (status == NO_ERROR) {
+                reply->writeInt32(enableAudioDeviceCallback(enabled));
+            } else {
+                reply->writeInt32(BAD_VALUE);
+            }
+            return NO_ERROR;
+        } break;
+
         default:
             return BBinder::onTransact(code, data, reply, flags);
     }

@@ -45,12 +45,13 @@ enum {
 class BpSoundTriggerHwService: public BpInterface<ISoundTriggerHwService>
 {
 public:
-    BpSoundTriggerHwService(const sp<IBinder>& impl)
+    explicit BpSoundTriggerHwService(const sp<IBinder>& impl)
         : BpInterface<ISoundTriggerHwService>(impl)
     {
     }
 
-    virtual status_t listModules(struct sound_trigger_module_descriptor *modules,
+    virtual status_t listModules(const String16& opPackageName,
+                                 struct sound_trigger_module_descriptor *modules,
                                  uint32_t *numModules)
     {
         if (numModules == NULL || (*numModules != 0 && modules == NULL)) {
@@ -58,6 +59,7 @@ public:
         }
         Parcel data, reply;
         data.writeInterfaceToken(ISoundTriggerHwService::getInterfaceDescriptor());
+        data.writeString16(opPackageName);
         unsigned int numModulesReq = (modules == NULL) ? 0 : *numModules;
         data.writeInt32(numModulesReq);
         status_t status = remote()->transact(LIST_MODULES, data, &reply);
@@ -77,16 +79,21 @@ public:
         return status;
     }
 
-    virtual status_t attach(const sound_trigger_module_handle_t handle,
+    virtual status_t attach(const String16& opPackageName,
+                            const sound_trigger_module_handle_t handle,
                             const sp<ISoundTriggerClient>& client,
                             sp<ISoundTrigger>& module)
     {
         Parcel data, reply;
         data.writeInterfaceToken(ISoundTriggerHwService::getInterfaceDescriptor());
+        data.writeString16(opPackageName);
         data.write(&handle, sizeof(sound_trigger_module_handle_t));
         data.writeStrongBinder(IInterface::asBinder(client));
-        remote()->transact(ATTACH, data, &reply);
-        status_t status = reply.readInt32();
+        status_t status = remote()->transact(ATTACH, data, &reply);
+        if (status != NO_ERROR) {
+            return status;
+        }
+        status = reply.readInt32();
         if (reply.readInt32() != 0) {
             module = interface_cast<ISoundTrigger>(reply.readStrongBinder());
         }
@@ -117,6 +124,11 @@ status_t BnSoundTriggerHwService::onTransact(
     switch(code) {
         case LIST_MODULES: {
             CHECK_INTERFACE(ISoundTriggerHwService, data, reply);
+            String16 opPackageName;
+            status_t status = data.readString16(&opPackageName);
+            if (status != NO_ERROR) {
+                return status;
+            }
             unsigned int numModulesReq = data.readInt32();
             if (numModulesReq > MAX_ITEMS_PER_LIST) {
                 numModulesReq = MAX_ITEMS_PER_LIST;
@@ -130,7 +142,7 @@ status_t BnSoundTriggerHwService::onTransact(
                 reply->writeInt32(0);
                 return NO_ERROR;
             }
-            status_t status = listModules(modules, &numModules);
+            status = listModules(opPackageName, modules, &numModules);
             reply->writeInt32(status);
             reply->writeInt32(numModules);
             ALOGV("LIST_MODULES status %d got numModules %d", status, numModules);
@@ -148,12 +160,17 @@ status_t BnSoundTriggerHwService::onTransact(
 
         case ATTACH: {
             CHECK_INTERFACE(ISoundTriggerHwService, data, reply);
+            String16 opPackageName;
+            status_t status = data.readString16(&opPackageName);
+            if (status != NO_ERROR) {
+                return status;
+            }
             sound_trigger_module_handle_t handle;
             data.read(&handle, sizeof(sound_trigger_module_handle_t));
             sp<ISoundTriggerClient> client =
                     interface_cast<ISoundTriggerClient>(data.readStrongBinder());
             sp<ISoundTrigger> module;
-            status_t status = attach(handle, client, module);
+            status = attach(opPackageName, handle, client, module);
             reply->writeInt32(status);
             if (module != 0) {
                 reply->writeInt32(1);

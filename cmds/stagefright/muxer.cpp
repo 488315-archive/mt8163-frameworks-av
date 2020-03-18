@@ -29,7 +29,6 @@
 #include <media/stagefright/foundation/ALooper.h>
 #include <media/stagefright/foundation/AMessage.h>
 #include <media/stagefright/foundation/AString.h>
-#include <media/stagefright/DataSource.h>
 #include <media/stagefright/MediaCodec.h>
 #include <media/stagefright/MediaDefs.h>
 #include <media/stagefright/MediaMuxer.h>
@@ -43,6 +42,7 @@ static void usage(const char *me) {
     fprintf(stderr, "       -h help\n");
     fprintf(stderr, "       -a use audio\n");
     fprintf(stderr, "       -v use video\n");
+    fprintf(stderr, "       -w mux into WebM container (default is MP4)\n");
     fprintf(stderr, "       -s Time in milli-seconds when the trim should start\n");
     fprintf(stderr, "       -e Time in milli-seconds when the trim should end\n");
     fprintf(stderr, "       -o output file name. Default is /sdcard/muxeroutput.mp4\n");
@@ -60,7 +60,8 @@ static int muxing(
         bool enableTrim,
         int trimStartTimeMs,
         int trimEndTimeMs,
-        int rotationDegrees) {
+        int rotationDegrees,
+        MediaMuxer::OutputFormat container = MediaMuxer::OUTPUT_FORMAT_MPEG_4) {
     sp<NuMediaExtractor> extractor = new NuMediaExtractor;
     if (extractor->setDataSource(NULL /* httpService */, path) != OK) {
         fprintf(stderr, "unable to instantiate extractor. %s\n", path);
@@ -80,8 +81,7 @@ static int muxing(
         ALOGE("couldn't open file");
         return fd;
     }
-    sp<MediaMuxer> muxer = new MediaMuxer(fd,
-                                          MediaMuxer::OUTPUT_FORMAT_MPEG_4);
+    sp<MediaMuxer> muxer = new MediaMuxer(fd, container);
     close(fd);
 
     size_t trackCount = extractor->countTracks();
@@ -237,9 +237,10 @@ int main(int argc, char **argv) {
     // When trimStartTimeMs and trimEndTimeMs seems valid, we turn this switch
     // to true.
     bool enableTrim = false;
+    MediaMuxer::OutputFormat container = MediaMuxer::OUTPUT_FORMAT_MPEG_4;
 
     int res;
-    while ((res = getopt(argc, argv, "h?avo:s:e:r:")) >= 0) {
+    while ((res = getopt(argc, argv, "h?avo:s:e:r:w")) >= 0) {
         switch (res) {
             case 'a':
             {
@@ -250,6 +251,12 @@ int main(int argc, char **argv) {
             case 'v':
             {
                 useVideo = true;
+                break;
+            }
+
+            case 'w':
+            {
+                container = MediaMuxer::OUTPUT_FORMAT_WEBM;
                 break;
             }
 
@@ -311,14 +318,11 @@ int main(int argc, char **argv) {
     }
     ProcessState::self()->startThreadPool();
 
-    // Make sure setDataSource() works.
-    DataSource::RegisterDefaultSniffers();
-
     sp<ALooper> looper = new ALooper;
     looper->start();
 
     int result = muxing(argv[0], useAudio, useVideo, outputFileName,
-                        enableTrim, trimStartTimeMs, trimEndTimeMs, rotationDegrees);
+                        enableTrim, trimStartTimeMs, trimEndTimeMs, rotationDegrees, container);
 
     looper->stop();
 

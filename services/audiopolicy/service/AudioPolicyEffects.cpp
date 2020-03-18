@@ -1,9 +1,4 @@
 /*
-* Copyright (C) 2014 MediaTek Inc.
-* Modification based on code covered by the mentioned copyright
-* and/or permission notice(s).
-*/
-/*
  * Copyright (C) 2014 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,27 +16,25 @@
 
 #define LOG_TAG "AudioPolicyEffects"
 //#define LOG_NDEBUG 0
-#ifdef MTK_AUDIO
+#if defined(MTK_AUDIO_DEBUG) && defined(CONFIG_MT_ENG_BUILD)
 #define LOG_NDEBUG 0
 #endif
 
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <memory>
 #include <cutils/misc.h>
 #include <media/AudioEffect.h>
+#include <media/EffectsConfig.h>
+#include <mediautils/ServiceUtilities.h>
 #include <system/audio.h>
-#ifdef MTK_AUDIO
-#include <hardware/audio_effect_mtk.h>
-#else
-#include <hardware/audio_effect.h>
-#endif
-#include <audio_effects/audio_effects_conf.h>
+#include <system/audio_effects/audio_effects_conf.h>
 #include <utils/Vector.h>
 #include <utils/SortedVector.h>
 #include <cutils/config_utils.h>
+#include <binder/IPCThreadState.h>
 #include "AudioPolicyEffects.h"
-#include "ServiceUtilities.h"
 
 namespace android {
 
@@ -51,11 +44,17 @@ namespace android {
 
 AudioPolicyEffects::AudioPolicyEffects()
 {
-    // load automatic audio effect modules
-    if (access(AUDIO_EFFECT_VENDOR_CONFIG_FILE, R_OK) == 0) {
-        loadAudioEffectConfig(AUDIO_EFFECT_VENDOR_CONFIG_FILE);
-    } else if (access(AUDIO_EFFECT_DEFAULT_CONFIG_FILE, R_OK) == 0) {
-        loadAudioEffectConfig(AUDIO_EFFECT_DEFAULT_CONFIG_FILE);
+    status_t loadResult = loadAudioEffectXmlConfig();
+    if (loadResult < 0) {
+        ALOGW("Failed to load XML effect configuration, fallback to .conf");
+        // load automatic audio effect modules
+        if (access(AUDIO_EFFECT_VENDOR_CONFIG_FILE, R_OK) == 0) {
+            loadAudioEffectConfig(AUDIO_EFFECT_VENDOR_CONFIG_FILE);
+        } else if (access(AUDIO_EFFECT_DEFAULT_CONFIG_FILE, R_OK) == 0) {
+            loadAudioEffectConfig(AUDIO_EFFECT_DEFAULT_CONFIG_FILE);
+        }
+    } else if (loadResult > 0) {
+        ALOGE("Effect config is partially invalid, skipped %d elements", loadResult);
     }
 }
 
@@ -69,11 +68,11 @@ AudioPolicyEffects::~AudioPolicyEffects()
     }
     mInputSources.clear();
 
-    for (i = 0; i < mInputs.size(); i++) {
-        mInputs.valueAt(i)->mEffects.clear();
-        delete mInputs.valueAt(i);
+    for (i = 0; i < mInputSessions.size(); i++) {
+        mInputSessions.valueAt(i)->mEffects.clear();
+        delete mInputSessions.valueAt(i);
     }
-    mInputs.clear();
+    mInputSessions.clear();
 
     // release audio output processing resources
     for (i = 0; i < mOutputStreams.size(); i++) {
@@ -91,7 +90,7 @@ AudioPolicyEffects::~AudioPolicyEffects()
 
 status_t AudioPolicyEffects::addInputEffects(audio_io_handle_t input,
                              audio_source_t inputSource,
-                             int audioSession)
+                             audio_session_t audioSession)
 {
     status_t status = NO_ERROR;
 
@@ -105,19 +104,20 @@ status_t AudioPolicyEffects::addInputEffects(audio_io_handle_t input,
         ALOGV("addInputEffects(): no processing needs to be attached to this source");
         return status;
     }
-    ssize_t idx = mInputs.indexOfKey(input);
-    EffectVector *inputDesc;
+    ssize_t idx = mInputSessions.indexOfKey(audioSession);
+    EffectVector *sessionDesc;
     if (idx < 0) {
-        inputDesc = new EffectVector(audioSession);
-        mInputs.add(input, inputDesc);
+        sessionDesc = new EffectVector(audioSession);
+        mInputSessions.add(audioSession, sessionDesc);
     } else {
         // EffectVector is existing and we just need to increase ref count
-        inputDesc = mInputs.valueAt(idx);
+        sessionDesc = mInputSessions.valueAt(idx);
     }
-    inputDesc->mRefCount++;
+    sessionDesc->mRefCount++;
 
-    ALOGV("addInputEffects(): input: %d, refCount: %d", input, inputDesc->mRefCount);
-    if (inputDesc->mRefCount == 1) {
+    ALOGV("addInputEffects(): input: %d, refCount: %d", input, sessionDesc->mRefCount);
+    if (sessionDesc->mRefCount == 1) {
+        int64_t token = IPCThreadState::self()->clearCallingIdentity();
         Vector <EffectDesc *> effects = mInputSources.valueAt(index)->mEffects;
         for (size_t i = 0; i < effects.size(); i++) {
             EffectDesc *effect = effects[i];
@@ -135,36 +135,38 @@ status_t AudioPolicyEffects::addInputEffects(audio_io_handle_t input,
             }
             ALOGV("addInputEffects(): added Fx %s on source: %d",
                   effect->mName, (int32_t)aliasSource);
-            inputDesc->mEffects.add(fx);
+            sessionDesc->mEffects.add(fx);
         }
-        inputDesc->setProcessorEnabled(true);
+        sessionDesc->setProcessorEnabled(true);
+        IPCThreadState::self()->restoreCallingIdentity(token);
     }
     return status;
 }
 
 
-status_t AudioPolicyEffects::releaseInputEffects(audio_io_handle_t input)
+status_t AudioPolicyEffects::releaseInputEffects(audio_io_handle_t input,
+                                                 audio_session_t audioSession)
 {
     status_t status = NO_ERROR;
 
     Mutex::Autolock _l(mLock);
-    ssize_t index = mInputs.indexOfKey(input);
+    ssize_t index = mInputSessions.indexOfKey(audioSession);
     if (index < 0) {
         return status;
     }
-    EffectVector *inputDesc = mInputs.valueAt(index);
-    inputDesc->mRefCount--;
-    ALOGV("releaseInputEffects(): input: %d, refCount: %d", input, inputDesc->mRefCount);
-    if (inputDesc->mRefCount == 0) {
-        inputDesc->setProcessorEnabled(false);
-        delete inputDesc;
-        mInputs.removeItemsAt(index);
+    EffectVector *sessionDesc = mInputSessions.valueAt(index);
+    sessionDesc->mRefCount--;
+    ALOGV("releaseInputEffects(): input: %d, refCount: %d", input, sessionDesc->mRefCount);
+    if (sessionDesc->mRefCount == 0) {
+        sessionDesc->setProcessorEnabled(false);
+        delete sessionDesc;
+        mInputSessions.removeItemsAt(index);
         ALOGV("releaseInputEffects(): all effects released");
     }
     return status;
 }
 
-status_t AudioPolicyEffects::queryDefaultInputEffects(int audioSession,
+status_t AudioPolicyEffects::queryDefaultInputEffects(audio_session_t audioSession,
                                                       effect_descriptor_t *descriptors,
                                                       uint32_t *count)
 {
@@ -172,16 +174,16 @@ status_t AudioPolicyEffects::queryDefaultInputEffects(int audioSession,
 
     Mutex::Autolock _l(mLock);
     size_t index;
-    for (index = 0; index < mInputs.size(); index++) {
-        if (mInputs.valueAt(index)->mSessionId == audioSession) {
+    for (index = 0; index < mInputSessions.size(); index++) {
+        if (mInputSessions.valueAt(index)->mSessionId == audioSession) {
             break;
         }
     }
-    if (index == mInputs.size()) {
+    if (index == mInputSessions.size()) {
         *count = 0;
         return BAD_VALUE;
     }
-    Vector< sp<AudioEffect> > effects = mInputs.valueAt(index)->mEffects;
+    Vector< sp<AudioEffect> > effects = mInputSessions.valueAt(index)->mEffects;
 
     for (size_t i = 0; i < effects.size(); i++) {
         effect_descriptor_t desc = effects[i]->descriptor();
@@ -197,7 +199,7 @@ status_t AudioPolicyEffects::queryDefaultInputEffects(int audioSession,
 }
 
 
-status_t AudioPolicyEffects::queryDefaultOutputSessionEffects(int audioSession,
+status_t AudioPolicyEffects::queryDefaultOutputSessionEffects(audio_session_t audioSession,
                          effect_descriptor_t *descriptors,
                          uint32_t *count)
 {
@@ -232,7 +234,7 @@ status_t AudioPolicyEffects::queryDefaultOutputSessionEffects(int audioSession,
 
 status_t AudioPolicyEffects::addOutputSessionEffects(audio_io_handle_t output,
                          audio_stream_type_t stream,
-                         int audioSession)
+                         audio_session_t audioSession)
 {
     status_t status = NO_ERROR;
 
@@ -263,6 +265,8 @@ status_t AudioPolicyEffects::addOutputSessionEffects(audio_io_handle_t output,
     ALOGV("addOutputSessionEffects(): session: %d, refCount: %d",
           audioSession, procDesc->mRefCount);
     if (procDesc->mRefCount == 1) {
+        // make sure effects are associated to audio server even if we are executing a binder call
+        int64_t token = IPCThreadState::self()->clearCallingIdentity();
         Vector <EffectDesc *> effects = mOutputStreams.valueAt(index)->mEffects;
         for (size_t i = 0; i < effects.size(); i++) {
             EffectDesc *effect = effects[i];
@@ -281,13 +285,14 @@ status_t AudioPolicyEffects::addOutputSessionEffects(audio_io_handle_t output,
         }
 
         procDesc->setProcessorEnabled(true);
+        IPCThreadState::self()->restoreCallingIdentity(token);
     }
     return status;
 }
 
 status_t AudioPolicyEffects::releaseOutputSessionEffects(audio_io_handle_t output,
                          audio_stream_type_t stream,
-                         int audioSession)
+                         audio_session_t audioSession)
 {
     status_t status = NO_ERROR;
     (void) output; // argument not used for now
@@ -315,6 +320,201 @@ status_t AudioPolicyEffects::releaseOutputSessionEffects(audio_io_handle_t outpu
     return status;
 }
 
+status_t AudioPolicyEffects::addSourceDefaultEffect(const effect_uuid_t *type,
+                                                    const String16& opPackageName,
+                                                    const effect_uuid_t *uuid,
+                                                    int32_t priority,
+                                                    audio_source_t source,
+                                                    audio_unique_id_t* id)
+{
+    if (uuid == NULL || type == NULL) {
+        ALOGE("addSourceDefaultEffect(): Null uuid or type uuid pointer");
+        return BAD_VALUE;
+    }
+
+    // HOTWORD, FM_TUNER and ECHO_REFERENCE are special case sources > MAX.
+    if (source < AUDIO_SOURCE_DEFAULT ||
+            (source > AUDIO_SOURCE_MAX &&
+             source != AUDIO_SOURCE_HOTWORD &&
+             source != AUDIO_SOURCE_FM_TUNER &&
+             source != AUDIO_SOURCE_ECHO_REFERENCE)) {
+        ALOGE("addSourceDefaultEffect(): Unsupported source type %d", source);
+        return BAD_VALUE;
+    }
+
+    // Check that |uuid| or |type| corresponds to an effect on the system.
+    effect_descriptor_t descriptor = {};
+    status_t res = AudioEffect::getEffectDescriptor(
+            uuid, type, EFFECT_FLAG_TYPE_PRE_PROC, &descriptor);
+    if (res != OK) {
+        ALOGE("addSourceDefaultEffect(): Failed to find effect descriptor matching uuid/type.");
+        return res;
+    }
+
+    // Only pre-processing effects can be added dynamically as source defaults.
+    if ((descriptor.flags & EFFECT_FLAG_TYPE_MASK) != EFFECT_FLAG_TYPE_PRE_PROC) {
+        ALOGE("addSourceDefaultEffect(): Desired effect cannot be attached "
+              "as a source default effect.");
+        return BAD_VALUE;
+    }
+
+    Mutex::Autolock _l(mLock);
+
+    // Find the EffectDescVector for the given source type, or create a new one if necessary.
+    ssize_t index = mInputSources.indexOfKey(source);
+    EffectDescVector *desc = NULL;
+    if (index < 0) {
+        // No effects for this source type yet.
+        desc = new EffectDescVector();
+        mInputSources.add(source, desc);
+    } else {
+        desc = mInputSources.valueAt(index);
+    }
+
+    // Create a new effect and add it to the vector.
+    res = AudioEffect::newEffectUniqueId(id);
+    if (res != OK) {
+        ALOGE("addSourceDefaultEffect(): failed to get new unique id.");
+        return res;
+    }
+    EffectDesc *effect = new EffectDesc(
+            descriptor.name, *type, opPackageName, *uuid, priority, *id);
+    desc->mEffects.add(effect);
+    // TODO(b/71813697): Support setting params as well.
+
+    // TODO(b/71814300): Retroactively attach to any existing sources of the given type.
+    // This requires tracking the source type of each session id in addition to what is
+    // already being tracked.
+
+    return NO_ERROR;
+}
+
+status_t AudioPolicyEffects::addStreamDefaultEffect(const effect_uuid_t *type,
+                                                    const String16& opPackageName,
+                                                    const effect_uuid_t *uuid,
+                                                    int32_t priority,
+                                                    audio_usage_t usage,
+                                                    audio_unique_id_t* id)
+{
+    if (uuid == NULL || type == NULL) {
+        ALOGE("addStreamDefaultEffect(): Null uuid or type uuid pointer");
+        return BAD_VALUE;
+    }
+    audio_stream_type_t stream = AudioSystem::attributesToStreamType(attributes_initializer(usage));
+
+    if (stream < AUDIO_STREAM_MIN || stream >= AUDIO_STREAM_PUBLIC_CNT) {
+        ALOGE("addStreamDefaultEffect(): Unsupported stream type %d", stream);
+        return BAD_VALUE;
+    }
+
+    // Check that |uuid| or |type| corresponds to an effect on the system.
+    effect_descriptor_t descriptor = {};
+    status_t res = AudioEffect::getEffectDescriptor(
+            uuid, type, EFFECT_FLAG_TYPE_INSERT, &descriptor);
+    if (res != OK) {
+        ALOGE("addStreamDefaultEffect(): Failed to find effect descriptor matching uuid/type.");
+        return res;
+    }
+
+    // Only insert effects can be added dynamically as stream defaults.
+    if ((descriptor.flags & EFFECT_FLAG_TYPE_MASK) != EFFECT_FLAG_TYPE_INSERT) {
+        ALOGE("addStreamDefaultEffect(): Desired effect cannot be attached "
+              "as a stream default effect.");
+        return BAD_VALUE;
+    }
+
+    Mutex::Autolock _l(mLock);
+
+    // Find the EffectDescVector for the given stream type, or create a new one if necessary.
+    ssize_t index = mOutputStreams.indexOfKey(stream);
+    EffectDescVector *desc = NULL;
+    if (index < 0) {
+        // No effects for this stream type yet.
+        desc = new EffectDescVector();
+        mOutputStreams.add(stream, desc);
+    } else {
+        desc = mOutputStreams.valueAt(index);
+    }
+
+    // Create a new effect and add it to the vector.
+    res = AudioEffect::newEffectUniqueId(id);
+    if (res != OK) {
+        ALOGE("addStreamDefaultEffect(): failed to get new unique id.");
+        return res;
+    }
+    EffectDesc *effect = new EffectDesc(
+            descriptor.name, *type, opPackageName, *uuid, priority, *id);
+    desc->mEffects.add(effect);
+    // TODO(b/71813697): Support setting params as well.
+
+    // TODO(b/71814300): Retroactively attach to any existing streams of the given type.
+    // This requires tracking the stream type of each session id in addition to what is
+    // already being tracked.
+
+    return NO_ERROR;
+}
+
+status_t AudioPolicyEffects::removeSourceDefaultEffect(audio_unique_id_t id)
+{
+    if (id == AUDIO_UNIQUE_ID_ALLOCATE) {
+        // ALLOCATE is not a unique identifier, but rather a reserved value indicating
+        // a real id has not been assigned. For default effects, this value is only used
+        // by system-owned defaults from the loaded config, which cannot be removed.
+        return BAD_VALUE;
+    }
+
+    Mutex::Autolock _l(mLock);
+
+    // Check each source type.
+    size_t numSources = mInputSources.size();
+    for (size_t i = 0; i < numSources; ++i) {
+        // Check each effect for each source.
+        EffectDescVector* descVector = mInputSources[i];
+        for (auto desc = descVector->mEffects.begin(); desc != descVector->mEffects.end(); ++desc) {
+            if ((*desc)->mId == id) {
+                // Found it!
+                // TODO(b/71814300): Remove from any sources the effect was attached to.
+                descVector->mEffects.erase(desc);
+                // Handles are unique; there can only be one match, so return early.
+                return NO_ERROR;
+            }
+        }
+    }
+
+    // Effect wasn't found, so it's been trivially removed successfully.
+    return NO_ERROR;
+}
+
+status_t AudioPolicyEffects::removeStreamDefaultEffect(audio_unique_id_t id)
+{
+    if (id == AUDIO_UNIQUE_ID_ALLOCATE) {
+        // ALLOCATE is not a unique identifier, but rather a reserved value indicating
+        // a real id has not been assigned. For default effects, this value is only used
+        // by system-owned defaults from the loaded config, which cannot be removed.
+        return BAD_VALUE;
+    }
+
+    Mutex::Autolock _l(mLock);
+
+    // Check each stream type.
+    size_t numStreams = mOutputStreams.size();
+    for (size_t i = 0; i < numStreams; ++i) {
+        // Check each effect for each stream.
+        EffectDescVector* descVector = mOutputStreams[i];
+        for (auto desc = descVector->mEffects.begin(); desc != descVector->mEffects.end(); ++desc) {
+            if ((*desc)->mId == id) {
+                // Found it!
+                // TODO(b/71814300): Remove from any streams the effect was attached to.
+                descVector->mEffects.erase(desc);
+                // Handles are unique; there can only be one match, so return early.
+                return NO_ERROR;
+            }
+        }
+    }
+
+    // Effect wasn't found, so it's been trivially removed successfully.
+    return NO_ERROR;
+}
 
 void AudioPolicyEffects::EffectVector::setProcessorEnabled(bool enabled)
 {
@@ -335,7 +535,9 @@ void AudioPolicyEffects::EffectVector::setProcessorEnabled(bool enabled)
     VOICE_CALL_SRC_TAG,
     CAMCORDER_SRC_TAG,
     VOICE_REC_SRC_TAG,
-    VOICE_COMM_SRC_TAG
+    VOICE_COMM_SRC_TAG,
+    UNPROCESSED_SRC_TAG,
+    VOICE_PERFORMANCE_SRC_TAG
 };
 
 // returns the audio_source_t enum corresponding to the input source name or
@@ -384,7 +586,7 @@ audio_stream_type_t AudioPolicyEffects::streamNameToEnum(const char *name)
 // Audio Effect Config parser
 // ----------------------------------------------------------------------------
 
-size_t AudioPolicyEffects::growParamSize(char *param,
+size_t AudioPolicyEffects::growParamSize(char **param,
                                          size_t size,
                                          size_t *curSize,
                                          size_t *totSize)
@@ -396,55 +598,84 @@ size_t AudioPolicyEffects::growParamSize(char *param,
         while (pos + size > *totSize) {
             *totSize += ((*totSize + 7) / 8) * 4;
         }
-        param = (char *)realloc(param, *totSize);
+        char *newParam = (char *)realloc(*param, *totSize);
+        if (newParam == NULL) {
+            ALOGE("%s realloc error for size %zu", __func__, *totSize);
+            return 0;
+        }
+        *param = newParam;
     }
     *curSize = pos + size;
     return pos;
 }
 
+
 size_t AudioPolicyEffects::readParamValue(cnode *node,
-                                          char *param,
+                                          char **param,
                                           size_t *curSize,
                                           size_t *totSize)
 {
+    size_t len = 0;
+    size_t pos;
+
     if (strncmp(node->name, SHORT_TAG, sizeof(SHORT_TAG) + 1) == 0) {
-        size_t pos = growParamSize(param, sizeof(short), curSize, totSize);
-        *(short *)((char *)param + pos) = (short)atoi(node->value);
-        ALOGV("readParamValue() reading short %d", *(short *)((char *)param + pos));
-        return sizeof(short);
-    } else if (strncmp(node->name, INT_TAG, sizeof(INT_TAG) + 1) == 0) {
-        size_t pos = growParamSize(param, sizeof(int), curSize, totSize);
-        *(int *)((char *)param + pos) = atoi(node->value);
-        ALOGV("readParamValue() reading int %d", *(int *)((char *)param + pos));
-        return sizeof(int);
-    } else if (strncmp(node->name, FLOAT_TAG, sizeof(FLOAT_TAG) + 1) == 0) {
-        size_t pos = growParamSize(param, sizeof(float), curSize, totSize);
-        *(float *)((char *)param + pos) = (float)atof(node->value);
-        ALOGV("readParamValue() reading float %f",*(float *)((char *)param + pos));
-        return sizeof(float);
-    } else if (strncmp(node->name, BOOL_TAG, sizeof(BOOL_TAG) + 1) == 0) {
-        size_t pos = growParamSize(param, sizeof(bool), curSize, totSize);
-        if (strncmp(node->value, "false", strlen("false") + 1) == 0) {
-            *(bool *)((char *)param + pos) = false;
-        } else {
-            *(bool *)((char *)param + pos) = true;
+        pos = growParamSize(param, sizeof(short), curSize, totSize);
+        if (pos == 0) {
+            goto exit;
         }
-        ALOGV("readParamValue() reading bool %s",*(bool *)((char *)param + pos) ? "true" : "false");
-        return sizeof(bool);
+        *(short *)(*param + pos) = (short)atoi(node->value);
+        ALOGV("readParamValue() reading short %d", *(short *)(*param + pos));
+        len = sizeof(short);
+    } else if (strncmp(node->name, INT_TAG, sizeof(INT_TAG) + 1) == 0) {
+        pos = growParamSize(param, sizeof(int), curSize, totSize);
+        if (pos == 0) {
+            goto exit;
+        }
+        *(int *)(*param + pos) = atoi(node->value);
+        ALOGV("readParamValue() reading int %d", *(int *)(*param + pos));
+        len = sizeof(int);
+    } else if (strncmp(node->name, FLOAT_TAG, sizeof(FLOAT_TAG) + 1) == 0) {
+        pos = growParamSize(param, sizeof(float), curSize, totSize);
+        if (pos == 0) {
+            goto exit;
+        }
+        *(float *)(*param + pos) = (float)atof(node->value);
+        ALOGV("readParamValue() reading float %f",*(float *)(*param + pos));
+        len = sizeof(float);
+    } else if (strncmp(node->name, BOOL_TAG, sizeof(BOOL_TAG) + 1) == 0) {
+        pos = growParamSize(param, sizeof(bool), curSize, totSize);
+        if (pos == 0) {
+            goto exit;
+        }
+        if (strncmp(node->value, "true", strlen("true") + 1) == 0) {
+            *(bool *)(*param + pos) = true;
+        } else {
+            *(bool *)(*param + pos) = false;
+        }
+        ALOGV("readParamValue() reading bool %s",
+              *(bool *)(*param + pos) ? "true" : "false");
+        len = sizeof(bool);
     } else if (strncmp(node->name, STRING_TAG, sizeof(STRING_TAG) + 1) == 0) {
-        size_t len = strnlen(node->value, EFFECT_STRING_LEN_MAX);
+        len = strnlen(node->value, EFFECT_STRING_LEN_MAX);
         if (*curSize + len + 1 > *totSize) {
             *totSize = *curSize + len + 1;
-            param = (char *)realloc(param, *totSize);
+            char *newParam = (char *)realloc(*param, *totSize);
+            if (newParam == NULL) {
+                len = 0;
+                ALOGE("%s realloc error for string len %zu", __func__, *totSize);
+                goto exit;
+            }
+            *param = newParam;
         }
-        strncpy(param + *curSize, node->value, len);
+        strncpy(*param + *curSize, node->value, len);
         *curSize += len;
-        param[*curSize] = '\0';
-        ALOGV("readParamValue() reading string %s", param + *curSize - len);
-        return len;
+        (*param)[*curSize] = '\0';
+        ALOGV("readParamValue() reading string %s", *param + *curSize - len);
+    } else {
+        ALOGW("readParamValue() unknown param type %s", node->name);
     }
-    ALOGW("readParamValue() unknown param type %s", node->name);
-    return 0;
+exit:
+    return len;
 }
 
 effect_param_t *AudioPolicyEffects::loadEffectParameter(cnode *root)
@@ -455,6 +686,12 @@ effect_param_t *AudioPolicyEffects::loadEffectParameter(cnode *root)
     size_t totSize = sizeof(effect_param_t) + 2 * sizeof(int);
     effect_param_t *fx_param = (effect_param_t *)malloc(totSize);
 
+    if (fx_param == NULL) {
+        ALOGE("%s malloc error for effect structure of size %zu",
+              __func__, totSize);
+        return NULL;
+    }
+
     param = config_find(root, PARAM_TAG);
     value = config_find(root, VALUE_TAG);
     if (param == NULL && value == NULL) {
@@ -463,8 +700,10 @@ effect_param_t *AudioPolicyEffects::loadEffectParameter(cnode *root)
         if (param != NULL) {
             // Note: that a pair of random strings is read as 0 0
             int *ptr = (int *)fx_param->data;
+#if LOG_NDEBUG == 0
             int *ptr2 = (int *)((char *)param + sizeof(effect_param_t));
-            ALOGW("loadEffectParameter() ptr %p ptr2 %p", ptr, ptr2);
+            ALOGV("loadEffectParameter() ptr %p ptr2 %p", ptr, ptr2);
+#endif
             *ptr++ = atoi(param->name);
             *ptr = atoi(param->value);
             fx_param->psize = sizeof(int);
@@ -473,7 +712,8 @@ effect_param_t *AudioPolicyEffects::loadEffectParameter(cnode *root)
         }
     }
     if (param == NULL || value == NULL) {
-        ALOGW("loadEffectParameter() invalid parameter description %s", root->name);
+        ALOGW("loadEffectParameter() invalid parameter description %s",
+              root->name);
         goto error;
     }
 
@@ -481,7 +721,8 @@ effect_param_t *AudioPolicyEffects::loadEffectParameter(cnode *root)
     param = param->first_child;
     while (param) {
         ALOGV("loadEffectParameter() reading param of type %s", param->name);
-        size_t size = readParamValue(param, (char *)fx_param, &curSize, &totSize);
+        size_t size =
+                readParamValue(param, (char **)&fx_param, &curSize, &totSize);
         if (size == 0) {
             goto error;
         }
@@ -496,7 +737,8 @@ effect_param_t *AudioPolicyEffects::loadEffectParameter(cnode *root)
     value = value->first_child;
     while (value) {
         ALOGV("loadEffectParameter() reading value of type %s", value->name);
-        size_t size = readParamValue(value, (char *)fx_param, &curSize, &totSize);
+        size_t size =
+                readParamValue(value, (char **)&fx_param, &curSize, &totSize);
         if (size == 0) {
             goto error;
         }
@@ -507,7 +749,7 @@ effect_param_t *AudioPolicyEffects::loadEffectParameter(cnode *root)
     return fx_param;
 
 error:
-    delete fx_param;
+    free(fx_param);
     return NULL;
 }
 
@@ -517,11 +759,9 @@ void AudioPolicyEffects::loadEffectParameters(cnode *root, Vector <effect_param_
     while (node) {
         ALOGV("loadEffectParameters() loading param %s", node->name);
         effect_param_t *param = loadEffectParameter(node);
-        if (param == NULL) {
-            node = node->next;
-            continue;
+        if (param != NULL) {
+            params.add(param);
         }
-        params.add(param);
         node = node->next;
     }
 }
@@ -539,6 +779,7 @@ AudioPolicyEffects::EffectDescVector *AudioPolicyEffects::loadEffectConfig(
     EffectDescVector *desc = new EffectDescVector();
     while (node) {
         size_t i;
+
         for (i = 0; i < effects.size(); i++) {
             if (strncmp(effects[i]->mName, node->name, EFFECT_STRING_LEN_MAX) == 0) {
                 ALOGV("loadEffectConfig() found effect %s in list", node->name);
@@ -653,6 +894,28 @@ status_t AudioPolicyEffects::loadEffects(cnode *root, Vector <EffectDesc *>& eff
     return NO_ERROR;
 }
 
+status_t AudioPolicyEffects::loadAudioEffectXmlConfig() {
+    auto result = effectsConfig::parse();
+    if (result.parsedConfig == nullptr) {
+        return -ENOENT;
+    }
+
+    auto loadProcessingChain = [](auto& processingChain, auto& streams) {
+        for (auto& stream : processingChain) {
+            auto effectDescs = std::make_unique<EffectDescVector>();
+            for (auto& effect : stream.effects) {
+                effectDescs->mEffects.add(
+                        new EffectDesc{effect.get().name.c_str(), effect.get().uuid});
+            }
+            streams.add(stream.type, effectDescs.release());
+        }
+    };
+    loadProcessingChain(result.parsedConfig->preprocess, mInputSources);
+    loadProcessingChain(result.parsedConfig->postprocess, mOutputStreams);
+    // Casting from ssize_t to status_t is probably safe, there should not be more than 2^31 errors
+    return result.nbSkippedElement;
+}
+
 status_t AudioPolicyEffects::loadAudioEffectConfig(const char *path)
 {
     cnode *root;
@@ -682,4 +945,4 @@ status_t AudioPolicyEffects::loadAudioEffectConfig(const char *path)
 }
 
 
-}; // namespace android
+} // namespace android

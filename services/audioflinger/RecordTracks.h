@@ -24,45 +24,70 @@ class RecordTrack : public TrackBase {
 public:
                         RecordTrack(RecordThread *thread,
                                 const sp<Client>& client,
+                                const audio_attributes_t& attr,
                                 uint32_t sampleRate,
                                 audio_format_t format,
                                 audio_channel_mask_t channelMask,
                                 size_t frameCount,
                                 void *buffer,
-                                int sessionId,
-                                int uid,
-                                IAudioFlinger::track_flags_t flags,
-                                track_type type);
+                                size_t bufferSize,
+                                audio_session_t sessionId,
+                                pid_t creatorPid,
+                                uid_t uid,
+                                audio_input_flags_t flags,
+                                track_type type,
+                                audio_port_handle_t portId = AUDIO_PORT_HANDLE_NONE);
     virtual             ~RecordTrack();
     virtual status_t    initCheck() const;
 
-    virtual status_t    start(AudioSystem::sync_event_t event, int triggerSession);
+    virtual status_t    start(AudioSystem::sync_event_t event, audio_session_t triggerSession);
     virtual void        stop();
 
             void        destroy();
 
-            void        invalidate();
+    virtual void        invalidate();
             // clear the buffer overflow flag
             void        clearOverflow() { mOverflow = false; }
             // set the buffer overflow flag and return previous value
             bool        setOverflow() { bool tmp = mOverflow; mOverflow = true;
                                                 return tmp; }
 
-    static  void        appendDumpHeader(String8& result);
-            void        dump(char* buffer, size_t size, bool active);
+            void        appendDumpHeader(String8& result);
+            void        appendDump(String8& result, bool active);
 
             void        handleSyncStartEvent(const sp<SyncEvent>& event);
             void        clearSyncStartEvent();
 
+            void        updateTrackFrameInfo(int64_t trackFramesReleased,
+                                             int64_t sourceFramesRead,
+                                             uint32_t halSampleRate,
+                                             const ExtendedTimestamp &timestamp);
+
+    virtual bool        isFastTrack() const { return (mFlags & AUDIO_INPUT_FLAG_FAST) != 0; }
+            bool        isDirect() const override
+                                { return (mFlags & AUDIO_INPUT_FLAG_DIRECT) != 0; }
+
+            void        setSilenced(bool silenced) { if (!isPatchTrack()) mSilenced = silenced; }
+            bool        isSilenced() const { return mSilenced; }
+
+            status_t    getActiveMicrophones(std::vector<media::MicrophoneInfo>* activeMicrophones);
+
+            status_t    setPreferredMicrophoneDirection(audio_microphone_direction_t direction);
+            status_t    setPreferredMicrophoneFieldDimension(float zoom);
+
+    static  bool        checkServerLatencySupported(
+                                audio_format_t format, audio_input_flags_t flags) {
+                            return audio_is_linear_pcm(format)
+                                    && (flags & AUDIO_INPUT_FLAG_HW_AV_SYNC) == 0;
+                        }
+
 private:
     friend class AudioFlinger;  // for mState
 
-                        RecordTrack(const RecordTrack&);
-                        RecordTrack& operator = (const RecordTrack&);
+    DISALLOW_COPY_AND_ASSIGN(RecordTrack);
 
     // AudioBufferProvider interface
-    virtual status_t getNextBuffer(AudioBufferProvider::Buffer* buffer,
-                                   int64_t pts = kInvalidPTS);
+    virtual status_t getNextBuffer(AudioBufferProvider::Buffer* buffer);
     // releaseBuffer() not overridden
 
     bool                mOverflow;  // overflow on most recent attempt to fill client buffer
@@ -83,10 +108,13 @@ private:
 
             // used by the record thread to convert frames to proper destination format
             RecordBufferConverter              *mRecordBufferConverter;
+            audio_input_flags_t                mFlags;
+
+            bool                               mSilenced;
 };
 
 // playback track, used by PatchPanel
-class PatchRecord : virtual public RecordTrack, public PatchProxyBufferProvider {
+class PatchRecord : public RecordTrack, public PatchTrackBase {
 public:
 
     PatchRecord(RecordThread *recordThread,
@@ -95,23 +123,17 @@ public:
                 audio_format_t format,
                 size_t frameCount,
                 void *buffer,
-                IAudioFlinger::track_flags_t flags);
+                size_t bufferSize,
+                audio_input_flags_t flags,
+                const Timeout& timeout = {});
     virtual             ~PatchRecord();
 
     // AudioBufferProvider interface
-    virtual status_t getNextBuffer(AudioBufferProvider::Buffer* buffer,
-                                   int64_t pts);
+    virtual status_t getNextBuffer(AudioBufferProvider::Buffer* buffer);
     virtual void releaseBuffer(AudioBufferProvider::Buffer* buffer);
 
     // PatchProxyBufferProvider interface
     virtual status_t    obtainBuffer(Proxy::Buffer *buffer,
                                      const struct timespec *timeOut = NULL);
     virtual void        releaseBuffer(Proxy::Buffer *buffer);
-
-    void setPeerProxy(PatchProxyBufferProvider *proxy) { mPeerProxy = proxy; }
-
-private:
-    sp<ClientProxy>             mProxy;
-    PatchProxyBufferProvider*   mPeerProxy;
-    struct timespec             mPeerTimeout;
 };  // end of PatchRecord

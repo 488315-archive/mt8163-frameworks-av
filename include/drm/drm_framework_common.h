@@ -1,9 +1,4 @@
 /*
-* Copyright (C) 2014 MediaTek Inc.
-* Modification based on code covered by the mentioned copyright
-* and/or permission notice(s).
-*/
-/*
  * Copyright (C) 2010 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -28,7 +23,7 @@
 #include <utils/String8.h>
 #include <utils/Errors.h>
 
-#define INVALID_VALUE -1
+#define INVALID_VALUE (-1)
 
 namespace android {
 
@@ -191,11 +186,6 @@ public:
      * Constant field signifies that the content can displayed
      */
     static const int DISPLAY = 0x07;
-
-    // M: these 2 are added for OMA DRM v1.0 implementation.
-    static const int PRINT = 0x08;
-
-    static const int WALLPAPER = 0x09; // for FL only
 };
 
 /**
@@ -222,12 +212,6 @@ public:
      * Constant field signifies that the rights are not acquired for the content
      */
     static const int RIGHTS_NOT_ACQUIRED = 0x03;
-
-    // M: added for OMA DRM v1.0 implementation.
-    /**
-     * Constant field signifies that the secure timer is invalid
-     */
-    static const int SECURE_TIMER_INVALID = 0x04;
 };
 
 /**
@@ -250,10 +234,6 @@ public:
      * POSIX based Decrypt API set for container based DRM
      */
     static const int CONTAINER_BASED = 0x02;
-    /**
-     * Decrypt API for Widevine streams
-     */
-    static const int WV_BASED = 0x3;
 };
 
 /**
@@ -332,22 +312,6 @@ public:
             status(INVALID_VALUE),
             decryptInfo(NULL) {
 
-    }
-
-    // M: added for OMA DRM v1.0 implementation.
-    DecryptHandle(DecryptHandle* copy):
-            decryptId(copy->decryptId),
-            mimeType(copy->mimeType),
-            decryptApiType(copy->decryptApiType),
-            status(copy->status),
-            decryptInfo(NULL),
-            copyControlVector(copy->copyControlVector),
-            extendedData(copy->extendedData) {
-        if (NULL != copy->decryptInfo) {
-            decryptInfo = new DecryptInfo();
-            decryptInfo->decryptBufferLength =
-                copy->decryptInfo->decryptBufferLength;
-        }
     }
 
     ~DecryptHandle() {

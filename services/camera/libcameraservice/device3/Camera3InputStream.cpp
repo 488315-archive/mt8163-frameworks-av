@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2013 The Android Open Source Project
+ * Copyright (C) 2013-2018 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,10 +27,13 @@ namespace android {
 
 namespace camera3 {
 
+const String8 Camera3InputStream::DUMMY_ID;
+
 Camera3InputStream::Camera3InputStream(int id,
         uint32_t width, uint32_t height, int format) :
         Camera3IOStreamBase(id, CAMERA3_STREAM_INPUT, width, height, /*maxSize*/0,
-                            format, HAL_DATASPACE_UNKNOWN, CAMERA3_STREAM_ROTATION_0) {
+                            format, HAL_DATASPACE_UNKNOWN, CAMERA3_STREAM_ROTATION_0,
+                            DUMMY_ID) {
 
     if (format == HAL_PIXEL_FORMAT_BLOB) {
         ALOGE("%s: Bad format, BLOB not supported", __FUNCTION__);
@@ -85,6 +88,9 @@ status_t Camera3InputStream::getInputBufferLocked(
                         /*releaseFence*/-1, CAMERA3_BUFFER_STATUS_OK, /*output*/false);
     mBuffersInFlight.push_back(bufferItem);
 
+    mFrameCount++;
+    mLastTimestamp = bufferItem.mTimestamp;
+
     return OK;
 }
 
@@ -92,6 +98,7 @@ status_t Camera3InputStream::returnBufferCheckedLocked(
             const camera3_stream_buffer &buffer,
             nsecs_t timestamp,
             bool output,
+            const std::vector<size_t>&,
             /*out*/
             sp<Fence> *releaseFenceOut) {
 
@@ -116,6 +123,7 @@ status_t Camera3InputStream::returnBufferCheckedLocked(
                 bufferFound = true;
                 bufferItem = tmp;
                 mBuffersInFlight.erase(it);
+                break;
             }
         }
     }
@@ -169,7 +177,7 @@ status_t Camera3InputStream::getInputBufferProducerLocked(
     if (producer == NULL) {
         return BAD_VALUE;
     } else if (mProducer == NULL) {
-        ALOGE("%s: No input stream is configured");
+        ALOGE("%s: No input stream is configured", __FUNCTION__);
         return INVALID_OPERATION;
     }
 
@@ -219,6 +227,7 @@ status_t Camera3InputStream::configureQueueLocked() {
 
     mHandoutTotalBufferCount = 0;
     mFrameCount = 0;
+    mLastTimestamp = 0;
 
     if (mConsumer.get() == 0) {
         sp<IGraphicBufferProducer> producer;
@@ -253,11 +262,13 @@ status_t Camera3InputStream::configureQueueLocked() {
             camera3_stream::max_buffers : minBufs;
         // TODO: somehow set the total buffer count when producer connects?
 
-        mConsumer = new BufferItemConsumer(consumer, camera3_stream::usage,
+        mConsumer = new BufferItemConsumer(consumer, mUsage,
                                            mTotalBufferCount);
         mConsumer->setName(String8::format("Camera3-InputStream-%d", mId));
 
         mProducer = producer;
+
+        mConsumer->setBufferFreedListener(this);
     }
 
     res = mConsumer->setDefaultBufferSize(camera3_stream::width,
@@ -277,10 +288,31 @@ status_t Camera3InputStream::configureQueueLocked() {
     return OK;
 }
 
-status_t Camera3InputStream::getEndpointUsage(uint32_t *usage) const {
+status_t Camera3InputStream::getEndpointUsage(uint64_t *usage) const {
     // Per HAL3 spec, input streams have 0 for their initial usage field.
     *usage = 0;
     return OK;
+}
+
+void Camera3InputStream::onBufferFreed(const wp<GraphicBuffer>& gb) {
+    const sp<GraphicBuffer> buffer = gb.promote();
+    if (buffer != nullptr) {
+        camera3_stream_buffer streamBuffer =
+                {nullptr, &buffer->handle, 0, -1, -1};
+        // Check if this buffer is outstanding.
+        if (isOutstandingBuffer(streamBuffer)) {
+            ALOGV("%s: Stream %d: Trying to free a buffer that is still being "
+                    "processed.", __FUNCTION__, mId);
+            return;
+        }
+
+        sp<Camera3StreamBufferFreedListener> callback = mBufferFreedListener.promote();
+        if (callback != nullptr) {
+            callback->onBufferFreed(mId, buffer->handle);
+        }
+    } else {
+        ALOGE("%s: GraphicBuffer is freed before onBufferFreed callback finishes!", __FUNCTION__);
+    }
 }
 
 }; // namespace camera3

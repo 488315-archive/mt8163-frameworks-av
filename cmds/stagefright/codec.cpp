@@ -26,12 +26,12 @@
 #include <media/ICrypto.h>
 #include <media/IMediaHTTPService.h>
 #include <media/IMediaPlayerService.h>
+#include <media/MediaCodecBuffer.h>
 #include <media/stagefright/foundation/ABuffer.h>
 #include <media/stagefright/foundation/ADebug.h>
 #include <media/stagefright/foundation/ALooper.h>
 #include <media/stagefright/foundation/AMessage.h>
 #include <media/stagefright/foundation/AString.h>
-#include <media/stagefright/DataSource.h>
 #include <media/stagefright/MediaCodec.h>
 #include <media/stagefright/MediaCodecList.h>
 #include <media/stagefright/MediaDefs.h>
@@ -56,8 +56,8 @@ namespace android {
 
 struct CodecState {
     sp<MediaCodec> mCodec;
-    Vector<sp<ABuffer> > mInBuffers;
-    Vector<sp<ABuffer> > mOutBuffers;
+    Vector<sp<MediaCodecBuffer> > mInBuffers;
+    Vector<sp<MediaCodecBuffer> > mOutBuffers;
     bool mSignalledInputEOS;
     bool mSawOutputEOS;
     int64_t mNumBuffersDecoded;
@@ -138,7 +138,7 @@ static int decode(
 
     CHECK(!stateByTrack.isEmpty());
 
-    int64_t startTimeUs = ALooper::GetNowUs();
+    int64_t startTimeUs = android::ALooper::GetNowUs();
     int64_t startTimeRender = -1;
 
     for (size_t i = 0; i < stateByTrack.size(); ++i) {
@@ -174,10 +174,12 @@ static int decode(
                 if (err == OK) {
                     ALOGV("filling input buffer %zu", index);
 
-                    const sp<ABuffer> &buffer = state->mInBuffers.itemAt(index);
+                    const sp<MediaCodecBuffer> &buffer = state->mInBuffers.itemAt(index);
+                    sp<ABuffer> abuffer = new ABuffer(buffer->base(), buffer->capacity());
 
-                    err = extractor->readSampleData(buffer);
+                    err = extractor->readSampleData(abuffer);
                     CHECK_EQ(err, (status_t)OK);
+                    buffer->setRange(abuffer->offset(), abuffer->size());
 
                     int64_t timeUs;
                     err = extractor->getSampleTime(&timeUs);
@@ -305,7 +307,7 @@ static int decode(
         }
     }
 
-    int64_t elapsedTimeUs = ALooper::GetNowUs() - startTimeUs;
+    int64_t elapsedTimeUs = android::ALooper::GetNowUs() - startTimeUs;
 
     for (size_t i = 0; i < stateByTrack.size(); ++i) {
         CodecState *state = &stateByTrack.editValueAt(i);
@@ -364,13 +366,13 @@ int main(int argc, char **argv) {
             case 'T':
             {
                 useTimestamp = true;
+                FALLTHROUGH_INTENDED;
             }
-            // fall through
             case 'R':
             {
                 renderSurface = true;
+                FALLTHROUGH_INTENDED;
             }
-            // fall through
             case 'S':
             {
                 useSurface = true;
@@ -398,9 +400,7 @@ int main(int argc, char **argv) {
 
     ProcessState::self()->startThreadPool();
 
-    DataSource::RegisterDefaultSniffers();
-
-    sp<ALooper> looper = new ALooper;
+    sp<android::ALooper> looper = new android::ALooper;
     looper->start();
 
     sp<SurfaceComposerClient> composerClient;
@@ -411,10 +411,12 @@ int main(int argc, char **argv) {
         composerClient = new SurfaceComposerClient;
         CHECK_EQ(composerClient->initCheck(), (status_t)OK);
 
-        sp<IBinder> display(SurfaceComposerClient::getBuiltInDisplay(
-                ISurfaceComposer::eDisplayIdMain));
+        const sp<IBinder> display = SurfaceComposerClient::getInternalDisplayToken();
+        CHECK(display != nullptr);
+
         DisplayInfo info;
-        SurfaceComposerClient::getDisplayInfo(display, &info);
+        CHECK_EQ(SurfaceComposerClient::getDisplayInfo(display, &info), NO_ERROR);
+
         ssize_t displayWidth = info.w;
         ssize_t displayHeight = info.h;
 
@@ -430,10 +432,10 @@ int main(int argc, char **argv) {
         CHECK(control != NULL);
         CHECK(control->isValid());
 
-        SurfaceComposerClient::openGlobalTransaction();
-        CHECK_EQ(control->setLayer(INT_MAX), (status_t)OK);
-        CHECK_EQ(control->show(), (status_t)OK);
-        SurfaceComposerClient::closeGlobalTransaction();
+        SurfaceComposerClient::Transaction{}
+                 .setLayer(control, INT_MAX)
+                 .show(control)
+                 .apply();
 
         surface = control->getSurface();
         CHECK(surface != NULL);

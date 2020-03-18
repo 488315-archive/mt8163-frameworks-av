@@ -18,17 +18,18 @@
 
 #define STAGEFRIGHT_METADATA_RETRIEVER_H_
 
+#include <media/IMediaExtractor.h>
 #include <media/MediaMetadataRetrieverInterface.h>
 
-#include <media/stagefright/OMXClient.h>
 #include <utils/KeyedVector.h>
 
 namespace android {
 
 class DataSource;
-class MediaExtractor;
+struct ImageDecoder;
+struct FrameRect;
 
-struct StagefrightMetadataRetriever : public MediaMetadataRetrieverInterface {
+struct StagefrightMetadataRetriever : public MediaMetadataRetrieverBase {
     StagefrightMetadataRetriever();
     virtual ~StagefrightMetadataRetriever();
 
@@ -38,24 +39,41 @@ struct StagefrightMetadataRetriever : public MediaMetadataRetrieverInterface {
             const KeyedVector<String8, String8> *headers);
 
     virtual status_t setDataSource(int fd, int64_t offset, int64_t length);
-    virtual status_t setDataSource(const sp<DataSource>& source);
+    virtual status_t setDataSource(const sp<DataSource>& source, const char *mime);
 
-    virtual VideoFrame *getFrameAtTime(int64_t timeUs, int option);
+    virtual sp<IMemory> getFrameAtTime(
+            int64_t timeUs, int option, int colorFormat, bool metaOnly);
+    virtual sp<IMemory> getImageAtIndex(
+            int index, int colorFormat, bool metaOnly, bool thumbnail);
+    virtual sp<IMemory> getImageRectAtIndex(
+            int index, int colorFormat, int left, int top, int right, int bottom);
+    virtual status_t getFrameAtIndex(
+            std::vector<sp<IMemory> >* frames,
+            int frameIndex, int numFrames, int colorFormat, bool metaOnly);
+
     virtual MediaAlbumArt *extractAlbumArt();
     virtual const char *extractMetadata(int keyCode);
 
 private:
-    OMXClient mClient;
     sp<DataSource> mSource;
-    sp<MediaExtractor> mExtractor;
+    sp<IMediaExtractor> mExtractor;
 
     bool mParsedMetaData;
     KeyedVector<int, String8> mMetaData;
     MediaAlbumArt *mAlbumArt;
 
+    sp<ImageDecoder> mImageDecoder;
+    int mLastImageIndex;
     void parseMetaData();
+    void parseColorAspects(const sp<MetaData>& meta);
     // Delete album art and clear metadata.
     void clearMetadata();
+
+    status_t getFrameInternal(
+            int64_t timeUs, int numFrames, int option, int colorFormat, bool metaOnly,
+            sp<IMemory>* outFrame, std::vector<sp<IMemory> >* outFrames);
+    virtual sp<IMemory> getImageInternal(
+            int index, int colorFormat, bool metaOnly, bool thumbnail, FrameRect* rect);
 
     StagefrightMetadataRetriever(const StagefrightMetadataRetriever &);
 

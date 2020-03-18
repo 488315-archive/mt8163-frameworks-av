@@ -17,10 +17,13 @@
 #ifndef ANDROID_AUDIO_FAST_MIXER_H
 #define ANDROID_AUDIO_FAST_MIXER_H
 
+#include <atomic>
+#include <audio_utils/Balance.h>
 #include "FastThread.h"
 #include "StateQueue.h"
 #include "FastMixerState.h"
 #include "FastMixerDumpState.h"
+#include "NBAIO_Tee.h"
 
 namespace android {
 
@@ -31,30 +34,43 @@ typedef StateQueue<FastMixerState> FastMixerStateQueue;
 class FastMixer : public FastThread {
 
 public:
-            FastMixer();
+    /** FastMixer constructor takes as param the parent MixerThread's io handle (id)
+        for purposes of identification. */
+    explicit FastMixer(audio_io_handle_t threadIoHandle);
     virtual ~FastMixer();
 
             FastMixerStateQueue* sq();
 
+    virtual void setMasterMono(bool mono) { mMasterMono.store(mono); /* memory_order_seq_cst */ }
+    virtual void setMasterBalance(float balance) { mMasterBalance.store(balance); }
+    virtual float getMasterBalance() const { return mMasterBalance.load(); }
+    virtual void setBoottimeOffset(int64_t boottimeOffset) {
+        mBoottimeOffset.store(boottimeOffset); /* memory_order_seq_cst */
+    }
 private:
             FastMixerStateQueue mSQ;
 
     // callouts
     virtual const FastThreadState *poll();
-    virtual void setLog(NBLog::Writer *logWriter);
+    virtual void setNBLogWriter(NBLog::Writer *logWriter);
     virtual void onIdle();
     virtual void onExit();
     virtual bool isSubClassCommand(FastThreadState::Command command);
     virtual void onStateChange();
     virtual void onWork();
 
+    enum Reason {
+        REASON_REMOVE,
+        REASON_ADD,
+        REASON_MODIFY,
+    };
+    // called when a fast track of index has been removed, added, or modified
+    void updateMixerTrack(int index, Reason reason);
+
     // FIXME these former local variables need comments
     static const FastMixerState sInitial;
 
     FastMixerState  mPreIdle;   // copy of state before we went into idle
-    long            mSlopNs;    // accumulated time we've woken up too early (> 0) or too late (< 0)
-    int             mFastTrackNames[FastMixerState::kMaxFastTracks];
-                                // handles used by mixer to identify tracks
     int             mGenerations[FastMixerState::kMaxFastTracks];
                                 // last observed mFastTracks[i].mGeneration
     NBAIO_Sink*     mOutputSink;
@@ -69,19 +85,38 @@ private:
     audio_channel_mask_t mSinkChannelMask;
     void*           mMixerBuffer;       // mixer output buffer.
     size_t          mMixerBufferSize;
-    audio_format_t  mMixerBufferFormat; // mixer output format: AUDIO_FORMAT_PCM_(16_BIT|FLOAT).
+    static constexpr audio_format_t mMixerBufferFormat = AUDIO_FORMAT_PCM_FLOAT;
+
+    uint32_t        mAudioChannelCount; // audio channel count, excludes haptic channels.
 
     enum {UNDEFINED, MIXED, ZEROED} mMixerBufferState;
     NBAIO_Format    mFormat;
     unsigned        mSampleRate;
     int             mFastTracksGen;
     FastMixerDumpState mDummyFastMixerDumpState;
-    uint32_t        mTotalNativeFramesWritten;  // copied to dumpState->mFramesWritten
+    int64_t         mTotalNativeFramesWritten;  // copied to dumpState->mFramesWritten
 
     // next 2 fields are valid only when timestampStatus == NO_ERROR
-    AudioTimestamp  mTimestamp;
-    uint32_t        mNativeFramesWrittenButNotPresented;
+    ExtendedTimestamp mTimestamp;
+    int64_t         mNativeFramesWrittenButNotPresented;
 
+    audio_utils::Balance mBalance;
+
+    // accessed without lock between multiple threads.
+    std::atomic_bool mMasterMono;
+    std::atomic<float> mMasterBalance{};
+    std::atomic_int_fast64_t mBoottimeOffset;
+
+    const audio_io_handle_t mThreadIoHandle; // parent thread id for debugging purposes
+#ifdef TEE_SINK
+    NBAIO_Tee       mTee;
+#endif
+
+// <MTK_AUDIOMIXER_ENABLE_DRC // ALPS04408933 low latency support drc
+    int         mDRCEnableGen;
+    int         mUpdateACFHCFParamGen;
+    int         mUpdateCustomSceneParamGen;
+// MTK_AUDIOMIXER_ENABLE_DRC>
 };  // class FastMixer
 
 }   // namespace android

@@ -21,6 +21,7 @@
 #include "include/CallbackDataSource.h"
 
 #include <binder/IMemory.h>
+#include <binder/IPCThreadState.h>
 #include <media/IDataSource.h>
 #include <media/stagefright/foundation/ADebug.h>
 
@@ -30,14 +31,20 @@ namespace android {
 
 CallbackDataSource::CallbackDataSource(
     const sp<IDataSource>& binderDataSource)
-    : mIDataSource(binderDataSource) {
+    : mIDataSource(binderDataSource),
+      mIsClosed(false) {
     // Set up the buffer to read into.
     mMemory = mIDataSource->getIMemory();
+    mName = String8::format("CallbackDataSource(%d->%d, %s)",
+            getpid(),
+            IPCThreadState::self()->getCallingPid(),
+            mIDataSource->toString().string());
+
 }
 
 CallbackDataSource::~CallbackDataSource() {
     ALOGV("~CallbackDataSource");
-    mIDataSource->close();
+    close();
 }
 
 status_t CallbackDataSource::initCheck() const {
@@ -48,7 +55,7 @@ status_t CallbackDataSource::initCheck() const {
 }
 
 ssize_t CallbackDataSource::readAt(off64_t offset, void* data, size_t size) {
-    if (mMemory == NULL) {
+    if (mMemory == NULL || data == NULL) {
         return -1;
     }
 
@@ -64,7 +71,7 @@ ssize_t CallbackDataSource::readAt(off64_t offset, void* data, size_t size) {
             mIDataSource->readAt(offset + totalNumRead, numToRead);
         // A negative return value represents an error. Pass it on.
         if (numRead < 0) {
-            return numRead;
+            return numRead == ERROR_END_OF_STREAM && totalNumRead > 0 ? totalNumRead : numRead;
         }
         // A zero return value signals EOS. Return the bytes read so far.
         if (numRead == 0) {
@@ -95,8 +102,28 @@ status_t CallbackDataSource::getSize(off64_t *size) {
     return OK;
 }
 
+uint32_t CallbackDataSource::flags() {
+    return mIDataSource->getFlags();
+}
+
+void CallbackDataSource::close() {
+    if (!mIsClosed) {
+        mIDataSource->close();
+        mIsClosed = true;
+    }
+}
+
+sp<DecryptHandle> CallbackDataSource::DrmInitialization(const char *mime) {
+    return mIDataSource->DrmInitialization(mime);
+}
+
+sp<IDataSource> CallbackDataSource::getIDataSource() const {
+    return mIDataSource;
+}
+
 TinyCacheSource::TinyCacheSource(const sp<DataSource>& source)
     : mSource(source), mCachedOffset(0), mCachedSize(0) {
+    mName = String8::format("TinyCacheSource(%s)", mSource->toString().string());
 }
 
 status_t TinyCacheSource::initCheck() const {
@@ -104,11 +131,12 @@ status_t TinyCacheSource::initCheck() const {
 }
 
 ssize_t TinyCacheSource::readAt(off64_t offset, void* data, size_t size) {
-    if (size >= kCacheSize) {
-        return mSource->readAt(offset, data, size);
-    }
-
     // Check if the cache satisfies the read.
+#ifdef MSSI_MTK_AUDIO_ALAC_SUPPORT
+    // add lock to ensure multiple threads readAt normally
+    Mutex::Autolock autoLock(mLock);
+    return readAt2(offset, data, size);
+#else
     if (mCachedOffset <= offset
             && offset < (off64_t) (mCachedOffset + mCachedSize)) {
         if (offset + size <= mCachedOffset + mCachedSize) {
@@ -131,6 +159,83 @@ ssize_t TinyCacheSource::readAt(off64_t offset, void* data, size_t size) {
         }
     }
 
+    if (size >= kCacheSize) {
+        return mSource->readAt(offset, data, size);
+    }
+
+    // Fill the cache and copy to the caller.
+    const ssize_t numRead = mSource->readAt(offset, mCache, kCacheSize);
+    if (numRead <= 0) {
+        // Flush cache on error
+        mCachedSize = 0;
+        mCachedOffset = 0;
+        return numRead;
+    }
+    if ((size_t)numRead > kCacheSize) {
+        // Flush cache on error
+        mCachedSize = 0;
+        mCachedOffset = 0;
+        return ERROR_OUT_OF_RANGE;
+    }
+
+    mCachedSize = numRead;
+    mCachedOffset = offset;
+    CHECK(mCachedSize <= kCacheSize && mCachedOffset >= 0);
+    const size_t numToReturn = std::min(size, (size_t)numRead);
+    memcpy(data, mCache, numToReturn);
+
+    return numToReturn;
+#endif
+}
+
+status_t TinyCacheSource::getSize(off64_t *size) {
+    return mSource->getSize(size);
+}
+
+uint32_t TinyCacheSource::flags() {
+    return mSource->flags();
+}
+
+sp<DecryptHandle> TinyCacheSource::DrmInitialization(const char *mime) {
+    // flush cache when DrmInitialization occurs since decrypted
+    // data may differ from what is in cache.
+    mCachedOffset = 0;
+    mCachedSize = 0;
+    return mSource->DrmInitialization(mime);
+}
+
+sp<IDataSource> TinyCacheSource::getIDataSource() const {
+    return mSource->getIDataSource();
+}
+
+#ifdef MSSI_MTK_AUDIO_ALAC_SUPPORT
+ssize_t TinyCacheSource::readAt2(off64_t offset, void* data, size_t size) {
+    // Check if the cache satisfies the read.
+    if (mCachedOffset <= offset
+            && offset < (off64_t) (mCachedOffset + mCachedSize)) {
+        if (offset + size <= mCachedOffset + mCachedSize) {
+            memcpy(data, &mCache[offset - mCachedOffset], size);
+            return size;
+        } else {
+            // If the cache hits only partially, flush the cache and read the
+            // remainder.
+
+            // This value is guaranteed to be greater than 0 because of the
+            // enclosing if statement.
+            const ssize_t remaining = mCachedOffset + mCachedSize - offset;
+            memcpy(data, &mCache[offset - mCachedOffset], remaining);
+            const ssize_t readMore = readAt2(offset + remaining,
+                    (uint8_t*)data + remaining, size - remaining);
+            if (readMore < 0) {
+                return readMore;
+            }
+            return remaining + readMore;
+        }
+    }
+    if (size >= kCacheSize) {
+        return mSource->readAt(offset, data, size);
+    }
+
     // Fill the cache and copy to the caller.
     const ssize_t numRead = mSource->readAt(offset, mCache, kCacheSize);
     if (numRead <= 0) {
@@ -148,13 +253,6 @@ ssize_t TinyCacheSource::readAt(off64_t offset, void* data, size_t size) {
 
     return numToReturn;
 }
-
-status_t TinyCacheSource::getSize(off64_t *size) {
-    return mSource->getSize(size);
-}
-
-uint32_t TinyCacheSource::flags() {
-    return mSource->flags();
-}
+#endif
 
 } // namespace android

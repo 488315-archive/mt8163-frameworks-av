@@ -1,9 +1,4 @@
 /*
-* Copyright (C) 2014 MediaTek Inc.
-* Modification based on code covered by the mentioned copyright
-* and/or permission notice(s).
-*/
-/*
  * Copyright (C) 2012 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,13 +18,8 @@
 
 #define LOG_TAG "MonoPipe"
 //#define LOG_NDEBUG 0
-#if defined(MTK_AUDIO)
-#include <common_time/local_clock.h>
-#endif
-#include <common_time/cc_helper.h>
-#include <cutils/atomic.h>
+
 #include <cutils/compiler.h>
-#include <utils/LinearTransform.h>
 #include <utils/Log.h>
 #include <utils/Trace.h>
 #include <media/AudioBufferProvider.h>
@@ -39,31 +29,13 @@
 
 namespace android {
 
-static uint64_t cacheN; // output of CCHelper::getLocalFreq()
-static bool cacheValid; // whether cacheN is valid
-static pthread_once_t cacheOnceControl = PTHREAD_ONCE_INIT;
-
-static void cacheOnceInit()
-{
-    CCHelper tmpHelper;
-    status_t res;
-    if (OK != (res = tmpHelper.getLocalFreq(&cacheN))) {
-        ALOGE("Failed to fetch local time frequency when constructing a"
-              " MonoPipe (res = %d).  getNextWriteTimestamp calls will be"
-              " non-functional", res);
-        return;
-    }
-    cacheValid = true;
-}
-
 MonoPipe::MonoPipe(size_t reqFrames, const NBAIO_Format& format, bool writeCanBlock) :
         NBAIO_Sink(format),
-        mUpdateSeq(0),
-        mReqFrames(reqFrames),
+        // TODO fifo now supports non-power-of-2 buffer sizes, so could remove the roundup
         mMaxFrames(roundup(reqFrames)),
         mBuffer(malloc(mMaxFrames * Format_frameSize(format))),
-        mFront(0),
-        mRear(0),
+        mFifo(mMaxFrames, Format_frameSize(format), mBuffer, true /*throttlesWriter*/),
+        mFifoWriter(mFifo),
         mWriteTsValid(false),
         // mWriteTs
         mSetpoint((reqFrames * 11) / 16),
@@ -73,36 +45,6 @@ MonoPipe::MonoPipe(size_t reqFrames, const NBAIO_Format& format, bool writeCanBl
         mTimestampMutator(&mTimestampShared),
         mTimestampObserver(&mTimestampShared)
 {
-    uint64_t N, D;
-
-    mNextRdPTS = AudioBufferProvider::kInvalidPTS;
-
-    mSamplesToLocalTime.a_zero = 0;
-    mSamplesToLocalTime.b_zero = 0;
-    mSamplesToLocalTime.a_to_b_numer = 0;
-    mSamplesToLocalTime.a_to_b_denom = 0;
-
-    D = Format_sampleRate(format);
-
-    (void) pthread_once(&cacheOnceControl, cacheOnceInit);
-    if (!cacheValid) {
-        // log has already been done
-        return;
-    }
-    N = cacheN;
-
-    LinearTransform::reduce(&N, &D);
-    static const uint64_t kSignedHiBitsMask   = ~(0x7FFFFFFFull);
-    static const uint64_t kUnsignedHiBitsMask = ~(0xFFFFFFFFull);
-    if ((N & kSignedHiBitsMask) || (D & kUnsignedHiBitsMask)) {
-        ALOGE("Cannot reduce sample rate to local clock frequency ratio to fit"
-              " in a 32/32 bit rational.  (max reduction is 0x%016" PRIx64 "/0x%016" PRIx64
-              ").  getNextWriteTimestamp calls will be non-functional", N, D);
-        return;
-    }
-
-    mSamplesToLocalTime.a_to_b_numer = static_cast<int32_t>(N);
-    mSamplesToLocalTime.a_to_b_denom = static_cast<uint32_t>(D);
 }
 
 MonoPipe::~MonoPipe()
@@ -110,61 +52,63 @@ MonoPipe::~MonoPipe()
     free(mBuffer);
 }
 
-ssize_t MonoPipe::availableToWrite() const
+ssize_t MonoPipe::availableToWrite()
 {
     if (CC_UNLIKELY(!mNegotiated)) {
         return NEGOTIATE;
     }
-    // uses mMaxFrames not mReqFrames, so allows "over-filling" the pipe beyond requested limit
-    ssize_t ret = mMaxFrames - (mRear - android_atomic_acquire_load(&mFront));
-    ALOG_ASSERT((0 <= ret) && (ret <= mMaxFrames));
+    // uses mMaxFrames not reqFrames, so allows "over-filling" the pipe beyond requested limit
+    ssize_t ret = mFifoWriter.available();
+    ALOG_ASSERT(ret <= mMaxFrames);
     return ret;
 }
 
 ssize_t MonoPipe::write(const void *buffer, size_t count)
 {
-#ifdef MTK_AOSP_ENHANCEMENT
-    uint32_t try_count = 0;
-    uint32_t block_ns = 0;
-    ALOGV("+%s",__FUNCTION__);
-#endif
     if (CC_UNLIKELY(!mNegotiated)) {
         return NEGOTIATE;
     }
     size_t totalFramesWritten = 0;
+
+#if defined(MTK_AUDIO_FIX_DEFAULT_DEFECT)
+    uint32_t totalSleepTime = 0;
+    uint32_t maxWriteTime = count * (10000000000 / Format_sampleRate(mFormat));
+#endif
     while (count > 0) {
-        // can't return a negative value, as we already checked for !mNegotiated
-        size_t avail = availableToWrite();
-        size_t written = avail;
-        if (CC_LIKELY(written > count)) {
-            written = count;
-        }
-        size_t rear = mRear & (mMaxFrames - 1);
-        size_t part1 = mMaxFrames - rear;
-        if (part1 > written) {
-            part1 = written;
-        }
-        if (CC_LIKELY(part1 > 0)) {
-            memcpy((char *) mBuffer + (rear * mFrameSize), buffer, part1 * mFrameSize);
-            if (CC_UNLIKELY(rear + part1 == mMaxFrames)) {
-                size_t part2 = written - part1;
-                if (CC_LIKELY(part2 > 0)) {
-                    memcpy(mBuffer, (char *) buffer + (part1 * mFrameSize), part2 * mFrameSize);
-                }
+        ssize_t actual = mFifoWriter.write(buffer, count);
+        ALOG_ASSERT(actual <= count);
+        if (actual < 0) {
+            if (totalFramesWritten == 0) {
+                return actual;
             }
-            android_atomic_release_store(written + mRear, &mRear);
-            totalFramesWritten += written;
+            break;
         }
+        size_t written = (size_t) actual;
+        totalFramesWritten += written;
         if (!mWriteCanBlock || mIsShutdown) {
             break;
         }
+#if defined(MTK_AUDIO_FIX_DEFAULT_DEFECT)
+        // ALPS04697210 break loop if total sleep time > 10* count time
+        if (totalSleepTime > maxWriteTime) {
+            ALOGE("totalSleepTime %d > maxWriteTime %d break monopipe write", totalSleepTime, maxWriteTime);
+            break;
+        }
+#endif
         count -= written;
         buffer = (char *) buffer + (written * mFrameSize);
+        // TODO Replace this whole section by audio_util_fifo's setpoint feature.
         // Simulate blocking I/O by sleeping at different rates, depending on a throttle.
         // The throttle tries to keep the mean pipe depth near the setpoint, with a slight jitter.
         uint32_t ns;
         if (written > 0) {
-            size_t filled = (mMaxFrames - avail) + written;
+            ssize_t avail = mFifoWriter.available();
+            ALOG_ASSERT(avail <= mMaxFrames);
+            if (avail < 0) {
+                // don't return avail as status, because totalFramesWritten > 0
+                break;
+            }
+            size_t filled = mMaxFrames - (size_t) avail;
             // FIXME cache these values to avoid re-computation
             if (filled <= mSetpoint / 2) {
                 // pipe is (nearly) empty, fill quickly
@@ -215,6 +159,9 @@ ssize_t MonoPipe::write(const void *buffer, size_t count)
         if (ns > 0) {
             const struct timespec req = {0, static_cast<long>(ns)};
             nanosleep(&req, NULL);
+#if defined(MTK_AUDIO_FIX_DEFAULT_DEFECT)
+            totalSleepTime += ns;
+#endif
         }
         // record the time that this write() completed
         if (nowTsValid) {
@@ -225,122 +172,14 @@ ssize_t MonoPipe::write(const void *buffer, size_t count)
             }
         }
         mWriteTsValid = nowTsValid;
-#ifdef MTK_AOSP_ENHANCEMENT
-        block_ns += ns;
-        if (++try_count>=2){
-            ALOGW("%s is try count %d,blocked (%ldns), , please check if MonoPipeReader::read is normal",__FUNCTION__,try_count,block_ns);
-            break;
-        }
-#endif
     }
     mFramesWritten += totalFramesWritten;
-#ifdef MTK_AOSP_ENHANCEMENT
-    ALOGV("-%s",__FUNCTION__);
-#endif
     return totalFramesWritten;
 }
 
 void MonoPipe::setAvgFrames(size_t setpoint)
 {
     mSetpoint = setpoint;
-}
-
-status_t MonoPipe::getNextWriteTimestamp(int64_t *timestamp)
-{
-    int32_t front;
-
-    ALOG_ASSERT(NULL != timestamp);
-
-    if (0 == mSamplesToLocalTime.a_to_b_denom)
-        return UNKNOWN_ERROR;
-
-    observeFrontAndNRPTS(&front, timestamp);
-
-    if (AudioBufferProvider::kInvalidPTS != *timestamp) {
-        // If we have a valid read-pointer and next read timestamp pair, then
-        // use the current value of the write pointer to figure out how many
-        // frames are in the buffer, and offset the timestamp by that amt.  Then
-        // next time we write to the MonoPipe, the data will hit the speakers at
-        // the next read timestamp plus the current amount of data in the
-        // MonoPipe.
-        size_t pendingFrames = (mRear - front) & (mMaxFrames - 1);
-        *timestamp = offsetTimestampByAudioFrames(*timestamp, pendingFrames);
-    }
-
-    return OK;
-}
-
-void MonoPipe::updateFrontAndNRPTS(int32_t newFront, int64_t newNextRdPTS)
-{
-    // Set the MSB of the update sequence number to indicate that there is a
-    // multi-variable update in progress.  Use an atomic store with an "acquire"
-    // barrier to make sure that the next operations cannot be re-ordered and
-    // take place before the change to mUpdateSeq is commited..
-    int32_t tmp = mUpdateSeq | 0x80000000;
-    android_atomic_acquire_store(tmp, &mUpdateSeq);
-
-    // Update mFront and mNextRdPTS
-    mFront = newFront;
-    mNextRdPTS = newNextRdPTS;
-
-    // We are finished with the update.  Compute the next sequnce number (which
-    // should be the old sequence number, plus one, and with the MSB cleared)
-    // and then store it in mUpdateSeq using an atomic store with a "release"
-    // barrier so our update operations cannot be re-ordered past the update of
-    // the sequence number.
-    tmp = (tmp + 1) & 0x7FFFFFFF;
-    android_atomic_release_store(tmp, &mUpdateSeq);
-}
-
-void MonoPipe::observeFrontAndNRPTS(int32_t *outFront, int64_t *outNextRdPTS)
-{
-    // Perform an atomic observation of mFront and mNextRdPTS.  Basically,
-    // atomically observe the sequence number, then observer the variables, then
-    // atomically observe the sequence number again.  If the two observations of
-    // the sequence number match, and the update-in-progress bit was not set,
-    // then we know we have a successful atomic observation.  Otherwise, we loop
-    // around and try again.
-    //
-    // Note, it is very important that the observer be a lower priority thread
-    // than the updater.  If the updater is lower than the observer, or they are
-    // the same priority and running with SCHED_FIFO (implying that quantum
-    // based premption is disabled) then we run the risk of deadlock.
-    int32_t seqOne, seqTwo;
-
-    do {
-        seqOne        = android_atomic_acquire_load(&mUpdateSeq);
-        *outFront     = mFront;
-        *outNextRdPTS = mNextRdPTS;
-        seqTwo        = android_atomic_release_load(&mUpdateSeq);
-    } while ((seqOne != seqTwo) || (seqOne & 0x80000000));
-}
-
-int64_t MonoPipe::offsetTimestampByAudioFrames(int64_t ts, size_t audFrames)
-{
-    if (0 == mSamplesToLocalTime.a_to_b_denom)
-        return AudioBufferProvider::kInvalidPTS;
-
-    if (ts == AudioBufferProvider::kInvalidPTS)
-        return AudioBufferProvider::kInvalidPTS;
-
-    int64_t frame_lt_duration;
-    if (!mSamplesToLocalTime.doForwardTransform(audFrames,
-                                                &frame_lt_duration)) {
-        // This should never fail, but if there is a bug which is causing it
-        // to fail, this message would probably end up flooding the logs
-        // because the conversion would probably fail forever.  Log the
-        // error, but then zero out the ratio in the linear transform so
-        // that we don't try to do any conversions from now on.  This
-        // MonoPipe's getNextWriteTimestamp is now broken for good.
-        ALOGE("Overflow when attempting to convert %zu audio frames to"
-              " duration in local time.  getNextWriteTimestamp will fail from"
-              " now on.", audFrames);
-        mSamplesToLocalTime.a_to_b_numer = 0;
-        mSamplesToLocalTime.a_to_b_denom = 0;
-        return AudioBufferProvider::kInvalidPTS;
-    }
-
-    return ts + frame_lt_duration;
 }
 
 void MonoPipe::shutdown(bool newState)
@@ -353,9 +192,14 @@ bool MonoPipe::isShutdown()
     return mIsShutdown;
 }
 
-status_t MonoPipe::getTimestamp(AudioTimestamp& timestamp)
+status_t MonoPipe::getTimestamp(ExtendedTimestamp &timestamp)
 {
-    if (mTimestampObserver.poll(timestamp)) {
+    ExtendedTimestamp ets;
+    if (mTimestampObserver.poll(ets)) {
+        timestamp.mPosition[ExtendedTimestamp::LOCATION_KERNEL] =
+                ets.mPosition[ExtendedTimestamp::LOCATION_KERNEL];
+        timestamp.mTimeNs[ExtendedTimestamp::LOCATION_KERNEL] =
+                ets.mTimeNs[ExtendedTimestamp::LOCATION_KERNEL];
         return OK;
     }
     return INVALID_OPERATION;

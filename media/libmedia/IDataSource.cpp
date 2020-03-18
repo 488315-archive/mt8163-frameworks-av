@@ -23,6 +23,7 @@
 
 #include <binder/IMemory.h>
 #include <binder/Parcel.h>
+#include <drm/drm_framework_common.h>
 #include <media/stagefright/foundation/ADebug.h>
 
 namespace android {
@@ -32,10 +33,14 @@ enum {
     READ_AT,
     GET_SIZE,
     CLOSE,
+    GET_FLAGS,
+    TO_STRING,
+    DRM_INITIALIZATION,
 };
 
 struct BpDataSource : public BpInterface<IDataSource> {
-    BpDataSource(const sp<IBinder>& impl) : BpInterface<IDataSource>(impl) {}
+    explicit BpDataSource(const sp<IBinder>& impl)
+        : BpInterface<IDataSource>(impl) {}
 
     virtual sp<IMemory> getIMemory() {
         Parcel data, reply;
@@ -50,8 +55,16 @@ struct BpDataSource : public BpInterface<IDataSource> {
         data.writeInterfaceToken(IDataSource::getInterfaceDescriptor());
         data.writeInt64(offset);
         data.writeInt64(size);
-        remote()->transact(READ_AT, data, &reply);
-        return reply.readInt64();
+        status_t err = remote()->transact(READ_AT, data, &reply);
+        if (err != OK) {
+            return err;
+        }
+        int64_t value = 0;
+        err = reply.readInt64(&value);
+        if (err != OK) {
+            return err;
+        }
+        return (ssize_t)value;
     }
 
     virtual status_t getSize(off64_t* size) {
@@ -67,6 +80,61 @@ struct BpDataSource : public BpInterface<IDataSource> {
         Parcel data, reply;
         data.writeInterfaceToken(IDataSource::getInterfaceDescriptor());
         remote()->transact(CLOSE, data, &reply);
+    }
+
+    virtual uint32_t getFlags() {
+        Parcel data, reply;
+        data.writeInterfaceToken(IDataSource::getInterfaceDescriptor());
+        remote()->transact(GET_FLAGS, data, &reply);
+        return reply.readUint32();
+    }
+
+    virtual String8 toString() {
+        Parcel data, reply;
+        data.writeInterfaceToken(IDataSource::getInterfaceDescriptor());
+        remote()->transact(TO_STRING, data, &reply);
+        return reply.readString8();
+    }
+
+    virtual sp<DecryptHandle> DrmInitialization(const char *mime) {
+        Parcel data, reply;
+        data.writeInterfaceToken(IDataSource::getInterfaceDescriptor());
+        if (mime == NULL) {
+            data.writeInt32(0);
+        } else {
+            data.writeInt32(1);
+            data.writeCString(mime);
+        }
+        remote()->transact(DRM_INITIALIZATION, data, &reply);
+        sp<DecryptHandle> handle;
+        if (reply.dataAvail() != 0) {
+            handle = new DecryptHandle();
+            handle->decryptId = reply.readInt32();
+            handle->mimeType = reply.readString8();
+            handle->decryptApiType = reply.readInt32();
+            handle->status = reply.readInt32();
+
+            const int bufferLength = data.readInt32();
+            if (bufferLength != -1) {
+                handle->decryptInfo = new DecryptInfo();
+                handle->decryptInfo->decryptBufferLength = bufferLength;
+            }
+
+            size_t size = data.readInt32();
+            for (size_t i = 0; i < size; ++i) {
+                DrmCopyControl key = (DrmCopyControl)data.readInt32();
+                int value = data.readInt32();
+                handle->copyControlVector.add(key, value);
+            }
+
+            size = data.readInt32();
+            for (size_t i = 0; i < size; ++i) {
+                String8 key = data.readString8();
+                String8 value = data.readString8();
+                handle->extendedData.add(key, value);
+            }
+        }
+        return handle;
     }
 };
 
@@ -100,6 +168,53 @@ status_t BnDataSource::onTransact(
             close();
             return NO_ERROR;
         } break;
+        case GET_FLAGS: {
+            CHECK_INTERFACE(IDataSource, data, reply);
+            reply->writeUint32(getFlags());
+            return NO_ERROR;
+        } break;
+        case TO_STRING: {
+            CHECK_INTERFACE(IDataSource, data, reply);
+            reply->writeString8(toString());
+            return NO_ERROR;
+        } break;
+        case DRM_INITIALIZATION: {
+            CHECK_INTERFACE(IDataSource, data, reply);
+            const char *mime = NULL;
+            const int32_t flag = data.readInt32();
+            if (flag != 0) {
+                mime = data.readCString();
+            }
+            sp<DecryptHandle> handle = DrmInitialization(mime);
+            if (handle != NULL) {
+                reply->writeInt32(handle->decryptId);
+                reply->writeString8(handle->mimeType);
+                reply->writeInt32(handle->decryptApiType);
+                reply->writeInt32(handle->status);
+
+                if (handle->decryptInfo != NULL) {
+                    reply->writeInt32(handle->decryptInfo->decryptBufferLength);
+                } else {
+                    reply->writeInt32(-1);
+                }
+
+                size_t size = handle->copyControlVector.size();
+                reply->writeInt32(size);
+                for (size_t i = 0; i < size; ++i) {
+                    reply->writeInt32(handle->copyControlVector.keyAt(i));
+                    reply->writeInt32(handle->copyControlVector.valueAt(i));
+                }
+
+                size = handle->extendedData.size();
+                reply->writeInt32(size);
+                for (size_t i = 0; i < size; ++i) {
+                    reply->writeString8(handle->extendedData.keyAt(i));
+                    reply->writeString8(handle->extendedData.valueAt(i));
+                }
+            }
+            return NO_ERROR;
+        } break;
+
         default:
             return BBinder::onTransact(code, data, reply, flags);
     }

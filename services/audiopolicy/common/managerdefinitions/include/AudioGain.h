@@ -18,7 +18,9 @@
 
 #include <utils/Errors.h>
 #include <utils/RefBase.h>
+#include <utils/String8.h>
 #include <system/audio.h>
+#include <vector>
 
 namespace android {
 
@@ -28,13 +30,66 @@ public:
     AudioGain(int index, bool useInChannelMask);
     virtual ~AudioGain() {}
 
-    void dump(int fd, int spaces, int index) const;
+    void setMode(audio_gain_mode_t mode) { mGain.mode = mode; }
+    const audio_gain_mode_t &getMode() const { return mGain.mode; }
+
+    void setChannelMask(audio_channel_mask_t mask) { mGain.channel_mask = mask; }
+    const audio_channel_mask_t &getChannelMask() const { return mGain.channel_mask; }
+
+    void setMinValueInMb(int minValue) { mGain.min_value = minValue; }
+    int getMinValueInMb() const { return mGain.min_value; }
+
+    void setMaxValueInMb(int maxValue) { mGain.max_value = maxValue; }
+    int getMaxValueInMb() const { return mGain.max_value; }
+
+    void setDefaultValueInMb(int defaultValue) { mGain.default_value = defaultValue; }
+    int getDefaultValueInMb() const { return mGain.default_value; }
+
+    void setStepValueInMb(uint32_t stepValue) { mGain.step_value = stepValue; }
+    int getStepValueInMb() const { return mGain.step_value; }
+
+    void setMinRampInMs(uint32_t minRamp) { mGain.min_ramp_ms = minRamp; }
+    int getMinRampInMs() const { return mGain.min_ramp_ms; }
+
+    void setMaxRampInMs(uint32_t maxRamp) { mGain.max_ramp_ms = maxRamp; }
+    int getMaxRampInMs() const { return mGain.max_ramp_ms; }
+
+    // TODO: remove dump from here (split serialization)
+    void dump(String8 *dst, int spaces, int index) const;
 
     void getDefaultConfig(struct audio_gain_config *config);
     status_t checkConfig(const struct audio_gain_config *config);
+
+    void setUseForVolume(bool canUseForVolume) { mUseForVolume = canUseForVolume; }
+    bool canUseForVolume() const { return mUseForVolume; }
+
+    const struct audio_gain &getGain() const { return mGain; }
+
+private:
     int               mIndex;
     struct audio_gain mGain;
     bool              mUseInChannelMask;
+    bool              mUseForVolume = false;
 };
 
-}; // namespace android
+class AudioGains : public std::vector<sp<AudioGain> >
+{
+public:
+    bool canUseForVolume() const
+    {
+        for (const auto &gain: *this) {
+            if (gain->canUseForVolume()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    int32_t add(const sp<AudioGain> gain)
+    {
+        push_back(gain);
+        return 0;
+    }
+};
+
+} // namespace android

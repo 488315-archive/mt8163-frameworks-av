@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2013 The Android Open Source Project
+ * Copyright (C) 2013-2018 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -34,7 +34,9 @@ class Camera3IOStreamBase :
   protected:
     Camera3IOStreamBase(int id, camera3_stream_type_t type,
             uint32_t width, uint32_t height, size_t maxSize, int format,
-            android_dataspace dataSpace, camera3_stream_rotation_t rotation);
+            android_dataspace dataSpace, camera3_stream_rotation_t rotation,
+            const String8& physicalCameraId,
+            int setId = CAMERA3_STREAM_SET_ID_INVALID);
 
   public:
 
@@ -64,12 +66,14 @@ class Camera3IOStreamBase :
     status_t         returnAnyBufferLocked(
             const camera3_stream_buffer &buffer,
             nsecs_t timestamp,
-            bool output);
+            bool output,
+            const std::vector<size_t>& surface_ids = std::vector<size_t>());
 
     virtual status_t returnBufferCheckedLocked(
             const camera3_stream_buffer &buffer,
             nsecs_t timestamp,
             bool output,
+            const std::vector<size_t>& surface_ids,
             /*out*/
             sp<Fence> *releaseFenceOut) = 0;
 
@@ -80,11 +84,11 @@ class Camera3IOStreamBase :
 
     virtual size_t   getBufferCountLocked();
 
-    virtual size_t   getHandoutOutputBufferCountLocked();
+    virtual size_t   getHandoutOutputBufferCountLocked() const;
 
     virtual size_t   getHandoutInputBufferCountLocked();
 
-    virtual status_t getEndpointUsage(uint32_t *usage) const = 0;
+    virtual status_t getEndpointUsage(uint64_t *usage) const = 0;
 
     status_t getBufferPreconditionCheckLocked() const;
     status_t returnBufferPreconditionCheckLocked() const;

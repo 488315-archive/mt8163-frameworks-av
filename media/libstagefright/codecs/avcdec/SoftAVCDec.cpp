@@ -27,10 +27,9 @@
 #include <media/stagefright/foundation/ADebug.h>
 #include <media/stagefright/MediaDefs.h>
 #include <OMX_VideoExt.h>
+#include <inttypes.h>
 
 namespace android {
-
-#define PRINT_TIME  ALOGV
 
 #define componentName                   "video_decoder.avc"
 #define codingType                      OMX_VIDEO_CodingAVC
@@ -38,10 +37,10 @@ namespace android {
 
 /** Function and structure definitions to keep code similar for each codec */
 #define ivdec_api_function              ih264d_api_function
-#define ivdext_init_ip_t                ih264d_init_ip_t
-#define ivdext_init_op_t                ih264d_init_op_t
-#define ivdext_fill_mem_rec_ip_t        ih264d_fill_mem_rec_ip_t
-#define ivdext_fill_mem_rec_op_t        ih264d_fill_mem_rec_op_t
+#define ivdext_create_ip_t              ih264d_create_ip_t
+#define ivdext_create_op_t              ih264d_create_op_t
+#define ivdext_delete_ip_t              ih264d_delete_ip_t
+#define ivdext_delete_op_t              ih264d_delete_op_t
 #define ivdext_ctl_set_num_cores_ip_t   ih264d_ctl_set_num_cores_ip_t
 #define ivdext_ctl_set_num_cores_op_t   ih264d_ctl_set_num_cores_op_t
 
@@ -49,58 +48,14 @@ namespace android {
         (IVD_CONTROL_API_COMMAND_TYPE_T)IH264D_CMD_CTL_SET_NUM_CORES
 
 static const CodecProfileLevel kProfileLevels[] = {
-    { OMX_VIDEO_AVCProfileBaseline, OMX_VIDEO_AVCLevel1  },
-    { OMX_VIDEO_AVCProfileBaseline, OMX_VIDEO_AVCLevel1b },
-    { OMX_VIDEO_AVCProfileBaseline, OMX_VIDEO_AVCLevel11 },
-    { OMX_VIDEO_AVCProfileBaseline, OMX_VIDEO_AVCLevel12 },
-    { OMX_VIDEO_AVCProfileBaseline, OMX_VIDEO_AVCLevel13 },
-    { OMX_VIDEO_AVCProfileBaseline, OMX_VIDEO_AVCLevel2  },
-    { OMX_VIDEO_AVCProfileBaseline, OMX_VIDEO_AVCLevel21 },
-    { OMX_VIDEO_AVCProfileBaseline, OMX_VIDEO_AVCLevel22 },
-    { OMX_VIDEO_AVCProfileBaseline, OMX_VIDEO_AVCLevel3  },
-    { OMX_VIDEO_AVCProfileBaseline, OMX_VIDEO_AVCLevel31 },
-    { OMX_VIDEO_AVCProfileBaseline, OMX_VIDEO_AVCLevel32 },
-    { OMX_VIDEO_AVCProfileBaseline, OMX_VIDEO_AVCLevel4  },
-    { OMX_VIDEO_AVCProfileBaseline, OMX_VIDEO_AVCLevel41 },
-    { OMX_VIDEO_AVCProfileBaseline, OMX_VIDEO_AVCLevel42 },
-    { OMX_VIDEO_AVCProfileBaseline, OMX_VIDEO_AVCLevel5  },
-    { OMX_VIDEO_AVCProfileBaseline, OMX_VIDEO_AVCLevel51 },
+    { OMX_VIDEO_AVCProfileConstrainedBaseline, OMX_VIDEO_AVCLevel52 },
+
     { OMX_VIDEO_AVCProfileBaseline, OMX_VIDEO_AVCLevel52 },
 
-    { OMX_VIDEO_AVCProfileMain,     OMX_VIDEO_AVCLevel1  },
-    { OMX_VIDEO_AVCProfileMain,     OMX_VIDEO_AVCLevel1b },
-    { OMX_VIDEO_AVCProfileMain,     OMX_VIDEO_AVCLevel11 },
-    { OMX_VIDEO_AVCProfileMain,     OMX_VIDEO_AVCLevel12 },
-    { OMX_VIDEO_AVCProfileMain,     OMX_VIDEO_AVCLevel13 },
-    { OMX_VIDEO_AVCProfileMain,     OMX_VIDEO_AVCLevel2  },
-    { OMX_VIDEO_AVCProfileMain,     OMX_VIDEO_AVCLevel21 },
-    { OMX_VIDEO_AVCProfileMain,     OMX_VIDEO_AVCLevel22 },
-    { OMX_VIDEO_AVCProfileMain,     OMX_VIDEO_AVCLevel3  },
-    { OMX_VIDEO_AVCProfileMain,     OMX_VIDEO_AVCLevel31 },
-    { OMX_VIDEO_AVCProfileMain,     OMX_VIDEO_AVCLevel32 },
-    { OMX_VIDEO_AVCProfileMain,     OMX_VIDEO_AVCLevel4  },
-    { OMX_VIDEO_AVCProfileMain,     OMX_VIDEO_AVCLevel41 },
-    { OMX_VIDEO_AVCProfileMain,     OMX_VIDEO_AVCLevel42 },
-    { OMX_VIDEO_AVCProfileMain,     OMX_VIDEO_AVCLevel5  },
-    { OMX_VIDEO_AVCProfileMain,     OMX_VIDEO_AVCLevel51 },
     { OMX_VIDEO_AVCProfileMain,     OMX_VIDEO_AVCLevel52 },
 
-    { OMX_VIDEO_AVCProfileHigh,     OMX_VIDEO_AVCLevel1  },
-    { OMX_VIDEO_AVCProfileHigh,     OMX_VIDEO_AVCLevel1b },
-    { OMX_VIDEO_AVCProfileHigh,     OMX_VIDEO_AVCLevel11 },
-    { OMX_VIDEO_AVCProfileHigh,     OMX_VIDEO_AVCLevel12 },
-    { OMX_VIDEO_AVCProfileHigh,     OMX_VIDEO_AVCLevel13 },
-    { OMX_VIDEO_AVCProfileHigh,     OMX_VIDEO_AVCLevel2  },
-    { OMX_VIDEO_AVCProfileHigh,     OMX_VIDEO_AVCLevel21 },
-    { OMX_VIDEO_AVCProfileHigh,     OMX_VIDEO_AVCLevel22 },
-    { OMX_VIDEO_AVCProfileHigh,     OMX_VIDEO_AVCLevel3  },
-    { OMX_VIDEO_AVCProfileHigh,     OMX_VIDEO_AVCLevel31 },
-    { OMX_VIDEO_AVCProfileHigh,     OMX_VIDEO_AVCLevel32 },
-    { OMX_VIDEO_AVCProfileHigh,     OMX_VIDEO_AVCLevel4  },
-    { OMX_VIDEO_AVCProfileHigh,     OMX_VIDEO_AVCLevel41 },
-    { OMX_VIDEO_AVCProfileHigh,     OMX_VIDEO_AVCLevel42 },
-    { OMX_VIDEO_AVCProfileHigh,     OMX_VIDEO_AVCLevel5  },
-    { OMX_VIDEO_AVCProfileHigh,     OMX_VIDEO_AVCLevel51 },
+    { OMX_VIDEO_AVCProfileConstrainedHigh,     OMX_VIDEO_AVCLevel52 },
+
     { OMX_VIDEO_AVCProfileHigh,     OMX_VIDEO_AVCLevel52 },
 };
 
@@ -115,29 +70,37 @@ SoftAVC::SoftAVC(
             320 /* width */, 240 /* height */, callbacks,
             appData, component),
       mCodecCtx(NULL),
-      mMemRecords(NULL),
       mFlushOutBuffer(NULL),
       mOmxColorFormat(OMX_COLOR_FormatYUV420Planar),
       mIvColorFormat(IV_YUV_420P),
-      mNewWidth(mWidth),
-      mNewHeight(mHeight),
-      mNewLevel(0),
       mChangingResolution(false),
-      mSignalledError(false) {
+      mSignalledError(false),
+      mStride(mWidth),
+      mInputOffset(0){
     initPorts(
-            kNumBuffers, INPUT_BUF_SIZE, kNumBuffers, CODEC_MIME_TYPE);
+            1 /* numMinInputBuffers */, kNumBuffers, INPUT_BUF_SIZE,
+            1 /* numMinOutputBuffers */, kNumBuffers, CODEC_MIME_TYPE);
 
-    GETTIME(&mTimeStart, NULL);
+    mTimeStart = mTimeEnd = systemTime();
 
     // If input dump is enabled, then open create an empty file
     GENERATE_FILE_NAMES();
     CREATE_DUMP_FILE(mInFile);
-
-    CHECK_EQ(initDecoder(mWidth, mHeight), (status_t)OK);
 }
 
 SoftAVC::~SoftAVC() {
     CHECK_EQ(deInitDecoder(), (status_t)OK);
+}
+
+static void *ivd_aligned_malloc(void *ctxt, WORD32 alignment, WORD32 size) {
+    UNUSED(ctxt);
+    return memalign(alignment, size);
+}
+
+static void ivd_aligned_free(void *ctxt, void *buf) {
+    UNUSED(ctxt);
+    free(buf);
+    return;
 }
 
 static size_t GetCPUCoreCount() {
@@ -149,7 +112,7 @@ static size_t GetCPUCoreCount() {
     cpuCoreCount = sysconf(_SC_NPROC_ONLN);
 #endif
     CHECK(cpuCoreCount >= 1);
-    ALOGD("Number of CPU cores: %ld", cpuCoreCount);
+    ALOGV("Number of CPU cores: %ld", cpuCoreCount);
     return (size_t)cpuCoreCount;
 }
 
@@ -208,12 +171,12 @@ status_t SoftAVC::setParams(size_t stride) {
 status_t SoftAVC::resetPlugin() {
     mIsInFlush = false;
     mReceivedEOS = false;
+
     memset(mTimeStamps, 0, sizeof(mTimeStamps));
     memset(mTimeStampsValid, 0, sizeof(mTimeStampsValid));
 
     /* Initialize both start and end times */
-    gettimeofday(&mTimeStart, NULL);
-    gettimeofday(&mTimeEnd, NULL);
+    mTimeStart = mTimeEnd = systemTime();
 
     return OK;
 }
@@ -235,12 +198,10 @@ status_t SoftAVC::resetDecoder() {
     }
     mSignalledError = false;
 
-    /* Set the run-time (dynamic) parameters */
-    setParams(outputBufferWidth());
-
     /* Set number of cores/threads to be used by the codec */
     setNumCores();
 
+    mStride = 0;
     return OK;
 }
 
@@ -287,169 +248,50 @@ status_t SoftAVC::setFlushMode() {
     return OK;
 }
 
-status_t SoftAVC::initDecoder(uint32_t width, uint32_t height) {
+status_t SoftAVC::initDecoder() {
     IV_API_CALL_STATUS_T status;
-
-    UWORD32 u4_num_reorder_frames;
-    UWORD32 u4_num_ref_frames;
-    UWORD32 u4_share_disp_buf;
-    WORD32 i4_level;
 
     mNumCores = GetCPUCoreCount();
     mCodecCtx = NULL;
 
-    /* Initialize number of ref and reorder modes (for H264) */
-    u4_num_reorder_frames = 16;
-    u4_num_ref_frames = 16;
-    u4_share_disp_buf = 0;
-
-    uint32_t displayStride = mIsAdaptive ? mAdaptiveMaxWidth : width;
-    uint32_t displayHeight = mIsAdaptive ? mAdaptiveMaxHeight : height;
-    uint32_t displaySizeY = displayStride * displayHeight;
-
-    if(mNewLevel == 0){
-        if (displaySizeY > (1920 * 1088)) {
-            i4_level = 50;
-        } else if (displaySizeY > (1280 * 720)) {
-            i4_level = 40;
-        } else if (displaySizeY > (720 * 576)) {
-            i4_level = 31;
-        } else if (displaySizeY > (624 * 320)) {
-            i4_level = 30;
-        } else if (displaySizeY > (352 * 288)) {
-            i4_level = 21;
-        } else {
-            i4_level = 20;
-        }
-    } else {
-        i4_level = mNewLevel;
-    }
-
-    {
-        iv_num_mem_rec_ip_t s_num_mem_rec_ip;
-        iv_num_mem_rec_op_t s_num_mem_rec_op;
-
-        s_num_mem_rec_ip.u4_size = sizeof(s_num_mem_rec_ip);
-        s_num_mem_rec_op.u4_size = sizeof(s_num_mem_rec_op);
-        s_num_mem_rec_ip.e_cmd = IV_CMD_GET_NUM_MEM_REC;
-
-        ALOGV("Get number of mem records");
-        status = ivdec_api_function(
-                mCodecCtx, (void *)&s_num_mem_rec_ip, (void *)&s_num_mem_rec_op);
-        if (IV_SUCCESS != status) {
-            ALOGE("Error in getting mem records: 0x%x",
-                    s_num_mem_rec_op.u4_error_code);
-            return UNKNOWN_ERROR;
-        }
-
-        mNumMemRecords = s_num_mem_rec_op.u4_num_mem_rec;
-    }
-
-    mMemRecords = (iv_mem_rec_t *)ivd_aligned_malloc(
-            128, mNumMemRecords * sizeof(iv_mem_rec_t));
-    if (mMemRecords == NULL) {
-        ALOGE("Allocation failure");
-        return NO_MEMORY;
-    }
-
-    memset(mMemRecords, 0, mNumMemRecords * sizeof(iv_mem_rec_t));
-
-    {
-        size_t i;
-        ivdext_fill_mem_rec_ip_t s_fill_mem_ip;
-        ivdext_fill_mem_rec_op_t s_fill_mem_op;
-        iv_mem_rec_t *ps_mem_rec;
-
-        s_fill_mem_ip.s_ivd_fill_mem_rec_ip_t.u4_size =
-            sizeof(ivdext_fill_mem_rec_ip_t);
-        s_fill_mem_ip.i4_level = i4_level;
-        s_fill_mem_ip.u4_num_reorder_frames = u4_num_reorder_frames;
-        s_fill_mem_ip.u4_num_ref_frames = u4_num_ref_frames;
-        s_fill_mem_ip.u4_share_disp_buf = u4_share_disp_buf;
-        s_fill_mem_ip.u4_num_extra_disp_buf = 0;
-        s_fill_mem_ip.e_output_format = mIvColorFormat;
-
-        s_fill_mem_ip.s_ivd_fill_mem_rec_ip_t.e_cmd = IV_CMD_FILL_NUM_MEM_REC;
-        s_fill_mem_ip.s_ivd_fill_mem_rec_ip_t.pv_mem_rec_location = mMemRecords;
-        s_fill_mem_ip.s_ivd_fill_mem_rec_ip_t.u4_max_frm_wd = displayStride;
-        s_fill_mem_ip.s_ivd_fill_mem_rec_ip_t.u4_max_frm_ht = displayHeight;
-        s_fill_mem_op.s_ivd_fill_mem_rec_op_t.u4_size =
-            sizeof(ivdext_fill_mem_rec_op_t);
-
-        ps_mem_rec = mMemRecords;
-        for (i = 0; i < mNumMemRecords; i++) {
-            ps_mem_rec[i].u4_size = sizeof(iv_mem_rec_t);
-        }
-
-        status = ivdec_api_function(
-                mCodecCtx, (void *)&s_fill_mem_ip, (void *)&s_fill_mem_op);
-
-        if (IV_SUCCESS != status) {
-            ALOGE("Error in filling mem records: 0x%x",
-                    s_fill_mem_op.s_ivd_fill_mem_rec_op_t.u4_error_code);
-            return UNKNOWN_ERROR;
-        }
-        mNumMemRecords =
-            s_fill_mem_op.s_ivd_fill_mem_rec_op_t.u4_num_mem_rec_filled;
-
-        ps_mem_rec = mMemRecords;
-
-        for (i = 0; i < mNumMemRecords; i++) {
-            ps_mem_rec->pv_base = ivd_aligned_malloc(
-                    ps_mem_rec->u4_mem_alignment, ps_mem_rec->u4_mem_size);
-            if (ps_mem_rec->pv_base == NULL) {
-                ALOGE("Allocation failure for memory record #%zu of size %u",
-                        i, ps_mem_rec->u4_mem_size);
-                status = IV_FAIL;
-                return NO_MEMORY;
-            }
-
-            ps_mem_rec++;
-        }
-    }
+    mStride = outputBufferWidth();
 
     /* Initialize the decoder */
     {
-        ivdext_init_ip_t s_init_ip;
-        ivdext_init_op_t s_init_op;
+        ivdext_create_ip_t s_create_ip;
+        ivdext_create_op_t s_create_op;
 
         void *dec_fxns = (void *)ivdec_api_function;
 
-        s_init_ip.s_ivd_init_ip_t.u4_size = sizeof(ivdext_init_ip_t);
-        s_init_ip.s_ivd_init_ip_t.e_cmd = (IVD_API_COMMAND_TYPE_T)IV_CMD_INIT;
-        s_init_ip.s_ivd_init_ip_t.pv_mem_rec_location = mMemRecords;
-        s_init_ip.s_ivd_init_ip_t.u4_frm_max_wd = displayStride;
-        s_init_ip.s_ivd_init_ip_t.u4_frm_max_ht = displayHeight;
+        s_create_ip.s_ivd_create_ip_t.u4_size = sizeof(ivdext_create_ip_t);
+        s_create_ip.s_ivd_create_ip_t.e_cmd = IVD_CMD_CREATE;
+        s_create_ip.s_ivd_create_ip_t.u4_share_disp_buf = 0;
+        s_create_op.s_ivd_create_op_t.u4_size = sizeof(ivdext_create_op_t);
+        s_create_ip.s_ivd_create_ip_t.e_output_format = mIvColorFormat;
+        s_create_ip.s_ivd_create_ip_t.pf_aligned_alloc = ivd_aligned_malloc;
+        s_create_ip.s_ivd_create_ip_t.pf_aligned_free = ivd_aligned_free;
+        s_create_ip.s_ivd_create_ip_t.pv_mem_ctxt = NULL;
 
-        s_init_ip.i4_level = i4_level;
-        s_init_ip.u4_num_reorder_frames = u4_num_reorder_frames;
-        s_init_ip.u4_num_ref_frames = u4_num_ref_frames;
-        s_init_ip.u4_share_disp_buf = u4_share_disp_buf;
-        s_init_ip.u4_num_extra_disp_buf = 0;
+        status = ivdec_api_function(mCodecCtx, (void *)&s_create_ip, (void *)&s_create_op);
 
-        s_init_op.s_ivd_init_op_t.u4_size = sizeof(s_init_op);
-
-        s_init_ip.s_ivd_init_ip_t.u4_num_mem_rec = mNumMemRecords;
-        s_init_ip.s_ivd_init_ip_t.e_output_format = mIvColorFormat;
-
-        mCodecCtx = (iv_obj_t *)mMemRecords[0].pv_base;
-        mCodecCtx->pv_fxns = dec_fxns;
-        mCodecCtx->u4_size = sizeof(iv_obj_t);
-
-        status = ivdec_api_function(mCodecCtx, (void *)&s_init_ip, (void *)&s_init_op);
         if (status != IV_SUCCESS) {
+            ALOGE("Error in create: 0x%x",
+                    s_create_op.s_ivd_create_op_t.u4_error_code);
+            deInitDecoder();
             mCodecCtx = NULL;
-            ALOGE("Error in init: 0x%x",
-                    s_init_op.s_ivd_init_op_t.u4_error_code);
             return UNKNOWN_ERROR;
         }
+
+        mCodecCtx = (iv_obj_t*)s_create_op.s_ivd_create_op_t.pv_handle;
+        mCodecCtx->pv_fxns = dec_fxns;
+        mCodecCtx->u4_size = sizeof(iv_obj_t);
     }
 
     /* Reset the plugin state */
     resetPlugin();
 
     /* Set the run time (dynamic) parameters */
-    setParams(displayStride);
+    setParams(mStride);
 
     /* Set number of cores/threads to be used by the codec */
     setNumCores();
@@ -457,58 +299,33 @@ status_t SoftAVC::initDecoder(uint32_t width, uint32_t height) {
     /* Get codec version */
     logVersion();
 
-    /* Allocate internal picture buffer */
-    uint32_t bufferSize = displaySizeY * 3 / 2;
-    mFlushOutBuffer = (uint8_t *)ivd_aligned_malloc(128, bufferSize);
-    if (NULL == mFlushOutBuffer) {
-        ALOGE("Could not allocate flushOutputBuffer of size %u", bufferSize);
-        return NO_MEMORY;
-    }
-
-    mInitNeeded = false;
     mFlushNeeded = false;
     return OK;
 }
 
 status_t SoftAVC::deInitDecoder() {
-    size_t i;
+    IV_API_CALL_STATUS_T status;
 
-    if (mMemRecords) {
-        iv_mem_rec_t *ps_mem_rec;
+    if (mCodecCtx) {
+        ivdext_delete_ip_t s_delete_ip;
+        ivdext_delete_op_t s_delete_op;
 
-        ps_mem_rec = mMemRecords;
-        for (i = 0; i < mNumMemRecords; i++) {
-            if (ps_mem_rec->pv_base) {
-                ivd_aligned_free(ps_mem_rec->pv_base);
-            }
-            ps_mem_rec++;
+        s_delete_ip.s_ivd_delete_ip_t.u4_size = sizeof(ivdext_delete_ip_t);
+        s_delete_ip.s_ivd_delete_ip_t.e_cmd = IVD_CMD_DELETE;
+
+        s_delete_op.s_ivd_delete_op_t.u4_size = sizeof(ivdext_delete_op_t);
+
+        status = ivdec_api_function(mCodecCtx, (void *)&s_delete_ip, (void *)&s_delete_op);
+        if (status != IV_SUCCESS) {
+            ALOGE("Error in delete: 0x%x",
+                    s_delete_op.s_ivd_delete_op_t.u4_error_code);
+            return UNKNOWN_ERROR;
         }
-        ivd_aligned_free(mMemRecords);
-        mMemRecords = NULL;
     }
 
-    if (mFlushOutBuffer) {
-        ivd_aligned_free(mFlushOutBuffer);
-        mFlushOutBuffer = NULL;
-    }
 
-    mInitNeeded = true;
     mChangingResolution = false;
 
-    return OK;
-}
-
-status_t SoftAVC::reInitDecoder(uint32_t width, uint32_t height) {
-    status_t ret;
-
-    deInitDecoder();
-
-    ret = initDecoder(width, height);
-    if (OK != ret) {
-        ALOGE("Create failure");
-        deInitDecoder();
-        return NO_MEMORY;
-    }
     return OK;
 }
 
@@ -516,25 +333,51 @@ void SoftAVC::onReset() {
     SoftVideoDecoderOMXComponent::onReset();
 
     mSignalledError = false;
+    mInputOffset = 0;
     resetDecoder();
     resetPlugin();
 }
 
-OMX_ERRORTYPE SoftAVC::internalSetParameter(OMX_INDEXTYPE index, const OMX_PTR params) {
-    const uint32_t oldWidth = mWidth;
-    const uint32_t oldHeight = mHeight;
-    OMX_ERRORTYPE ret = SoftVideoDecoderOMXComponent::internalSetParameter(index, params);
-    if (mWidth != oldWidth || mHeight != oldHeight) {
-        mNewWidth = mWidth;
-        mNewHeight = mHeight;
-        status_t err = reInitDecoder(mNewWidth, mNewHeight);
-        if (err != OK) {
-            notify(OMX_EventError, OMX_ErrorUnsupportedSetting, err, NULL);
-            mSignalledError = true;
-            return OMX_ErrorUnsupportedSetting;
-        }
+bool SoftAVC::getVUIParams() {
+    IV_API_CALL_STATUS_T status;
+    ih264d_ctl_get_vui_params_ip_t s_ctl_get_vui_params_ip;
+    ih264d_ctl_get_vui_params_op_t s_ctl_get_vui_params_op;
+
+    s_ctl_get_vui_params_ip.e_cmd = IVD_CMD_VIDEO_CTL;
+    s_ctl_get_vui_params_ip.e_sub_cmd =
+        (IVD_CONTROL_API_COMMAND_TYPE_T)IH264D_CMD_CTL_GET_VUI_PARAMS;
+
+    s_ctl_get_vui_params_ip.u4_size =
+        sizeof(ih264d_ctl_get_vui_params_ip_t);
+
+    s_ctl_get_vui_params_op.u4_size = sizeof(ih264d_ctl_get_vui_params_op_t);
+
+    status = ivdec_api_function(
+            (iv_obj_t *)mCodecCtx, (void *)&s_ctl_get_vui_params_ip,
+            (void *)&s_ctl_get_vui_params_op);
+
+    if (status != IV_SUCCESS) {
+        ALOGW("Error in getting VUI params: 0x%x",
+                s_ctl_get_vui_params_op.u4_error_code);
+        return false;
     }
-    return ret;
+
+    int32_t primaries = s_ctl_get_vui_params_op.u1_colour_primaries;
+    int32_t transfer = s_ctl_get_vui_params_op.u1_tfr_chars;
+    int32_t coeffs = s_ctl_get_vui_params_op.u1_matrix_coeffs;
+    bool fullRange = s_ctl_get_vui_params_op.u1_video_full_range_flag;
+
+    ColorAspects colorAspects;
+    ColorUtils::convertIsoColorAspectsToCodecAspects(
+            primaries, transfer, coeffs, fullRange, colorAspects);
+
+    // Update color aspects if necessary.
+    if (colorAspectsDiffer(colorAspects, mBitstreamColorAspects)) {
+        mBitstreamColorAspects = colorAspects;
+        status_t err = handleColorAspectsChange();
+        CHECK(err == OK);
+    }
+    return true;
 }
 
 bool SoftAVC::setDecodeArgs(
@@ -556,8 +399,8 @@ bool SoftAVC::setDecodeArgs(
     if (inHeader) {
         ps_dec_ip->u4_ts = timeStampIx;
         ps_dec_ip->pv_stream_buffer =
-            inHeader->pBuffer + inHeader->nOffset;
-        ps_dec_ip->u4_num_Bytes = inHeader->nFilledLen;
+            inHeader->pBuffer + inHeader->nOffset + mInputOffset;
+        ps_dec_ip->u4_num_Bytes = inHeader->nFilledLen - mInputOffset;
     } else {
         ps_dec_ip->u4_ts = 0;
         ps_dec_ip->pv_stream_buffer = NULL;
@@ -572,7 +415,7 @@ bool SoftAVC::setDecodeArgs(
     uint8_t *pBuf;
     if (outHeader) {
         if (outHeader->nAllocLen < sizeY + (sizeUV * 2)) {
-            //android_errorWriteLog(0x534e4554, "27833616");
+            android_errorWriteLog(0x534e4554, "27833616");
             return false;
         }
         pBuf = outHeader->pBuffer;
@@ -592,11 +435,21 @@ void SoftAVC::onPortFlushCompleted(OMX_U32 portIndex) {
     if (kOutputPortIndex == portIndex) {
         setFlushMode();
 
+        /* Allocate a picture buffer to flushed data */
+        uint32_t displayStride = outputBufferWidth();
+        uint32_t displayHeight = outputBufferHeight();
+
+        uint32_t bufferSize = displayStride * displayHeight * 3 / 2;
+        mFlushOutBuffer = (uint8_t *)memalign(128, bufferSize);
+        if (NULL == mFlushOutBuffer) {
+            ALOGE("Could not allocate flushOutputBuffer of size %u", bufferSize);
+            return;
+        }
+
         while (true) {
             ivd_video_decode_ip_t s_dec_ip;
             ivd_video_decode_op_t s_dec_op;
             IV_API_CALL_STATUS_T status;
-            size_t sizeY, sizeUV;
 
             setDecodeArgs(&s_dec_ip, &s_dec_op, NULL, NULL, 0);
 
@@ -606,11 +459,20 @@ void SoftAVC::onPortFlushCompleted(OMX_U32 portIndex) {
                 break;
             }
         }
+
+        if (mFlushOutBuffer) {
+            free(mFlushOutBuffer);
+            mFlushOutBuffer = NULL;
+        }
+    } else {
+        mInputOffset = 0;
     }
 }
 
 void SoftAVC::onQueueFilled(OMX_U32 portIndex) {
     UNUSED(portIndex);
+    OMX_BUFFERHEADERTYPE *inHeader = NULL;
+    BufferInfo *inInfo = NULL;
 
     if (mSignalledError) {
         return;
@@ -619,31 +481,29 @@ void SoftAVC::onQueueFilled(OMX_U32 portIndex) {
         return;
     }
 
+    if (NULL == mCodecCtx) {
+        if (OK != initDecoder()) {
+            ALOGE("Failed to initialize decoder");
+            notify(OMX_EventError, OMX_ErrorUnsupportedSetting, 0, NULL);
+            mSignalledError = true;
+            return;
+        }
+    }
+    if (outputBufferWidth() != mStride) {
+        /* Set the run-time (dynamic) parameters */
+        mStride = outputBufferWidth();
+        setParams(mStride);
+    }
+
     List<BufferInfo *> &inQueue = getPortQueue(kInputPortIndex);
     List<BufferInfo *> &outQueue = getPortQueue(kOutputPortIndex);
 
-    /* If input EOS is seen and decoder is not in flush mode,
-     * set the decoder in flush mode.
-     * There can be a case where EOS is sent along with last picture data
-     * In that case, only after decoding that input data, decoder has to be
-     * put in flush. This case is handled here  */
-
-    if (mReceivedEOS && !mIsInFlush) {
-        setFlushMode();
-    }
-
     while (!outQueue.empty()) {
-        BufferInfo *inInfo;
-        OMX_BUFFERHEADERTYPE *inHeader;
-
         BufferInfo *outInfo;
         OMX_BUFFERHEADERTYPE *outHeader;
-        size_t timeStampIx;
+        size_t timeStampIx = 0;
 
-        inInfo = NULL;
-        inHeader = NULL;
-
-        if (!mIsInFlush) {
+        if (!mIsInFlush && (NULL == inHeader)) {
             if (!inQueue.empty()) {
                 inInfo = *inQueue.begin();
                 inHeader = inInfo->mHeader;
@@ -670,7 +530,7 @@ void SoftAVC::onQueueFilled(OMX_U32 portIndex) {
                 notifyEmptyBufferDone(inHeader);
 
                 if (!(inHeader->nFlags & OMX_BUFFERFLAG_EOS)) {
-                    continue;
+                    return;
                 }
 
                 mReceivedEOS = true;
@@ -679,22 +539,6 @@ void SoftAVC::onQueueFilled(OMX_U32 portIndex) {
             } else if (inHeader->nFlags & OMX_BUFFERFLAG_EOS) {
                 mReceivedEOS = true;
             }
-        }
-
-        // When there is an init required and the decoder is not in flush mode,
-        // update output port's definition and reinitialize decoder.
-        if (mInitNeeded && !mIsInFlush) {
-            bool portWillReset = false;
-
-            status_t err = reInitDecoder(mNewWidth, mNewHeight);
-            if (err != OK) {
-                notify(OMX_EventError, OMX_ErrorUnsupportedSetting, err, NULL);
-                mSignalledError = true;
-                return;
-            }
-
-            handlePortSettingsChange(&portWillReset, mNewWidth, mNewHeight);
-            return;
         }
 
         /* Get a free slot in timestamp array to hold input timestamp */
@@ -716,8 +560,7 @@ void SoftAVC::onQueueFilled(OMX_U32 portIndex) {
         {
             ivd_video_decode_ip_t s_dec_ip;
             ivd_video_decode_op_t s_dec_op;
-            WORD32 timeDelay, timeTaken;
-            size_t sizeY, sizeUV;
+            nsecs_t timeDelay, timeTaken;
 
             if (!setDecodeArgs(&s_dec_ip, &s_dec_op, inHeader, outHeader, timeStampIx)) {
                 ALOGE("Decoder arg setup failed");
@@ -726,26 +569,52 @@ void SoftAVC::onQueueFilled(OMX_U32 portIndex) {
                 return;
             }
             // If input dump is enabled, then write to file
-            DUMP_TO_FILE(mInFile, s_dec_ip.pv_stream_buffer, s_dec_ip.u4_num_Bytes);
+            DUMP_TO_FILE(mInFile, s_dec_ip.pv_stream_buffer, s_dec_ip.u4_num_Bytes, mInputOffset);
 
-            GETTIME(&mTimeStart, NULL);
+            mTimeStart = systemTime();
             /* Compute time elapsed between end of previous decode()
              * to start of current decode() */
-            TIME_DIFF(mTimeEnd, mTimeStart, timeDelay);
+            timeDelay = mTimeStart - mTimeEnd;
 
             IV_API_CALL_STATUS_T status;
             status = ivdec_api_function(mCodecCtx, (void *)&s_dec_ip, (void *)&s_dec_op);
 
-            bool unsupportedDimensions =
-                (IVD_STREAM_WIDTH_HEIGHT_NOT_SUPPORTED == (s_dec_op.u4_error_code & 0xFF));
-            bool resChanged = (IVD_RES_CHANGED == (s_dec_op.u4_error_code & 0xFF));
-            bool unsupportedLevel = (IH264D_UNSUPPORTED_LEVEL == (s_dec_op.u4_error_code & 0xFF));
+            bool unsupportedResolution =
+                (IVD_STREAM_WIDTH_HEIGHT_NOT_SUPPORTED == (s_dec_op.u4_error_code & IVD_ERROR_MASK));
 
-            GETTIME(&mTimeEnd, NULL);
+            /* Check for unsupported dimensions */
+            if (unsupportedResolution) {
+                ALOGE("Unsupported resolution : %dx%d", mWidth, mHeight);
+                notify(OMX_EventError, OMX_ErrorUnsupportedSetting, 0, NULL);
+                mSignalledError = true;
+                return;
+            }
+
+            bool allocationFailed = (IVD_MEM_ALLOC_FAILED == (s_dec_op.u4_error_code & IVD_ERROR_MASK));
+            if (allocationFailed) {
+                ALOGE("Allocation failure in decoder");
+                notify(OMX_EventError, OMX_ErrorUnsupportedSetting, 0, NULL);
+                mSignalledError = true;
+                return;
+            }
+
+            if (IS_IVD_FATAL_ERROR(s_dec_op.u4_error_code)) {
+                ALOGE("Fatal Error : 0x%x", s_dec_op.u4_error_code);
+                notify(OMX_EventError, OMX_ErrorUnsupportedSetting, 0, NULL);
+                mSignalledError = true;
+                return;
+            }
+
+            bool resChanged = (IVD_RES_CHANGED == (s_dec_op.u4_error_code & IVD_ERROR_MASK));
+
+            getVUIParams();
+
+            mTimeEnd = systemTime();
             /* Compute time taken for decode() */
-            TIME_DIFF(mTimeStart, mTimeEnd, timeTaken);
+            timeTaken = mTimeEnd - mTimeStart;
 
-            PRINT_TIME("timeTaken=%6d delay=%6d numBytes=%6d", timeTaken, timeDelay,
+            ALOGV("timeTaken=%6lldus delay=%6lldus numBytes=%6d",
+                    (long long) (timeTaken / 1000LL), (long long) (timeDelay / 1000LL),
                    s_dec_op.u4_num_bytes_consumed);
             if (s_dec_op.u4_frame_decoded_flag && !mFlushNeeded) {
                 mFlushNeeded = true;
@@ -757,90 +626,42 @@ void SoftAVC::onQueueFilled(OMX_U32 portIndex) {
                 mTimeStampsValid[timeStampIx] = false;
             }
 
-
-            // This is needed to handle CTS DecoderTest testCodecResetsH264WithoutSurface,
-            // which is not sending SPS/PPS after port reconfiguration and flush to the codec.
-            if (unsupportedDimensions && !mFlushNeeded) {
-                bool portWillReset = false;
-                mNewWidth = s_dec_op.u4_pic_wd;
-                mNewHeight = s_dec_op.u4_pic_ht;
-
-                status_t err = reInitDecoder(mNewWidth, mNewHeight);
-                if (err != OK) {
-                    notify(OMX_EventError, OMX_ErrorUnsupportedSetting, err, NULL);
-                    mSignalledError = true;
-                    return;
-                }
-
-                handlePortSettingsChange(&portWillReset, mNewWidth, mNewHeight);
-
-                setDecodeArgs(&s_dec_ip, &s_dec_op, inHeader, outHeader, timeStampIx);
-
-                ivdec_api_function(mCodecCtx, (void *)&s_dec_ip, (void *)&s_dec_op);
-                return;
-            }
-
-            if (unsupportedLevel && !mFlushNeeded) {
-
-                mNewLevel = 51;
-
-                status_t err = reInitDecoder(mNewWidth, mNewHeight);
-                if (err != OK) {
-                    notify(OMX_EventError, OMX_ErrorUnsupportedSetting, err, NULL);
-                    mSignalledError = true;
-                    return;
-                }
-
-                setDecodeArgs(&s_dec_ip, &s_dec_op, inHeader, outHeader, timeStampIx);
-
-                ivdec_api_function(mCodecCtx, (void *)&s_dec_ip, (void *)&s_dec_op);
-                return;
-            }
-
             // If the decoder is in the changing resolution mode and there is no output present,
             // that means the switching is done and it's ready to reset the decoder and the plugin.
             if (mChangingResolution && !s_dec_op.u4_output_present) {
                 mChangingResolution = false;
                 resetDecoder();
                 resetPlugin();
+                mStride = outputBufferWidth();
+                setParams(mStride);
                 continue;
             }
 
-            if (unsupportedDimensions || resChanged) {
+            if (resChanged) {
                 mChangingResolution = true;
                 if (mFlushNeeded) {
                     setFlushMode();
                 }
-
-                if (unsupportedDimensions) {
-                    mNewWidth = s_dec_op.u4_pic_wd;
-                    mNewHeight = s_dec_op.u4_pic_ht;
-                    mInitNeeded = true;
-                }
                 continue;
             }
 
-            if (unsupportedLevel) {
-
-                if (mFlushNeeded) {
-                    setFlushMode();
-                }
-
-                mNewLevel = 51;
-                mInitNeeded = true;
-                continue;
-            }
-
+            // Combine the resolution change and coloraspects change in one PortSettingChange event
+            // if necessary.
             if ((0 < s_dec_op.u4_pic_wd) && (0 < s_dec_op.u4_pic_ht)) {
                 uint32_t width = s_dec_op.u4_pic_wd;
                 uint32_t height = s_dec_op.u4_pic_ht;
                 bool portWillReset = false;
                 handlePortSettingsChange(&portWillReset, width, height);
-
                 if (portWillReset) {
                     resetDecoder();
+                    resetPlugin();
                     return;
                 }
+            } else if (mUpdateColorAspects) {
+                notify(OMX_EventPortSettingsChanged, kOutputPortIndex,
+                    kDescribeColorAspectsIndex, NULL);
+                mUpdateColorAspects = false;
+                return;
             }
 
             if (s_dec_op.u4_output_present) {
@@ -854,7 +675,7 @@ void SoftAVC::onQueueFilled(OMX_U32 portIndex) {
                 outInfo = NULL;
                 notifyFillBufferDone(outHeader);
                 outHeader = NULL;
-            } else {
+            } else if (mIsInFlush) {
                 /* If in flush mode and no output is returned by the codec,
                  * then come out of flush mode */
                 mIsInFlush = false;
@@ -873,16 +694,32 @@ void SoftAVC::onQueueFilled(OMX_U32 portIndex) {
                     resetPlugin();
                 }
             }
+            mInputOffset += s_dec_op.u4_num_bytes_consumed;
         }
-
-        if (inHeader != NULL) {
+        // If more than 4 bytes are remaining in input, then do not release it
+        if (inHeader != NULL && ((inHeader->nFilledLen - mInputOffset) <= 4)) {
             inInfo->mOwnedByUs = false;
             inQueue.erase(inQueue.begin());
             inInfo = NULL;
             notifyEmptyBufferDone(inHeader);
             inHeader = NULL;
+            mInputOffset = 0;
+
+            /* If input EOS is seen and decoder is not in flush mode,
+             * set the decoder in flush mode.
+             * There can be a case where EOS is sent along with last picture data
+             * In that case, only after decoding that input data, decoder has to be
+             * put in flush. This case is handled here  */
+
+            if (mReceivedEOS && !mIsInFlush) {
+                setFlushMode();
+            }
         }
     }
+}
+
+int SoftAVC::getColorAspectPreference() {
+    return kPreferBitstream;
 }
 
 }  // namespace android

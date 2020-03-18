@@ -184,6 +184,9 @@ typedef enum
 {
     LVEQNB_STEREO       = 0,
     LVEQNB_MONOINSTEREO = 1,
+#ifdef SUPPORT_MC
+    LVEQNB_MULTICHANNEL = 2,
+#endif
     LVEQNB_SOURCE_MAX   = LVM_MAXINT_32
 } LVEQNB_SourceFormat_en;
 
@@ -200,6 +203,12 @@ typedef enum
 #define LVEQNB_CAP_FS_32000                64
 #define LVEQNB_CAP_FS_44100                128
 #define LVEQNB_CAP_FS_48000                256
+#if defined(BUILD_FLOAT) && defined(HIGHER_FS)
+#define LVEQNB_CAP_FS_88200                512
+#define LVEQNB_CAP_FS_96000                1024
+#define LVEQNB_CAP_FS_176400               2048
+#define LVEQNB_CAP_FS_192000               4096
+#endif
 
 typedef enum
 {
@@ -212,6 +221,12 @@ typedef enum
     LVEQNB_FS_32000 = 6,
     LVEQNB_FS_44100 = 7,
     LVEQNB_FS_48000 = 8,
+#ifdef HIGHER_FS
+    LVEQNB_FS_88200 = 9,
+    LVEQNB_FS_96000 = 10,
+    LVEQNB_FS_176400 = 11,
+    LVEQNB_FS_192000 = 12,
+#endif
     LVEQNB_FS_MAX   = LVM_MAXINT_32
 } LVEQNB_Fs_en;
 
@@ -259,7 +274,9 @@ typedef struct
     /* Equaliser parameters */
     LVM_UINT16                  NBands;                 /* Number of bands */
     LVEQNB_BandDef_t            *pBandDefinition;       /* Pointer to equaliser definitions */
-
+#ifdef SUPPORT_MC
+    LVM_INT16                   NrChannels;
+#endif
 } LVEQNB_Params_t;
 
 
@@ -268,6 +285,7 @@ typedef struct
 {
     /* General parameters */
     LVM_UINT16                  SampleRate;
+
     LVM_UINT16                  SourceFormat;
     LVM_UINT16                  MaxBlockSize;
     LVM_UINT16                  MaxBands;
@@ -460,11 +478,17 @@ LVEQNB_ReturnStatus_en LVEQNB_Control(LVEQNB_Handle_t       hInstance,
 /* NOTES:                                                                               */
 /*                                                                                      */
 /****************************************************************************************/
-
+#ifdef BUILD_FLOAT
+LVEQNB_ReturnStatus_en LVEQNB_Process(LVEQNB_Handle_t       hInstance,
+                                      const LVM_FLOAT       *pInData,
+                                      LVM_FLOAT             *pOutData,
+                                      LVM_UINT16            NumSamples);
+#else
 LVEQNB_ReturnStatus_en LVEQNB_Process(LVEQNB_Handle_t       hInstance,
                                       const LVM_INT16       *pInData,
                                       LVM_INT16             *pOutData,
                                       LVM_UINT16            NumSamples);
+#endif
 
 
 

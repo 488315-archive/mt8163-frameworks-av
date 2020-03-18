@@ -23,18 +23,36 @@ namespace android {
 
 sp<ABuffer> decodeBase64(const AString &s) {
     size_t n = s.size();
+
     if ((n % 4) != 0) {
         return NULL;
     }
 
+    size_t bufSize = n / 4 * 3;
+    sp<ABuffer> buf = new ABuffer(bufSize);
+
+    if (decodeBase64(buf->data(), &bufSize, s.c_str())) {
+        buf->setRange(0, bufSize);
+        return buf;
+    }
+    return NULL;
+}
+
+bool decodeBase64(uint8_t *out, size_t *inOutBufSize, const char* s) {
+    size_t n = strlen(s);
+
+    if ((n % 4) != 0) {
+        return false;
+    }
+
     size_t padding = 0;
-    if (n >= 1 && s.c_str()[n - 1] == '=') {
+    if (n >= 1 && s[n - 1] == '=') {
         padding = 1;
 
-        if (n >= 2 && s.c_str()[n - 2] == '=') {
+        if (n >= 2 && s[n - 2] == '=') {
             padding = 2;
 
-            if (n >= 3 && s.c_str()[n - 3] == '=') {
+            if (n >= 3 && s[n - 3] == '=') {
                 padding = 3;
             }
         }
@@ -44,16 +62,13 @@ sp<ABuffer> decodeBase64(const AString &s) {
     // already made sure that n % 4 == 0.
     size_t outLen = (n / 4) * 3 - padding;
 
-    sp<ABuffer> buffer = new ABuffer(outLen);
-
-    uint8_t *out = buffer->data();
-    if (out == NULL || buffer->size() < outLen) {
-        return NULL;
+    if (out == NULL || *inOutBufSize < outLen) {
+        return false;
     }
     size_t j = 0;
     uint32_t accum = 0;
     for (size_t i = 0; i < n; ++i) {
-        char c = s.c_str()[i];
+        char c = s[i];
         unsigned value;
         if (c >= 'A' && c <= 'Z') {
             value = c - 'A';
@@ -61,15 +76,15 @@ sp<ABuffer> decodeBase64(const AString &s) {
             value = 26 + c - 'a';
         } else if (c >= '0' && c <= '9') {
             value = 52 + c - '0';
-        } else if (c == '+') {
+        } else if (c == '+' || c == '-') {
             value = 62;
-        } else if (c == '/') {
+        } else if (c == '/' || c == '_') {
             value = 63;
         } else if (c != '=') {
-            return NULL;
+            return false;
         } else {
             if (i < n - padding) {
-                return NULL;
+                return false;
             }
 
             value = 0;
@@ -78,8 +93,7 @@ sp<ABuffer> decodeBase64(const AString &s) {
         accum = (accum << 6) | value;
 
         if (((i + 1) % 4) == 0) {
-            out[j++] = (accum >> 16);
-
+            if (j < outLen) { out[j++] = (accum >> 16); }
             if (j < outLen) { out[j++] = (accum >> 8) & 0xff; }
             if (j < outLen) { out[j++] = accum & 0xff; }
 
@@ -87,7 +101,8 @@ sp<ABuffer> decodeBase64(const AString &s) {
         }
     }
 
-    return buffer;
+    *inOutBufSize = j;
+    return true;
 }
 
 static char encode6Bit(unsigned x) {
@@ -144,5 +159,27 @@ void encodeBase64(
         }
     }
 }
+
+void encodeBase64Url(
+        const void *_data, size_t size, AString *out) {
+    encodeBase64(_data, size, out);
+
+    if ((-1 != out->find("+")) || (-1 != out->find("/"))) {
+        size_t outLen = out->size();
+        char *base64url = new char[outLen];
+        for (size_t i = 0; i < outLen; ++i) {
+            if (out->c_str()[i] == '+')
+                base64url[i] = '-';
+            else if (out->c_str()[i] == '/')
+                base64url[i] = '_';
+            else
+                base64url[i] = out->c_str()[i];
+        }
+
+        out->setTo(base64url, outLen);
+        delete[] base64url;
+    }
+}
+
 
 }  // namespace android

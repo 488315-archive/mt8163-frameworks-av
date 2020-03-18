@@ -24,13 +24,17 @@
 #include "AnotherPacketSource.h"
 #include "NuPlayerStreamListener.h"
 
+#include <media/MediaSource.h>
 #include <media/stagefright/foundation/ABuffer.h>
 #include <media/stagefright/foundation/ADebug.h>
 #include <media/stagefright/foundation/AMessage.h>
-#include <media/stagefright/MediaSource.h>
+#include <media/stagefright/foundation/MediaKeys.h>
 #include <media/stagefright/MetaData.h>
+#include <media/stagefright/Utils.h>
 
 namespace android {
+
+const int32_t kNumListenerQueuePackets = 80;
 
 NuPlayer::StreamingSource::StreamingSource(
         const sp<AMessage> &notify,
@@ -46,6 +50,17 @@ NuPlayer::StreamingSource::~StreamingSource() {
         mLooper->unregisterHandler(id());
         mLooper->stop();
     }
+}
+
+status_t NuPlayer::StreamingSource::getBufferingSettings(
+        BufferingSettings *buffering /* nonnull */) {
+    *buffering = BufferingSettings();
+    return OK;
+}
+
+status_t NuPlayer::StreamingSource::setBufferingSettings(
+        const BufferingSettings & /* buffering */) {
+    return OK;
 }
 
 void NuPlayer::StreamingSource::prepareAsync() {
@@ -84,7 +99,7 @@ status_t NuPlayer::StreamingSource::feedMoreTSData() {
 }
 
 void NuPlayer::StreamingSource::onReadBuffer() {
-    for (int32_t i = 0; i < 50; ++i) {
+    for (int32_t i = 0; i < kNumListenerQueuePackets; ++i) {
         char buffer[188];
         sp<AMessage> extra;
         ssize_t n = mStreamListener->read(buffer, sizeof(buffer), &extra);
@@ -100,7 +115,7 @@ void NuPlayer::StreamingSource::onReadBuffer() {
             int32_t mask;
             if (extra != NULL
                     && extra->findInt32(
-                        IStreamListener::kKeyDiscontinuityMask, &mask)) {
+                        kIStreamListenerKeyDiscontinuityMask, &mask)) {
                 if (mask == 0) {
                     ALOGE("Client specified an illegal discontinuity type.");
                     setError(ERROR_UNSUPPORTED);
@@ -128,7 +143,7 @@ void NuPlayer::StreamingSource::onReadBuffer() {
                     int64_t mediaTimeUs;
                     memcpy(&mediaTimeUs, &buffer[2], sizeof(mediaTimeUs));
 
-                    extra->setInt64(IStreamListener::kKeyMediaTimeUs, mediaTimeUs);
+                    extra->setInt64(kATSParserKeyMediaTimeUs, mediaTimeUs);
                 }
 
                 mTSParser->signalDiscontinuity(
@@ -171,7 +186,7 @@ bool NuPlayer::StreamingSource::haveSufficientDataOnAllTracks() {
     // We're going to buffer at least 2 secs worth data on all tracks before
     // starting playback (both at startup and after a seek).
 
-    static const int64_t kMinDurationUs = 2000000ll;
+    static const int64_t kMinDurationUs = 2000000LL;
 
     sp<AnotherPacketSource> audioTrack = getSource(true /*audio*/);
     sp<AnotherPacketSource> videoTrack = getSource(false /*audio*/);
@@ -215,14 +230,25 @@ sp<AnotherPacketSource> NuPlayer::StreamingSource::getSource(bool audio) {
     return static_cast<AnotherPacketSource *>(source.get());
 }
 
-sp<MetaData> NuPlayer::StreamingSource::getFormatMeta(bool audio) {
+sp<AMessage> NuPlayer::StreamingSource::getFormat(bool audio) {
     sp<AnotherPacketSource> source = getSource(audio);
 
+    sp<AMessage> format = new AMessage;
     if (source == NULL) {
-        return NULL;
+        format->setInt32("err", -EWOULDBLOCK);
+        return format;
     }
 
-    return source->getFormat();
+    sp<MetaData> meta = source->getFormat();
+    if (meta == NULL) {
+        format->setInt32("err", -EWOULDBLOCK);
+        return format;
+    }
+    status_t err = convertMetaDataToMessage(meta, &format);
+    if (err != OK) { // format may have been cleared on error
+        return NULL;
+    }
+    return format;
 }
 
 status_t NuPlayer::StreamingSource::dequeueAccessUnit(

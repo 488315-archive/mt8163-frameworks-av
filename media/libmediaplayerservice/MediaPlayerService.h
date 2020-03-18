@@ -1,9 +1,4 @@
 /*
-* Copyright (C) 2014 MediaTek Inc.
-* Modification based on code covered by the mentioned copyright
-* and/or permission notice(s).
-*/
-/*
 **
 ** Copyright 2008, The Android Open Source Project
 **
@@ -42,22 +37,20 @@ namespace android {
 struct AudioPlaybackRate;
 class AudioTrack;
 struct AVSyncSettings;
+class DeathNotifier;
 class IDataSource;
 class IMediaRecorder;
 class IMediaMetadataRetriever;
-class IOMX;
 class IRemoteDisplay;
 class IRemoteDisplayClient;
 class MediaRecorderClient;
-#ifdef MTK_AOSP_ENHANCEMENT
 struct RemoteDisplay;
-#endif
 
 #define CALLBACK_ANTAGONIZER 0
 #if CALLBACK_ANTAGONIZER
 class Antagonizer {
 public:
-    Antagonizer(notify_callback_f cb, void* client);
+    Antagonizer(const sp<MediaPlayerBase::Listener> &listener);
     void start() { mActive = true; }
     void stop() { mActive = false; }
     void kill();
@@ -65,12 +58,11 @@ private:
     static const int interval;
     Antagonizer();
     static int callbackThread(void* cookie);
-    Mutex               mLock;
-    Condition           mCondition;
-    bool                mExit;
-    bool                mActive;
-    void*               mClient;
-    notify_callback_f   mCb;
+    Mutex                         mLock;
+    Condition                     mCondition;
+    bool                          mExit;
+    bool                          mActive;
+    sp<MediaPlayerBase::Listener> mListener;
 };
 #endif
 
@@ -83,8 +75,12 @@ class MediaPlayerService : public BnMediaPlayerService
         class CallbackData;
 
      public:
-                                AudioOutput(int sessionId, int uid, int pid,
-                                        const audio_attributes_t * attr);
+                                AudioOutput(
+                                        audio_session_t sessionId,
+                                        uid_t uid,
+                                        int pid,
+                                        const audio_attributes_t * attr,
+                                        const sp<AudioSystem::AudioDeviceCallback>& deviceCallback);
         virtual                 ~AudioOutput();
 
         virtual bool            ready() const { return mTrack != 0; }
@@ -96,9 +92,11 @@ class MediaPlayerService : public BnMediaPlayerService
         virtual float           msecsPerFrame() const;
         virtual status_t        getPosition(uint32_t *position) const;
         virtual status_t        getTimestamp(AudioTimestamp &ts) const;
+        virtual int64_t         getPlayedOutDurationUs(int64_t nowUs) const;
         virtual status_t        getFramesWritten(uint32_t *frameswritten) const;
-        virtual int             getSessionId() const;
+        virtual audio_session_t getSessionId() const;
         virtual uint32_t        getSampleRate() const;
+        virtual int64_t         getBufferDurationInUs() const;
 
         virtual status_t        open(
                 uint32_t sampleRate, int channelCount, audio_channel_mask_t channelMask,
@@ -135,12 +133,23 @@ class MediaPlayerService : public BnMediaPlayerService
         virtual status_t        setParameters(const String8& keyValuePairs);
         virtual String8         getParameters(const String8& keys);
 
+        virtual media::VolumeShaper::Status applyVolumeShaper(
+                                        const sp<media::VolumeShaper::Configuration>& configuration,
+                                        const sp<media::VolumeShaper::Operation>& operation) override;
+        virtual sp<media::VolumeShaper::State> getVolumeShaperState(int id) override;
+
+        // AudioRouting
+        virtual status_t        setOutputDevice(audio_port_handle_t deviceId);
+        virtual status_t        getRoutedDeviceId(audio_port_handle_t* deviceId);
+        virtual status_t        enableAudioDeviceCallback(bool enabled);
+
     private:
         static void             setMinBufferCount();
         static void             CallbackWrapper(
                 int event, void *me, void *info);
                void             deleteRecycledTrack_l();
                void             close_l();
+           status_t             updateTrack();
 
         sp<AudioTrack>          mTrack;
         sp<AudioTrack>          mRecycledTrack;
@@ -148,7 +157,6 @@ class MediaPlayerService : public BnMediaPlayerService
         AudioCallback           mCallback;
         void *                  mCallbackCookie;
         CallbackData *          mCallbackData;
-        uint64_t                mBytesWritten;
         audio_stream_type_t     mStreamType;
         audio_attributes_t *    mAttributes;
         float                   mLeftVolume;
@@ -157,12 +165,17 @@ class MediaPlayerService : public BnMediaPlayerService
         uint32_t                mSampleRateHz; // sample rate of the content, as set in open()
         float                   mMsecsPerFrame;
         size_t                  mFrameSize;
-        int                     mSessionId;
-        int                     mUid;
+        audio_session_t         mSessionId;
+        uid_t                   mUid;
         int                     mPid;
         float                   mSendLevel;
         int                     mAuxEffectId;
         audio_output_flags_t    mFlags;
+        sp<media::VolumeHandler>       mVolumeHandler;
+        audio_port_handle_t     mSelectedDeviceId;
+        audio_port_handle_t     mRoutedDeviceId;
+        bool                    mDeviceCallbackEnabled;
+        wp<AudioSystem::AudioDeviceCallback>        mDeviceCallback;
         mutable Mutex           mLock;
 
         // static variables below not protected by mutex
@@ -175,7 +188,7 @@ class MediaPlayerService : public BnMediaPlayerService
         class CallbackData {
             friend AudioOutput;
         public:
-            CallbackData(AudioOutput *cookie) {
+            explicit CallbackData(AudioOutput *cookie) {
                 mData = cookie;
                 mSwitching = false;
             }
@@ -212,81 +225,99 @@ class MediaPlayerService : public BnMediaPlayerService
 
     }; // AudioOutput
 
-
 public:
     static  void                instantiate();
 
     // IMediaPlayerService interface
     virtual sp<IMediaRecorder>  createMediaRecorder(const String16 &opPackageName);
-    void    removeMediaRecorderClient(wp<MediaRecorderClient> client);
+    void    removeMediaRecorderClient(const wp<MediaRecorderClient>& client);
     virtual sp<IMediaMetadataRetriever> createMetadataRetriever();
 
-    virtual sp<IMediaPlayer>    create(const sp<IMediaPlayerClient>& client, int audioSessionId);
+    virtual sp<IMediaPlayer>    create(const sp<IMediaPlayerClient>& client,
+                                       audio_session_t audioSessionId);
 
     virtual sp<IMediaCodecList> getCodecList() const;
-    virtual sp<IOMX>            getOMX();
-    virtual sp<ICrypto>         makeCrypto();
-    virtual sp<IDrm>            makeDrm();
-    virtual sp<IHDCP>           makeHDCP(bool createEncryptionModule);
 
     virtual sp<IRemoteDisplay> listenForRemoteDisplay(const String16 &opPackageName,
             const sp<IRemoteDisplayClient>& client, const String8& iface);
     virtual status_t            dump(int fd, const Vector<String16>& args);
 
-            void                removeClient(wp<Client> client);
+            void                removeClient(const wp<Client>& client);
             bool                hasClient(wp<Client> client);
 
-    // For battery usage tracking purpose
-    struct BatteryUsageInfo {
-        // how many streams are being played by one UID
-        int     refCount;
-        // a temp variable to store the duration(ms) of audio codecs
-        // when we start a audio codec, we minus the system time from audioLastTime
-        // when we pause it, we add the system time back to the audioLastTime
-        // so after the pause, audioLastTime = pause time - start time
-        // if multiple audio streams are played (or recorded), then audioLastTime
-        // = the total playing time of all the streams
-        int32_t audioLastTime;
-        // when all the audio streams are being paused, we assign audioLastTime to
-        // this variable, so this value could be provided to the battery app
-        // in the next pullBatteryData call
-        int32_t audioTotalTime;
-
-        int32_t videoLastTime;
-        int32_t videoTotalTime;
-    };
-    KeyedVector<int, BatteryUsageInfo>    mBatteryData;
-
     enum {
-        SPEAKER,
-        OTHER_AUDIO_DEVICE,
-        SPEAKER_AND_OTHER,
-        NUM_AUDIO_DEVICES
+        MEDIASERVER_PROCESS_DEATH = 0,
+        MEDIAEXTRACTOR_PROCESS_DEATH = 1,
+        MEDIACODEC_PROCESS_DEATH = 2,
+        AUDIO_PROCESS_DEATH = 3,   // currently no need to track this
+        CAMERA_PROCESS_DEATH = 4
     };
-
-    struct BatteryAudioFlingerUsageInfo {
-        int refCount; // how many audio streams are being played
-        int deviceOn[NUM_AUDIO_DEVICES]; // whether the device is currently used
-        int32_t lastTime[NUM_AUDIO_DEVICES]; // in ms
-        // totalTime[]: total time of audio output devices usage
-        int32_t totalTime[NUM_AUDIO_DEVICES]; // in ms
-    };
-
-    // This varialble is used to record the usage of audio output device
-    // for battery app
-    BatteryAudioFlingerUsageInfo mBatteryAudio;
 
     // Collect info of the codec usage from media player and media recorder
     virtual void                addBatteryData(uint32_t params);
     // API for the Battery app to pull the data of codecs usage
     virtual status_t            pullBatteryData(Parcel* reply);
 private:
+    struct BatteryTracker {
+        BatteryTracker();
+        // Collect info of the codec usage from media player and media recorder
+        void addBatteryData(uint32_t params);
+        // API for the Battery app to pull the data of codecs usage
+        status_t pullBatteryData(Parcel* reply);
+
+    private:
+        // For battery usage tracking purpose
+        struct BatteryUsageInfo {
+            // how many streams are being played by one UID
+            int     refCount;
+            // a temp variable to store the duration(ms) of audio codecs
+            // when we start a audio codec, we minus the system time from audioLastTime
+            // when we pause it, we add the system time back to the audioLastTime
+            // so after the pause, audioLastTime = pause time - start time
+            // if multiple audio streams are played (or recorded), then audioLastTime
+            // = the total playing time of all the streams
+            int32_t audioLastTime;
+            // when all the audio streams are being paused, we assign audioLastTime to
+            // this variable, so this value could be provided to the battery app
+            // in the next pullBatteryData call
+            int32_t audioTotalTime;
+
+            int32_t videoLastTime;
+            int32_t videoTotalTime;
+        };
+        KeyedVector<int, BatteryUsageInfo>    mBatteryData;
+
+        enum {
+            SPEAKER,
+            OTHER_AUDIO_DEVICE,
+            SPEAKER_AND_OTHER,
+            NUM_AUDIO_DEVICES
+        };
+
+        struct BatteryAudioFlingerUsageInfo {
+            int refCount; // how many audio streams are being played
+            int deviceOn[NUM_AUDIO_DEVICES]; // whether the device is currently used
+            int32_t lastTime[NUM_AUDIO_DEVICES]; // in ms
+            // totalTime[]: total time of audio output devices usage
+            int32_t totalTime[NUM_AUDIO_DEVICES]; // in ms
+        };
+
+        // This varialble is used to record the usage of audio output device
+        // for battery app
+        BatteryAudioFlingerUsageInfo mBatteryAudio;
+
+        mutable Mutex mLock;
+    };
+    BatteryTracker mBatteryTracker;
 
     class Client : public BnMediaPlayer {
         // IMediaPlayer interface
         virtual void            disconnect();
         virtual status_t        setVideoSurfaceTexture(
                                         const sp<IGraphicBufferProducer>& bufferProducer);
+        virtual status_t        setBufferingSettings(const BufferingSettings& buffering) override;
+        virtual status_t        getBufferingSettings(
+                                        BufferingSettings* buffering /* nonnull */) override;
         virtual status_t        prepareAsync();
         virtual status_t        start();
         virtual status_t        stop();
@@ -297,10 +328,13 @@ private:
         virtual status_t        setSyncSettings(const AVSyncSettings& rate, float videoFpsHint);
         virtual status_t        getSyncSettings(AVSyncSettings* rate /* nonnull */,
                                                 float* videoFps /* nonnull */);
-        virtual status_t        seekTo(int msec);
+        virtual status_t        seekTo(
+                int msec,
+                MediaPlayerSeekMode mode = MediaPlayerSeekMode::SEEK_PREVIOUS_SYNC);
         virtual status_t        getCurrentPosition(int* msec);
         virtual status_t        getDuration(int* msec);
         virtual status_t        reset();
+        virtual status_t        notifyAt(int64_t mediaTimeUs);
         virtual status_t        setAudioStreamType(audio_stream_type_t type);
         virtual status_t        setLooping(int loop);
         virtual status_t        setVolume(float leftVolume, float rightVolume);
@@ -317,6 +351,11 @@ private:
         virtual status_t        getRetransmitEndpoint(struct sockaddr_in* endpoint);
         virtual status_t        setNextPlayer(const sp<IMediaPlayer>& player);
 
+        virtual media::VolumeShaper::Status applyVolumeShaper(
+                                        const sp<media::VolumeShaper::Configuration>& configuration,
+                                        const sp<media::VolumeShaper::Operation>& operation) override;
+        virtual sp<media::VolumeShaper::State> getVolumeShaperState(int id) override;
+
         sp<MediaPlayerBase>     createPlayer(player_type playerType);
 
         virtual status_t        setDataSource(
@@ -331,24 +370,45 @@ private:
 
 
         sp<MediaPlayerBase>     setDataSource_pre(player_type playerType);
-        void                    setDataSource_post(const sp<MediaPlayerBase>& p,
+        status_t                setDataSource_post(const sp<MediaPlayerBase>& p,
                                                    status_t status);
 
-        static  void            notify(void* cookie, int msg,
-                                       int ext1, int ext2, const Parcel *obj);
+                void            notify(int msg, int ext1, int ext2, const Parcel *obj);
 
                 pid_t           pid() const { return mPid; }
         virtual status_t        dump(int fd, const Vector<String16>& args);
 
-                int             getAudioSessionId() { return mAudioSessionId; }
+                audio_session_t getAudioSessionId() { return mAudioSessionId; }
+        // Modular DRM
+        virtual status_t prepareDrm(const uint8_t uuid[16], const Vector<uint8_t>& drmSessionId);
+        virtual status_t releaseDrm();
+        // AudioRouting
+        virtual status_t setOutputDevice(audio_port_handle_t deviceId);
+        virtual status_t getRoutedDeviceId(audio_port_handle_t* deviceId);
+        virtual status_t enableAudioDeviceCallback(bool enabled);
 
     private:
+        class AudioDeviceUpdatedNotifier: public AudioSystem::AudioDeviceCallback
+        {
+        public:
+            AudioDeviceUpdatedNotifier(const sp<MediaPlayerBase>& listener) {
+                mListener = listener;
+            }
+            ~AudioDeviceUpdatedNotifier() {}
+
+            virtual void onAudioDeviceUpdate(audio_io_handle_t audioIo,
+                                             audio_port_handle_t deviceId);
+
+        private:
+            wp<MediaPlayerBase> mListener;
+        };
+
         friend class MediaPlayerService;
                                 Client( const sp<MediaPlayerService>& service,
                                         pid_t pid,
                                         int32_t connId,
                                         const sp<IMediaPlayerClient>& client,
-                                        int audioSessionId,
+                                        audio_session_t audioSessionId,
                                         uid_t uid);
                                 Client();
         virtual                 ~Client();
@@ -370,27 +430,42 @@ private:
         void addNewMetadataUpdate(media::Metadata::Type type);
 
         // Disconnect from the currently connected ANativeWindow.
-        void disconnectNativeWindow();
+        void disconnectNativeWindow_l();
 
         status_t setAudioAttributes_l(const Parcel &request);
 
-        mutable     Mutex                       mLock;
-                    sp<MediaPlayerBase>         mPlayer;
-                    sp<MediaPlayerService>      mService;
-                    sp<IMediaPlayerClient>      mClient;
-                    sp<AudioOutput>             mAudioOutput;
-                    pid_t                       mPid;
-                    status_t                    mStatus;
-                    bool                        mLoop;
-                    int32_t                     mConnId;
-                    int                         mAudioSessionId;
-                    audio_attributes_t *        mAudioAttributes;
-                    uid_t                       mUID;
-                    sp<ANativeWindow>           mConnectedWindow;
-                    sp<IBinder>                 mConnectedWindowBinder;
-                    struct sockaddr_in          mRetransmitEndpoint;
-                    bool                        mRetransmitEndpointValid;
-                    sp<Client>                  mNextClient;
+        class Listener : public MediaPlayerBase::Listener {
+        public:
+            Listener(const wp<Client> &client) : mClient(client) {}
+            virtual ~Listener() {}
+            virtual void notify(int msg, int ext1, int ext2, const Parcel *obj) {
+                sp<Client> client = mClient.promote();
+                if (client != NULL) {
+                    client->notify(msg, ext1, ext2, obj);
+                }
+            }
+        private:
+            wp<Client> mClient;
+        };
+
+        mutable     Mutex                         mLock;
+                    sp<MediaPlayerBase>           mPlayer;
+                    sp<MediaPlayerService>        mService;
+                    sp<IMediaPlayerClient>        mClient;
+                    sp<AudioOutput>               mAudioOutput;
+                    pid_t                         mPid;
+                    status_t                      mStatus;
+                    bool                          mLoop;
+                    int32_t                       mConnId;
+                    audio_session_t               mAudioSessionId;
+                    audio_attributes_t *          mAudioAttributes;
+                    uid_t                         mUid;
+                    sp<ANativeWindow>             mConnectedWindow;
+                    sp<IBinder>                   mConnectedWindowBinder;
+                    struct sockaddr_in            mRetransmitEndpoint;
+                    bool                          mRetransmitEndpointValid;
+                    sp<Client>                    mNextClient;
+                    sp<MediaPlayerBase::Listener> mListener;
 
         // Metadata filters.
         media::Metadata::Filter mMetadataAllow;  // protected by mLock
@@ -402,19 +477,12 @@ private:
         // getMetadata clears this set.
         media::Metadata::Filter mMetadataUpdated;  // protected by mLock
 
+        std::vector<DeathNotifier> mDeathNotifiers;
+        sp<AudioDeviceUpdatedNotifier> mAudioDeviceUpdatedListener;
 #if CALLBACK_ANTAGONIZER
-                    Antagonizer*                mAntagonizer;
-#endif
-#ifdef MTK_AOSP_ENHANCEMENT
-private:
-    bool mIsOMADrm;
-    String8 mDrmProc;
-    status_t setDataSource_drm_preCheck(bool isFdMode,int fd,const char *url);
-    status_t setDataSource_drm_proHandle();
+                    Antagonizer*                  mAntagonizer;
 #endif
     }; // Client
-
-
 
 // ----------------------------------------------------------------------------
 
@@ -425,29 +493,12 @@ private:
                 SortedVector< wp<Client> >  mClients;
                 SortedVector< wp<MediaRecorderClient> > mMediaRecorderClients;
                 int32_t                     mNextConnId;
-                sp<IOMX>                    mOMX;
-                sp<ICrypto>                 mCrypto;
-#ifdef MTK_AOSP_ENHANCEMENT
+
 public:
-
     virtual status_t            enableRemoteDisplay(const char *iface);
-    virtual sp<IRemoteDisplay> listenForRemoteDisplay(
-        const String16 &opPackageName, const sp<IRemoteDisplayClient>& client,
-        const String8& iface, const uint32_t wfdFlags);
-    virtual sp<IRemoteDisplay> connectForRemoteDisplay(const sp<IRemoteDisplayClient>& client,
-            const String8& iface, const sp<IGraphicBufferProducer> &bufferProducer);
     virtual status_t            enableRemoteDisplay(const char *iface, const uint32_t wfdFlags);
-
-///M:XMount @{
-    virtual sp<IRemoteMount> listenForRemoteMount(
-            const sp<IRemoteMountClient>& client, const String8& iface,
-            const bool isProvider, const uint32_t mode);
-///@}
-
 private:
     sp<RemoteDisplay>           mRemoteDisplay;
-#endif
-
 };
 
 // ----------------------------------------------------------------------------

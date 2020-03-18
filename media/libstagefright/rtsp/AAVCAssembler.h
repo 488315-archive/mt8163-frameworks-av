@@ -1,10 +1,4 @@
 /*
-* Copyright (C) 2014 MediaTek Inc.
-* Modification based on code covered by the mentioned copyright
-* and/or permission notice(s).
-*/
-
-/*
  * Copyright (C) 2010 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -35,7 +29,7 @@ struct ABuffer;
 struct AMessage;
 
 struct AAVCAssembler : public ARTPAssembler {
-    AAVCAssembler(const sp<AMessage> &notify);
+    explicit AAVCAssembler(const sp<AMessage> &notify);
 
 protected:
     virtual ~AAVCAssembler();
@@ -61,14 +55,6 @@ private:
     void submitAccessUnit();
 
     DISALLOW_EVIL_CONSTRUCTORS(AAVCAssembler);
-#ifdef MTK_AOSP_ENHANCEMENT
-public:
-    virtual void setNextExpectedSeqNo(uint32_t rtpSeq) {
-        mNextExpectedSeqNo = rtpSeq;
-        mNextExpectedSeqNoValid = true;
-    }
-    void sendNalFragment(const sp<ABuffer> &buffer);
-#endif // #ifdef MTK_AOSP_ENHANCEMENT
 };
 
 }  // namespace android

@@ -18,6 +18,7 @@
 //#define LOG_NDEBUG 0
 
 #include <camera/CameraUtils.h>
+#include <media/hardware/HardwareAPI.h>
 
 #include <system/window.h>
 #include <system/graphics.h>
@@ -44,7 +45,7 @@ status_t CameraUtils::getRotationTransform(const CameraMetadata& staticInfo,
     }
 
     camera_metadata_ro_entry_t entryFacing = staticInfo.find(ANDROID_LENS_FACING);
-    if (entry.count == 0) {
+    if (entryFacing.count == 0) {
         ALOGE("%s: Can't find android.lens.facing in static metadata!", __FUNCTION__);
         return INVALID_OPERATION;
     }
@@ -120,6 +121,5 @@ status_t CameraUtils::getRotationTransform(const CameraMetadata& staticInfo,
 
     return OK;
 }
-
 
 } /* namespace android */

@@ -33,7 +33,10 @@ FrameProcessor::FrameProcessor(wp<CameraDeviceBase> device,
     FrameProcessorBase(device),
     mClient(client),
     mLastFrameNumberOfFaces(0),
-    mLast3AFrameNumber(-1) {
+    mLast3AFrameNumber(-1),
+    mLastAEFrameNumber(-1),
+    mLastAFrameNumber(-1),
+    mLastAWBFrameNumber(-1) {
 
     sp<CameraDeviceBase> d = device.promote();
     mSynthesize3ANotify = !(d->willNotify3A());
@@ -41,11 +44,7 @@ FrameProcessor::FrameProcessor(wp<CameraDeviceBase> device,
     {
         SharedParameters::Lock l(client->getParameters());
 
-        if (client->getCameraDeviceVersion() >= CAMERA_DEVICE_API_VERSION_3_2) {
-            mUsePartialResult = (mNumPartialResults > 1);
-        } else {
-            mUsePartialResult = l.mParameters.quirks.partialResults;
-        }
+        mUsePartialResult = (mNumPartialResults > 1);
 
         // Initialize starting 3A state
         m3aState.afTriggerId = l.mParameters.afTriggerCounter;
@@ -53,7 +52,13 @@ FrameProcessor::FrameProcessor(wp<CameraDeviceBase> device,
         // Check if lens is fixed-focus
         if (l.mParameters.focusMode == Parameters::FOCUS_MODE_FIXED) {
             m3aState.afMode = ANDROID_CONTROL_AF_MODE_OFF;
+        } else {
+            m3aState.afMode = ANDROID_CONTROL_AF_MODE_AUTO;
         }
+        m3aState.awbMode = ANDROID_CONTROL_AWB_MODE_AUTO;
+        m3aState.aeState = ANDROID_CONTROL_AE_STATE_INACTIVE;
+        m3aState.afState = ANDROID_CONTROL_AF_STATE_INACTIVE;
+        m3aState.awbState = ANDROID_CONTROL_AWB_STATE_INACTIVE;
     }
 }
 
@@ -70,16 +75,7 @@ bool FrameProcessor::processSingleFrame(CaptureResult &frame,
 
     bool isPartialResult = false;
     if (mUsePartialResult) {
-        if (client->getCameraDeviceVersion() >= CAMERA_DEVICE_API_VERSION_3_2) {
-            isPartialResult = frame.mResultExtras.partialResultCount < mNumPartialResults;
-        } else {
-            camera_metadata_entry_t entry;
-            entry = frame.mMetadata.find(ANDROID_QUIRKS_PARTIAL_RESULT);
-            if (entry.count > 0 &&
-                    entry.data.u8[0] == ANDROID_QUIRKS_PARTIAL_RESULT_PARTIAL) {
-                isPartialResult = true;
-            }
-        }
+        isPartialResult = frame.mResultExtras.partialResultCount < mNumPartialResults;
     }
 
     if (!isPartialResult && processFaceDetect(frame.mMetadata, client) != OK) {
@@ -170,7 +166,7 @@ status_t FrameProcessor::processFaceDetect(const CameraMetadata &frame,
 
         entry = frame.find(ANDROID_SCALER_CROP_REGION);
         if (entry.count < 4) {
-            ALOGE("%s: Camera %d: Unable to read crop region (count = %d)",
+            ALOGE("%s: Camera %d: Unable to read crop region (count = %zu)",
                     __FUNCTION__, client->getCameraId(), entry.count);
             return res;
         }
@@ -204,7 +200,6 @@ status_t FrameProcessor::processFaceDetect(const CameraMetadata &frame,
                                 faceRects[i*4 + 2], scalerCrop);
             face.rect[3] = l.mParameters.arrayYToNormalizedWithCrop(
                                 faceRects[i*4 + 3], scalerCrop);
-
             face.score = faceScores[i];
             if (faceDetectMode == ANDROID_STATISTICS_FACE_DETECT_MODE_FULL) {
                 face.id = faceIds[i];
@@ -253,80 +248,111 @@ status_t FrameProcessor::process3aState(const CaptureResult &frame,
     if (frameNumber <= mLast3AFrameNumber) {
         ALOGV("%s: Already sent 3A for frame number %d, skipping",
                 __FUNCTION__, frameNumber);
+
+        // Remove the entry if there is one for this frame number in mPending3AStates.
+        mPending3AStates.removeItem(frameNumber);
         return OK;
     }
 
-    mLast3AFrameNumber = frameNumber;
+    AlgState pendingState;
 
-    // Get 3A states from result metadata
+    ssize_t index = mPending3AStates.indexOfKey(frameNumber);
+    if (index != NAME_NOT_FOUND) {
+        pendingState = mPending3AStates.valueAt(index);
+    }
+
+    // Update 3A states from the result.
     bool gotAllStates = true;
 
-    AlgState new3aState;
-
     // TODO: Also use AE mode, AE trigger ID
+    bool gotAFState = updatePendingState<uint8_t>(metadata, ANDROID_CONTROL_AF_MODE,
+            &pendingState.afMode, frameNumber, cameraId);
 
-    gotAllStates &= get3aResult<uint8_t>(metadata, ANDROID_CONTROL_AF_MODE,
-            &new3aState.afMode, frameNumber, cameraId);
+    bool gotAWBState = updatePendingState<uint8_t>(metadata, ANDROID_CONTROL_AWB_MODE,
+            &pendingState.awbMode, frameNumber, cameraId);
 
-    gotAllStates &= get3aResult<uint8_t>(metadata, ANDROID_CONTROL_AWB_MODE,
-            &new3aState.awbMode, frameNumber, cameraId);
+    bool gotAEState = updatePendingState<uint8_t>(metadata, ANDROID_CONTROL_AE_STATE,
+            &pendingState.aeState, frameNumber, cameraId);
 
-    gotAllStates &= get3aResult<uint8_t>(metadata, ANDROID_CONTROL_AE_STATE,
-            &new3aState.aeState, frameNumber, cameraId);
+    gotAFState &= updatePendingState<uint8_t>(metadata, ANDROID_CONTROL_AF_STATE,
+            &pendingState.afState, frameNumber, cameraId);
 
-    gotAllStates &= get3aResult<uint8_t>(metadata, ANDROID_CONTROL_AF_STATE,
-            &new3aState.afState, frameNumber, cameraId);
+    gotAWBState &= updatePendingState<uint8_t>(metadata, ANDROID_CONTROL_AWB_STATE,
+            &pendingState.awbState, frameNumber, cameraId);
 
-    gotAllStates &= get3aResult<uint8_t>(metadata, ANDROID_CONTROL_AWB_STATE,
-            &new3aState.awbState, frameNumber, cameraId);
+    pendingState.afTriggerId = frame.mResultExtras.afTriggerId;
+    pendingState.aeTriggerId = frame.mResultExtras.precaptureTriggerId;
 
-    if (client->getCameraDeviceVersion() >= CAMERA_DEVICE_API_VERSION_3_2) {
-        new3aState.afTriggerId = frame.mResultExtras.afTriggerId;
-        new3aState.aeTriggerId = frame.mResultExtras.precaptureTriggerId;
-    } else {
-        gotAllStates &= get3aResult<int32_t>(metadata, ANDROID_CONTROL_AF_TRIGGER_ID,
-                 &new3aState.afTriggerId, frameNumber, cameraId);
+    if (gotAEState && (frameNumber > mLastAEFrameNumber)) {
+        if (pendingState.aeState != m3aState.aeState ||
+                pendingState.aeTriggerId > m3aState.aeTriggerId) {
+            ALOGV("%s: Camera %d: AE state %d->%d",
+                    __FUNCTION__, cameraId,
+                    m3aState.aeState, pendingState.aeState);
+            client->notifyAutoExposure(pendingState.aeState, pendingState.aeTriggerId);
 
-        gotAllStates &= get3aResult<int32_t>(metadata, ANDROID_CONTROL_AE_PRECAPTURE_ID,
-                 &new3aState.aeTriggerId, frameNumber, cameraId);
+            m3aState.aeState = pendingState.aeState;
+            m3aState.aeTriggerId = pendingState.aeTriggerId;
+            mLastAEFrameNumber = frameNumber;
+        }
     }
 
-    if (!gotAllStates) return BAD_VALUE;
+    if (gotAFState && (frameNumber > mLastAFrameNumber)) {
+        if (pendingState.afState != m3aState.afState ||
+                pendingState.afMode != m3aState.afMode ||
+                pendingState.afTriggerId != m3aState.afTriggerId) {
+            ALOGV("%s: Camera %d: AF state %d->%d. AF mode %d->%d. Trigger %d->%d",
+                    __FUNCTION__, cameraId,
+                    m3aState.afState, pendingState.afState,
+                    m3aState.afMode, pendingState.afMode,
+                    m3aState.afTriggerId, pendingState.afTriggerId);
+            client->notifyAutoFocus(pendingState.afState, pendingState.afTriggerId);
 
-    if (new3aState.aeState != m3aState.aeState) {
-        ALOGV("%s: Camera %d: AE state %d->%d",
-                __FUNCTION__, cameraId,
-                m3aState.aeState, new3aState.aeState);
-        client->notifyAutoExposure(new3aState.aeState, new3aState.aeTriggerId);
+            m3aState.afState = pendingState.afState;
+            m3aState.afMode = pendingState.afMode;
+            m3aState.afTriggerId = pendingState.afTriggerId;
+            mLastAFrameNumber = frameNumber;
+        }
     }
 
-    if (new3aState.afState != m3aState.afState ||
-        new3aState.afMode != m3aState.afMode ||
-        new3aState.afTriggerId != m3aState.afTriggerId) {
-        ALOGV("%s: Camera %d: AF state %d->%d. AF mode %d->%d. Trigger %d->%d",
-                __FUNCTION__, cameraId,
-                m3aState.afState, new3aState.afState,
-                m3aState.afMode, new3aState.afMode,
-                m3aState.afTriggerId, new3aState.afTriggerId);
-        client->notifyAutoFocus(new3aState.afState, new3aState.afTriggerId);
-    }
-    if (new3aState.awbState != m3aState.awbState ||
-        new3aState.awbMode != m3aState.awbMode) {
-        ALOGV("%s: Camera %d: AWB state %d->%d. AWB mode %d->%d",
-                __FUNCTION__, cameraId,
-                m3aState.awbState, new3aState.awbState,
-                m3aState.awbMode, new3aState.awbMode);
-        client->notifyAutoWhitebalance(new3aState.awbState,
-                new3aState.aeTriggerId);
+    if (gotAWBState && (frameNumber > mLastAWBFrameNumber)) {
+        if (pendingState.awbState != m3aState.awbState ||
+                pendingState.awbMode != m3aState.awbMode) {
+            ALOGV("%s: Camera %d: AWB state %d->%d. AWB mode %d->%d",
+                    __FUNCTION__, cameraId,
+                    m3aState.awbState, pendingState.awbState,
+                    m3aState.awbMode, pendingState.awbMode);
+            client->notifyAutoWhitebalance(pendingState.awbState,
+                    pendingState.aeTriggerId);
+
+            m3aState.awbMode = pendingState.awbMode;
+            m3aState.awbState = pendingState.awbState;
+            mLastAWBFrameNumber = frameNumber;
+        }
     }
 
-    m3aState = new3aState;
+    gotAllStates &= gotAEState & gotAFState & gotAWBState;
+    if (!gotAllStates) {
+        // If not all states are received, put the pending state to mPending3AStates.
+        if (index == NAME_NOT_FOUND) {
+            mPending3AStates.add(frameNumber, pendingState);
+        } else {
+            mPending3AStates.replaceValueAt(index, pendingState);
+        }
+        return NOT_ENOUGH_DATA;
+    }
+
+    if (index != NAME_NOT_FOUND) {
+        mPending3AStates.removeItemsAt(index);
+    }
+
+    mLast3AFrameNumber = frameNumber;
 
     return OK;
 }
 
 template<typename Src, typename T>
-bool FrameProcessor::get3aResult(const CameraMetadata& result, int32_t tag,
+bool FrameProcessor::updatePendingState(const CameraMetadata& result, int32_t tag,
         T* value, int32_t frameNumber, int cameraId) {
     camera_metadata_ro_entry_t entry;
     if (value == NULL) {
@@ -335,11 +361,19 @@ bool FrameProcessor::get3aResult(const CameraMetadata& result, int32_t tag,
         return false;
     }
 
+    // Already got the value for this tag.
+    if (*value != static_cast<T>(NOT_SET)) {
+        return true;
+    }
+
     entry = result.find(tag);
     if (entry.count == 0) {
-        ALOGE("%s: Camera %d: No %s provided by HAL for frame %d!",
+        const camera_metadata *metaBuffer = result.getAndLock();
+        ALOGV("%s: Camera %d: No %s provided by HAL for frame %d in this result!",
                 __FUNCTION__, cameraId,
-                get_camera_metadata_tag_name(tag), frameNumber);
+                get_local_camera_metadata_tag_name(tag, metaBuffer),
+                frameNumber);
+        result.unlock(metaBuffer);
         return false;
     } else {
         switch(sizeof(Src)){
@@ -359,7 +393,7 @@ bool FrameProcessor::get3aResult(const CameraMetadata& result, int32_t tag,
 }
 
 
-void FrameProcessor::callbackFaceDetection(sp<Camera2Client> client,
+void FrameProcessor::callbackFaceDetection(const sp<Camera2Client>& client,
                                      const camera_frame_metadata &metadata) {
 
     camera_frame_metadata *metadata_ptr =

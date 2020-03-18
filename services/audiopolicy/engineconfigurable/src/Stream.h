@@ -18,31 +18,20 @@
 
 #include "Element.h"
 #include "EngineDefinition.h"
-#include <Volume.h>
-#include <RoutingStrategy.h>
 #include <map>
 
-namespace android
-{
-namespace audio_policy
-{
+namespace android {
+namespace audio_policy {
+
 /**
- * @tparam routing_strategy: Applicable strategy for this stream.
+ * @tparam product_strategy_t: Applicable strategy for this stream.
  */
 template <>
 class Element<audio_stream_type_t>
 {
-private:
-    typedef std::map<Volume::device_category, VolumeCurvePoints> VolumeProfiles;
-    typedef VolumeProfiles::iterator VolumeProfileIterator;
-    typedef VolumeProfiles::const_iterator VolumeProfileConstIterator;
-
 public:
     Element(const std::string &name)
-        : mName(name),
-          mApplicableStrategy(STRATEGY_MEDIA),
-          mIndexMin(0),
-          mIndexMax(1)
+        : mName(name)
     {}
     ~Element() {}
 
@@ -70,7 +59,7 @@ public:
 
     /**
      * A Policy element may implement getter/setter function for a given property.
-     * Property may be routing_strategy, audio_stream_type_t, audio_usage_t, audio_source_t
+     * Property may be  audio_stream_type_t, audio_usage_t, audio_source_t
      * or a string.
      */
     template <typename Property>
@@ -78,12 +67,6 @@ public:
 
     template <typename Property>
     status_t set(Property property);
-
-    status_t setVolumeProfile(Volume::device_category category, const VolumeCurvePoints &points);
-
-    float volIndexToDb(Volume::device_category deviceCategory, int indexInUi);
-
-    status_t initVolume(int indexMin, int indexMax);
 
 private:
     /* Copy facilities are put private to disable copy. */
@@ -93,18 +76,7 @@ private:
     std::string mName; /**< Unique literal Identifier of a policy base element*/
     audio_stream_type_t mIdentifier; /**< Unique numerical Identifier of a policy base element*/
 
-    routing_strategy mApplicableStrategy; /**< Applicable strategy for this stream. */
-
-    /**
-     * Collection of volume profiles indexed by the stream type.
-     * Volume is the only reason why the stream profile was not removed from policy when introducing
-     * attributes.
-     */
-    VolumeProfiles mVolumeProfiles;
-
-    int mIndexMin;
-
-    int mIndexMax;
+    audio_stream_type_t mVolumeProfile; /**< Volume Profile followed by this stream. */
 };
 
 typedef Element<audio_stream_type_t> Stream;

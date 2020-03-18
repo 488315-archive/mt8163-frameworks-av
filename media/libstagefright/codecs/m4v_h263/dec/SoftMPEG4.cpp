@@ -24,27 +24,18 @@
 #include <media/stagefright/foundation/AUtils.h>
 #include <media/stagefright/MediaDefs.h>
 #include <media/stagefright/MediaErrors.h>
-#include <media/IOMX.h>
 
 #include "mp4dec_api.h"
 
 namespace android {
 
 static const CodecProfileLevel kM4VProfileLevels[] = {
-    { OMX_VIDEO_MPEG4ProfileSimple, OMX_VIDEO_MPEG4Level0 },
-    { OMX_VIDEO_MPEG4ProfileSimple, OMX_VIDEO_MPEG4Level0b },
-    { OMX_VIDEO_MPEG4ProfileSimple, OMX_VIDEO_MPEG4Level1 },
-    { OMX_VIDEO_MPEG4ProfileSimple, OMX_VIDEO_MPEG4Level2 },
     { OMX_VIDEO_MPEG4ProfileSimple, OMX_VIDEO_MPEG4Level3 },
 };
 
 static const CodecProfileLevel kH263ProfileLevels[] = {
-    { OMX_VIDEO_H263ProfileBaseline, OMX_VIDEO_H263Level10 },
-    { OMX_VIDEO_H263ProfileBaseline, OMX_VIDEO_H263Level20 },
     { OMX_VIDEO_H263ProfileBaseline, OMX_VIDEO_H263Level30 },
     { OMX_VIDEO_H263ProfileBaseline, OMX_VIDEO_H263Level45 },
-    { OMX_VIDEO_H263ProfileISWV2,    OMX_VIDEO_H263Level10 },
-    { OMX_VIDEO_H263ProfileISWV2,    OMX_VIDEO_H263Level20 },
     { OMX_VIDEO_H263ProfileISWV2,    OMX_VIDEO_H263Level30 },
     { OMX_VIDEO_H263ProfileISWV2,    OMX_VIDEO_H263Level45 },
 };
@@ -126,8 +117,13 @@ void SoftMPEG4::onQueueFilled(OMX_U32 /* portIndex */) {
                 outHeader->nFlags = OMX_BUFFERFLAG_EOS;
 
                 List<BufferInfo *>::iterator it = outQueue.begin();
-                while ((*it)->mHeader != outHeader) {
+                while (it != outQueue.end() && (*it)->mHeader != outHeader) {
                     ++it;
+                }
+                if (it == outQueue.end()) {
+                    ALOGE("couldn't find port buffer %d in outQueue: b/109891727", mNumSamplesOutput & 1);
+                    android_errorWriteLog(0x534e4554, "109891727");
+                    return;
                 }
 
                 BufferInfo *outInfo = *it;
@@ -249,19 +245,34 @@ void SoftMPEG4::onQueueFilled(OMX_U32 /* portIndex */) {
         frameSize = (OMX_U32)(yFrameSize + (yFrameSize / 2));
 
         if (outHeader->nAllocLen < frameSize) {
-            //android_errorWriteLog(0x534e4554, "27833616");
+            android_errorWriteLog(0x534e4554, "27833616");
             ALOGE("Insufficient output buffer size");
             notify(OMX_EventError, OMX_ErrorUndefined, 0, NULL);
             mSignalledError = true;
             return;
         }
+
+        // Need to check if header contains new info, e.g., width/height, etc.
+        VopHeaderInfo header_info;
+        uint8_t *bitstreamTmp = bitstream;
+        if (PVDecodeVopHeader(
+                    mHandle, &bitstreamTmp, &timestamp, &tmp,
+                    &header_info, &useExtTimestamp,
+                    outHeader->pBuffer) != PV_TRUE) {
+            ALOGE("failed to decode vop header.");
+
+            notify(OMX_EventError, OMX_ErrorUndefined, 0, NULL);
+            mSignalledError = true;
+            return;
+        }
+        if (handlePortSettingsChange()) {
+            return;
+        }
+
         // The PV decoder is lying to us, sometimes it'll claim to only have
         // consumed a subset of the buffer when it clearly consumed all of it.
         // ignore whatever it says...
-        if (PVDecodeVideoFrame(
-                    mHandle, &bitstream, &timestamp, &tmp,
-                    &useExtTimestamp,
-                    outHeader->pBuffer) != PV_TRUE) {
+        if (PVDecodeVopBody(mHandle, &tmp) != PV_TRUE) {
             ALOGE("failed to decode video frame.");
 
             notify(OMX_EventError, OMX_ErrorUndefined, 0, NULL);
@@ -346,7 +357,8 @@ bool SoftMPEG4::handlePortSettingsChange() {
     bool portWillReset = false;
     const bool fakeStride = true;
     SoftVideoDecoderOMXComponent::handlePortSettingsChange(
-            &portWillReset, buf_width, buf_height, cropSettingsMode, fakeStride);
+            &portWillReset, buf_width, buf_height,
+            OMX_COLOR_FormatYUV420Planar, cropSettingsMode, fakeStride);
     if (portWillReset) {
         if (mMode == MODE_H263) {
             PVCleanUpVideoDecoder(mHandle);
@@ -374,6 +386,7 @@ void SoftMPEG4::onPortFlushCompleted(OMX_U32 portIndex) {
     if (portIndex == 0 && mInitialized) {
         CHECK_EQ((int)PVResetVideoDecoder(mHandle), (int)PV_TRUE);
     }
+    mFramesConfigured = false;
 }
 
 void SoftMPEG4::onReset() {

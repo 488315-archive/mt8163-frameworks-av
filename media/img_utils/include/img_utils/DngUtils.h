@@ -39,11 +39,17 @@ namespace img_utils {
  */
 class ANDROID_API OpcodeListBuilder : public LightRefBase<OpcodeListBuilder> {
     public:
+        // Note that the Adobe DNG 1.4 spec for Bayer phase (defined for the
+        // FixBadPixelsConstant and FixBadPixelsList opcodes) is incorrect. It's
+        // inconsistent with the DNG SDK (cf. dng_negative::SetBayerMosaic and
+        // dng_opcode_FixBadPixelsList::IsGreen), and Adobe confirms that the
+        // spec should be updated to match the SDK.
         enum CfaLayout {
-            CFA_RGGB = 0,
-            CFA_GRBG,
-            CFA_GBRG,
+            CFA_GRBG = 0,
+            CFA_RGGB,
             CFA_BGGR,
+            CFA_GBRG,
+            CFA_NONE,
         };
 
         OpcodeListBuilder();
@@ -83,7 +89,6 @@ class ANDROID_API OpcodeListBuilder : public LightRefBase<OpcodeListBuilder> {
                                                 uint32_t activeAreaRight,
                                                 CfaLayout cfa,
                                                 const float* lensShadingMap);
-
 
         /**
          * Add a GainMap opcode with the given fields.  The mapGains array
@@ -138,6 +143,34 @@ class ANDROID_API OpcodeListBuilder : public LightRefBase<OpcodeListBuilder> {
                                             double opticalCenterY,
                                             const double* kCoeffs);
 
+
+        /**
+         * Add FixBadPixelsList opcode for the given metadata parameters.
+         *
+         * Returns OK on success, or a negative error code.
+         */
+        virtual status_t addBadPixelListForMetadata(const uint32_t* hotPixels,
+                                                    uint32_t xyPairCount,
+                                                    uint32_t colorFilterArrangement);
+
+        /**
+         * Add FixBadPixelsList opcode.
+         *
+         * bayerPhase - 0=top-left of image is red, 1=top-left of image is green pixel in red row,
+         *              2=top-left of image is green pixel in blue row, 3=top-left of image is
+         *              blue.
+         * badPointCount - number of (x,y) pairs of bad pixels are given in badPointRowColPairs.
+         * badRectCount - number of (top, left, bottom, right) tuples are given in
+         *              badRectTopLeftBottomRightTuples
+         *
+         * Returns OK on success, or a negative error code.
+         */
+        virtual status_t addBadPixelList(uint32_t bayerPhase,
+                                         uint32_t badPointCount,
+                                         uint32_t badRectCount,
+                                         const uint32_t* badPointRowColPairs,
+                                         const uint32_t* badRectTopLeftBottomRightTuples);
+
         // TODO: Add other Opcode methods
     protected:
         static const uint32_t FLAG_OPTIONAL = 0x1u;
@@ -146,6 +179,7 @@ class ANDROID_API OpcodeListBuilder : public LightRefBase<OpcodeListBuilder> {
         // Opcode IDs
         enum {
             WARP_RECTILINEAR_ID = 1,
+            FIX_BAD_PIXELS_LIST = 5,
             GAIN_MAP_ID = 9,
         };
 
@@ -161,6 +195,35 @@ class ANDROID_API OpcodeListBuilder : public LightRefBase<OpcodeListBuilder> {
         ByteArrayOutput mOpList;
         EndianOutput mEndianOut;
 
+        status_t addOpcodePreamble(uint32_t opcodeId);
+
+    private:
+        /**
+         * Add Bayer GainMap opcode(s) for the given metadata parameters.
+         * CFA layout must match the layout of the shading map passed into the
+         * lensShadingMap parameter.
+         *
+         * Returns OK on success, or a negative error code.
+         */
+        status_t addBayerGainMapsForMetadata(uint32_t lsmWidth,
+                                                uint32_t lsmHeight,
+                                                uint32_t activeAreaWidth,
+                                                uint32_t activeAreaHeight,
+                                                CfaLayout cfa,
+                                                const float* lensShadingMap);
+
+        /**
+         * Add Bayer GainMap opcode(s) for the given metadata parameters.
+         * CFA layout must match the layout of the shading map passed into the
+         * lensShadingMap parameter.
+         *
+         * Returns OK on success, or a negative error code.
+         */
+        status_t addMonochromeGainMapsForMetadata(uint32_t lsmWidth,
+                                                uint32_t lsmHeight,
+                                                uint32_t activeAreaWidth,
+                                                uint32_t activeAreaHeight,
+                                                const float* lensShadingMap);
 };
 
 } /*namespace img_utils*/

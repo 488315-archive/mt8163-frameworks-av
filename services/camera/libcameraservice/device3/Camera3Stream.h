@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2013 The Android Open Source Project
+ * Copyright (C) 2013-2018 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@
 
 #include "hardware/camera3.h"
 
+#include "utils/LatencyHistogram.h"
 #include "Camera3StreamBufferListener.h"
 #include "Camera3StreamInterface.h"
 
@@ -67,6 +68,12 @@ namespace camera3 {
  *    duration.  In this state, only prepareNextBuffer() and cancelPrepare()
  *    may be called.
  *
+ *  STATE_IN_IDLE: This is a temporary state only intended to be used for input
+ *    streams and only for the case where we need to re-configure the camera device
+ *    while the input stream has an outstanding buffer. All other streams should not
+ *    be able to switch to this state. For them this is invalid and should be handled
+ *    as an unknown state.
+ *
  * Transition table:
  *
  *    <none>               => STATE_CONSTRUCTED:
@@ -95,6 +102,13 @@ namespace camera3 {
  *    STATE_PREPARING      => STATE_CONFIGURED:
  *        When sufficient prepareNextBuffer calls have been made to allocate
  *        all stream buffers, or cancelPrepare is called.
+ *    STATE_CONFIGURED     => STATE_ABANDONED:
+ *        When the buffer queue of the stream is abandoned.
+ *    STATE_CONFIGURED     => STATE_IN_IDLE:
+ *        Only for an input stream which has an outstanding buffer.
+ *    STATE_IN_IDLE     => STATE_CONFIGURED:
+ *        After the internal re-configuration, the input should revert back to
+ *        the configured state.
  *
  * Status Tracking:
  *    Each stream is tracked by StatusTracker as a separate component,
@@ -105,7 +119,9 @@ namespace camera3 {
  *
  *    - ACTIVE: One or more buffers have been handed out (with #getBuffer).
  *    - IDLE: All buffers have been returned (with #returnBuffer), and their
- *          respective release_fence(s) have been signaled.
+ *          respective release_fence(s) have been signaled. The only exception to this
+ *          rule is an input stream that moves to "STATE_IN_IDLE" during internal
+ *          re-configuration.
  *
  *    A typical use case is output streams. When the HAL has any buffers
  *    dequeued, the stream is marked ACTIVE. When the HAL returns all buffers
@@ -130,12 +146,30 @@ class Camera3Stream :
     int              getId() const;
 
     /**
+     * Get the output stream set id.
+     */
+    int              getStreamSetId() const;
+
+    /**
      * Get the stream's dimensions and format
      */
     uint32_t          getWidth() const;
     uint32_t          getHeight() const;
     int               getFormat() const;
     android_dataspace getDataSpace() const;
+    uint64_t          getUsage() const;
+    void              setUsage(uint64_t usage);
+    void              setFormatOverride(bool formatOverriden);
+    bool              isFormatOverridden() const;
+    int               getOriginalFormat() const;
+    void              setDataSpaceOverride(bool dataSpaceOverriden);
+    bool              isDataSpaceOverridden() const;
+    android_dataspace getOriginalDataSpace() const;
+    const String8&    physicalCameraId() const;
+
+    camera3_stream*   asHalStream() override {
+        return this;
+    }
 
     /**
      * Start the stream configuration process. Returns a handle to the stream's
@@ -158,19 +192,21 @@ class Camera3Stream :
     bool             isConfiguring() const;
 
     /**
-     * Completes the stream configuration process. During this call, the stream
-     * may call the device's register_stream_buffers() method. The stream
-     * information structure returned by startConfiguration() may no longer be
-     * modified after this call, but can still be read until the destruction of
-     * the stream.
+     * Completes the stream configuration process. The stream information
+     * structure returned by startConfiguration() may no longer be modified
+     * after this call, but can still be read until the destruction of the
+     * stream.
+     *
+     * streamReconfigured: set to true when a stream is being reconfigured.
      *
      * Returns:
      *   OK on a successful configuration
      *   NO_INIT in case of a serious error from the HAL device
      *   NO_MEMORY in case of an error registering buffers
-     *   INVALID_OPERATION in case connecting to the consumer failed
+     *   INVALID_OPERATION in case connecting to the consumer failed or consumer
+     *       doesn't exist yet.
      */
-    status_t         finishConfiguration(camera3_device *hal3Device);
+    status_t         finishConfiguration(/*out*/bool* streamReconfigured = nullptr);
 
     /**
      * Cancels the stream configuration process. This returns the stream to the
@@ -188,13 +224,20 @@ class Camera3Stream :
 
     /**
      * Start stream preparation. May only be called in the CONFIGURED state,
-     * when no valid buffers have yet been returned to this stream.
+     * when no valid buffers have yet been returned to this stream. Prepares
+     * up to maxCount buffers, or the maximum number of buffers needed by the
+     * pipeline if maxCount is ALLOCATE_PIPELINE_MAX.
      *
      * If no prepartion is necessary, returns OK and does not transition to
      * PREPARING state. Otherwise, returns NOT_ENOUGH_DATA and transitions
      * to PREPARING.
      *
      * This call performs no allocation, so is quick to call.
+     *
+     * blockRequest specifies whether prepare will block upcoming capture
+     * request. This flag should only be set to false if the caller guarantees
+     * the whole buffer preparation process is done before capture request
+     * comes in.
      *
      * Returns:
      *    OK if no more buffers need to be preallocated
@@ -204,12 +247,12 @@ class Camera3Stream :
      *    INVALID_OPERATION if called when not in CONFIGURED state, or a
      *        valid buffer has already been returned to this stream.
      */
-    status_t         startPrepare();
+    status_t         startPrepare(int maxCount, bool blockRequest);
 
     /**
-     * Check if the stream is mid-preparing.
+     * Check if the request on a stream is blocked by prepare.
      */
-    bool             isPreparing() const;
+    bool             isBlockedByPrepare() const;
 
     /**
      * Continue stream buffer preparation by allocating the next
@@ -264,21 +307,35 @@ class Camera3Stream :
      * Fill in the camera3_stream_buffer with the next valid buffer for this
      * stream, to hand over to the HAL.
      *
+     * Multiple surfaces could share the same HAL stream, but a request may
+     * be only for a subset of surfaces. In this case, the
+     * Camera3StreamInterface object needs the surface ID information to acquire
+     * buffers for those surfaces.
+     *
      * This method may only be called once finishConfiguration has been called.
      * For bidirectional streams, this method applies to the output-side
      * buffers.
      *
      */
-    status_t         getBuffer(camera3_stream_buffer *buffer);
+    status_t         getBuffer(camera3_stream_buffer *buffer,
+            nsecs_t waitBufferTimeout,
+            const std::vector<size_t>& surface_ids = std::vector<size_t>());
 
     /**
      * Return a buffer to the stream after use by the HAL.
+     *
+     * Multiple surfaces could share the same HAL stream, but a request may
+     * be only for a subset of surfaces. In this case, the
+     * Camera3StreamInterface object needs the surface ID information to attach
+     * buffers for those surfaces.
      *
      * This method may only be called for buffers provided by getBuffer().
      * For bidirectional streams, this method applies to the output-side buffers
      */
     status_t         returnBuffer(const camera3_stream_buffer &buffer,
-            nsecs_t timestamp);
+            nsecs_t timestamp, bool timestampIncreasing,
+            const std::vector<size_t>& surface_ids = std::vector<size_t>(),
+            uint64_t frameNumber = 0);
 
     /**
      * Fill in the camera3_stream_buffer with the next valid buffer for this
@@ -288,8 +345,10 @@ class Camera3Stream :
      * For bidirectional streams, this method applies to the input-side
      * buffers.
      *
+     * Normally this call will block until the handed out buffer count is less than the stream
+     * max buffer count; if respectHalLimit is set to false, this is ignored.
      */
-    status_t         getInputBuffer(camera3_stream_buffer *buffer);
+    status_t         getInputBuffer(camera3_stream_buffer *buffer, bool respectHalLimit = true);
 
     /**
      * Return a buffer to the stream after use by the HAL.
@@ -309,6 +368,11 @@ class Camera3Stream :
      * release fence signaled.
      */
     bool             hasOutstandingBuffers() const;
+
+    /**
+     * Get number of buffers currently handed out to HAL
+     */
+    size_t           getOutstandingBuffersCount() const;
 
     enum {
         TIMEOUT_NEVER = -1
@@ -330,7 +394,7 @@ class Camera3Stream :
     /**
      * Debug dump of the stream's state.
      */
-    virtual void     dump(int fd, const Vector<String16> &args) const = 0;
+    virtual void     dump(int fd, const Vector<String16> &args) const;
 
     /**
      * Add a camera3 buffer listener. Adding the same listener twice has
@@ -346,26 +410,75 @@ class Camera3Stream :
     void             removeBufferListener(
             const sp<Camera3StreamBufferListener>& listener);
 
+
+    // Setting listener will remove previous listener (if exists)
+    virtual void     setBufferFreedListener(
+            wp<Camera3StreamBufferFreedListener> listener) override;
+
+    /**
+     * Return if the buffer queue of the stream is abandoned.
+     */
+    bool             isAbandoned() const;
+
+    /**
+     * Switch a configured stream with possibly outstanding buffers in idle
+     * state. Configuration for such streams will be skipped assuming there
+     * are no changes to the stream parameters.
+     */
+    status_t         forceToIdle();
+
+    /**
+     * Restore a forced idle stream to configured state, marking it active
+     * in case it contains outstanding buffers.
+     */
+    status_t         restoreConfiguredState();
+
+    /**
+     * Notify buffer stream listeners about incoming request with particular frame number.
+     */
+    void fireBufferRequestForFrameNumber(uint64_t frameNumber,
+            const CameraMetadata& settings) override;
+
   protected:
     const int mId;
+    /**
+     * Stream set id, used to indicate which group of this stream belongs to for buffer sharing
+     * across multiple streams.
+     *
+     * The default value is set to CAMERA3_STREAM_SET_ID_INVALID, which indicates that this stream
+     * doesn't intend to share buffers with any other streams, and this stream will fall back to
+     * the existing BufferQueue mechanism to manage the buffer allocations and buffer circulation.
+     * When a valid stream set id is set, this stream intends to use the Camera3BufferManager to
+     * manage the buffer allocations; the BufferQueue will only handle the buffer transaction
+     * between the producer and consumer. For this case, upon successfully registration, the streams
+     * with the same stream set id will potentially share the buffers allocated by
+     * Camera3BufferManager.
+     */
+    const int mSetId;
+
     const String8 mName;
     // Zero for formats with fixed buffer size for given dimensions.
     const size_t mMaxSize;
 
-    enum {
+    enum StreamState {
         STATE_ERROR,
         STATE_CONSTRUCTED,
         STATE_IN_CONFIG,
         STATE_IN_RECONFIG,
         STATE_CONFIGURED,
-        STATE_PREPARING
+        STATE_PREPARING,
+        STATE_ABANDONED,
+        STATE_IN_IDLE
     } mState;
 
     mutable Mutex mLock;
 
     Camera3Stream(int id, camera3_stream_type type,
             uint32_t width, uint32_t height, size_t maxSize, int format,
-            android_dataspace dataSpace, camera3_stream_rotation_t rotation);
+            android_dataspace dataSpace, camera3_stream_rotation_t rotation,
+            const String8& physicalCameraId, int setId);
+
+    wp<Camera3StreamBufferFreedListener> mBufferFreedListener;
 
     /**
      * Interface to be implemented by derived classes
@@ -377,9 +490,11 @@ class Camera3Stream :
     // cast to camera3_stream*, implementations must increment the
     // refcount of the stream manually in getBufferLocked, and decrement it in
     // returnBufferLocked.
-    virtual status_t getBufferLocked(camera3_stream_buffer *buffer);
+    virtual status_t getBufferLocked(camera3_stream_buffer *buffer,
+            const std::vector<size_t>& surface_ids = std::vector<size_t>());
     virtual status_t returnBufferLocked(const camera3_stream_buffer &buffer,
-            nsecs_t timestamp);
+            nsecs_t timestamp,
+            const std::vector<size_t>& surface_ids = std::vector<size_t>());
     virtual status_t getInputBufferLocked(camera3_stream_buffer *buffer);
     virtual status_t returnInputBufferLocked(
             const camera3_stream_buffer &buffer);
@@ -394,20 +509,24 @@ class Camera3Stream :
     // after the HAL has provided usage and max_buffers values. After this call,
     // the stream must be ready to produce all buffers for registration with
     // HAL.
+    // Returns NO_INIT or DEAD_OBJECT if the queue has been abandoned.
     virtual status_t configureQueueLocked() = 0;
 
     // Get the total number of buffers in the queue
     virtual size_t   getBufferCountLocked() = 0;
 
     // Get handout output buffer count.
-    virtual size_t   getHandoutOutputBufferCountLocked() = 0;
+    virtual size_t   getHandoutOutputBufferCountLocked() const = 0;
 
     // Get handout input buffer count.
     virtual size_t   getHandoutInputBufferCountLocked() = 0;
 
     // Get the usage flags for the other endpoint, or return
     // INVALID_OPERATION if they cannot be obtained.
-    virtual status_t getEndpointUsage(uint32_t *usage) const = 0;
+    virtual status_t getEndpointUsage(uint64_t *usage) const = 0;
+
+    // Return whether the buffer is in the list of outstanding buffers.
+    bool isOutstandingBuffer(const camera3_stream_buffer& buffer) const;
 
     // Tracking for idle state
     wp<StatusTracker> mStatusTracker;
@@ -418,21 +537,27 @@ class Camera3Stream :
     // prepareNextBuffer called on it.
     bool mStreamUnpreparable;
 
+    uint64_t mUsage;
+
   private:
-    uint32_t oldUsage;
-    uint32_t oldMaxBuffers;
+    // Previously configured stream properties (post HAL override)
+    uint64_t mOldUsage;
+    uint32_t mOldMaxBuffers;
+    int mOldFormat;
+    android_dataspace mOldDataSpace;
+
     Condition mOutputBufferReturnedSignal;
     Condition mInputBufferReturnedSignal;
     static const nsecs_t kWaitForBufferDuration = 3000000000LL; // 3000 ms
 
-    // Gets all buffers from endpoint and registers them with the HAL.
-    status_t registerBuffersLocked(camera3_device *hal3Device);
-
     void fireBufferListenersLocked(const camera3_stream_buffer& buffer,
-                                  bool acquired, bool output);
+            bool acquired, bool output, nsecs_t timestamp = 0, uint64_t frameNumber = 0);
     List<wp<Camera3StreamBufferListener> > mBufferListenerList;
 
     status_t        cancelPrepareLocked();
+
+    // Remove the buffer from the list of outstanding buffers.
+    void removeOutstandingBuffer(const camera3_stream_buffer& buffer);
 
     // Tracking for PREPARING state
 
@@ -440,10 +565,33 @@ class Camera3Stream :
     // has been called sufficient number of times, or stream configuration
     // had to register buffers with the HAL
     bool mPrepared;
+    bool mPrepareBlockRequest;
 
     Vector<camera3_stream_buffer_t> mPreparedBuffers;
     size_t mPreparedBufferIdx;
 
+    // Number of buffers allocated on last prepare call.
+    size_t mLastMaxCount;
+
+    mutable Mutex mOutstandingBuffersLock;
+    // Outstanding buffers dequeued from the stream's buffer queue.
+    List<buffer_handle_t> mOutstandingBuffers;
+
+    // Latency histogram of the wait time for handout buffer count to drop below
+    // max_buffers.
+    static const int32_t kBufferLimitLatencyBinSize = 33; //in ms
+    CameraLatencyHistogram mBufferLimitLatency;
+
+    //Keep track of original format when the stream is created in case it gets overridden
+    bool mFormatOverridden;
+    const int mOriginalFormat;
+
+    //Keep track of original dataSpace in case it gets overridden
+    bool mDataSpaceOverridden;
+    android_dataspace mOriginalDataSpace;
+
+    String8 mPhysicalCameraId;
+    nsecs_t mLastTimestamp;
 }; // class Camera3Stream
 
 }; // namespace camera3

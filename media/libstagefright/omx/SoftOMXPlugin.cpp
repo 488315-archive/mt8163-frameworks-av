@@ -1,9 +1,4 @@
 /*
-* Copyright (C) 2014 MediaTek Inc.
-* Modification based on code covered by the mentioned copyright
-* and/or permission notice(s).
-*/
-/*
  * Copyright (C) 2011 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,8 +18,8 @@
 #define LOG_TAG "SoftOMXPlugin"
 #include <utils/Log.h>
 
-#include "SoftOMXPlugin.h"
-#include "include/SoftOMXComponent.h"
+#include <media/stagefright/omx/SoftOMXPlugin.h>
+#include <media/stagefright/omx/SoftOMXComponent.h>
 
 #include <media/stagefright/foundation/ADebug.h>
 #include <media/stagefright/foundation/AString.h>
@@ -39,7 +34,12 @@ static const struct {
     const char *mRole;
 
 } kComponents[] = {
+    // two choices for aac decoding.
+    // configurable in media/libstagefright/data/media_codecs_google_audio.xml
+    // default implementation
     { "OMX.google.aac.decoder", "aacdec", "audio_decoder.aac" },
+    // alternate implementation
+    { "OMX.google.xaac.decoder", "xaacdec", "audio_decoder.aac" },
     { "OMX.google.aac.encoder", "aacenc", "audio_encoder.aac" },
     { "OMX.google.amrnb.decoder", "amrdec", "audio_decoder.amrnb" },
     { "OMX.google.amrnb.encoder", "amrnbenc", "audio_encoder.amrnb" },
@@ -61,19 +61,25 @@ static const struct {
     { "OMX.google.vp8.decoder", "vpxdec", "video_decoder.vp8" },
     { "OMX.google.vp9.decoder", "vpxdec", "video_decoder.vp9" },
     { "OMX.google.vp8.encoder", "vpxenc", "video_encoder.vp8" },
+    { "OMX.google.vp9.encoder", "vpxenc", "video_encoder.vp9" },
     { "OMX.google.raw.decoder", "rawdec", "audio_decoder.raw" },
+    { "OMX.google.flac.decoder", "flacdec", "audio_decoder.flac" },
     { "OMX.google.flac.encoder", "flacenc", "audio_encoder.flac" },
     { "OMX.google.gsm.decoder", "gsmdec", "audio_decoder.gsm" },
-#ifdef MTK_AUDIO_DDPLUS_SUPPORT
-    { "OMX.dolby.ac3.decoder", "ddpdec", "audio_decoder.ac3" },
-    { "OMX.dolby.ec3.decoder", "ddpdec", "audio_decoder.ec3" },
-    { "OMX.dolby.ec3_joc.decoder", "ddpdec", "audio_decoder.ec3_joc" },
-#endif // DOLBY_UDC
-
 };
 
 static const size_t kNumComponents =
     sizeof(kComponents) / sizeof(kComponents[0]);
+
+extern "C" OMXPluginBase* createOMXPlugin() {
+    ALOGI("createOMXPlugin");
+    return new SoftOMXPlugin();
+}
+
+extern "C" void destroyOMXPlugin(OMXPluginBase* plugin) {
+    ALOGI("destroyOMXPlugin");
+    delete plugin;
+}
 
 SoftOMXPlugin::SoftOMXPlugin() {
 }
@@ -94,7 +100,21 @@ OMX_ERRORTYPE SoftOMXPlugin::makeComponentInstance(
         libName.append(kComponents[i].mLibNameSuffix);
         libName.append(".so");
 
-        void *libHandle = dlopen(libName.c_str(), RTLD_NOW);
+        // RTLD_NODELETE means we keep the shared library around forever.
+        // this eliminates thrashing during sequences like loading soundpools.
+        // It also leaves the rest of the logic around the dlopen()/dlclose()
+        // calls in this file unchanged.
+        //
+        // Implications of the change:
+        // -- the codec process (where this happens) will have a slightly larger
+        //    long-term memory footprint as it accumulates the loaded shared libraries.
+        //    This is expected to be a small amount of memory.
+        // -- plugin codecs can no longer (and never should have) depend on a
+        //    free reset of any static data as the library would have crossed
+        //    a dlclose/dlopen cycle.
+        //
+
+        void *libHandle = dlopen(libName.c_str(), RTLD_NOW|RTLD_NODELETE);
 
         if (libHandle == NULL) {
             ALOGE("unable to dlopen %s: %s", libName.c_str(), dlerror());

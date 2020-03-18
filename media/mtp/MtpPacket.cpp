@@ -69,9 +69,9 @@ void MtpPacket::dump() {
     char buffer[500];
     char* bufptr = buffer;
 
-    for (int i = 0; i < mPacketSize; i++) {
-        sprintf(bufptr, "%02X ", mBuffer[i]);
-        bufptr += strlen(bufptr);
+    for (size_t i = 0; i < mPacketSize; i++) {
+        bufptr += snprintf(bufptr, sizeof(buffer) - (bufptr - buffer), "%02X ",
+                           mBuffer[i]);
         if (i % DUMP_BYTES_PER_ROW == (DUMP_BYTES_PER_ROW - 1)) {
             ALOGV("%s", buffer);
             bufptr = buffer;
@@ -157,7 +157,7 @@ int MtpPacket::transfer(struct usb_request* request) {
                             request->endpoint,
                             request->buffer,
                             request->buffer_length,
-                            0);
+                            1000);
     request->actual_length = result;
     return result;
 }

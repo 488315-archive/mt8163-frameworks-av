@@ -42,7 +42,9 @@ SoftRaw::SoftRaw(
     : SimpleSoftOMXComponent(name, callbacks, appData, component),
       mSignalledError(false),
       mChannelCount(2),
-      mSampleRate(44100) {
+      mSampleRate(44100),
+      mNumericalData(OMX_NumericalDataSigned),
+      mBitsPerSample(16) {
     initPorts();
     CHECK_EQ(initDecoder(), (status_t)OK);
 }
@@ -58,7 +60,7 @@ void SoftRaw::initPorts() {
     def.eDir = OMX_DirInput;
     def.nBufferCountMin = kNumBuffers;
     def.nBufferCountActual = def.nBufferCountMin;
-    def.nBufferSize = 32 * 1024;
+    def.nBufferSize = 192 * 1024;
     def.bEnabled = OMX_TRUE;
     def.bPopulated = OMX_FALSE;
     def.eDomain = OMX_PortDomainAudio;
@@ -76,7 +78,7 @@ void SoftRaw::initPorts() {
     def.eDir = OMX_DirOutput;
     def.nBufferCountMin = kNumBuffers;
     def.nBufferCountActual = def.nBufferCountMin;
-    def.nBufferSize = 32 * 1024;
+    def.nBufferSize = 192 * 1024;
     def.bEnabled = OMX_TRUE;
     def.bPopulated = OMX_FALSE;
     def.eDomain = OMX_PortDomainAudio;
@@ -98,6 +100,28 @@ status_t SoftRaw::initDecoder() {
 OMX_ERRORTYPE SoftRaw::internalGetParameter(
         OMX_INDEXTYPE index, OMX_PTR params) {
     switch (index) {
+        case OMX_IndexParamAudioPortFormat:
+        {
+            OMX_AUDIO_PARAM_PORTFORMATTYPE *formatParams =
+                (OMX_AUDIO_PARAM_PORTFORMATTYPE *)params;
+
+            if (!isValidOMXParam(formatParams)) {
+                return OMX_ErrorBadParameter;
+            }
+
+            if (formatParams->nPortIndex > 1) {
+                return OMX_ErrorUndefined;
+            }
+
+            if (formatParams->nIndex > 0) {
+                return OMX_ErrorNoMore;
+            }
+
+            formatParams->eEncoding = OMX_AUDIO_CodingPCM;
+
+            return OMX_ErrorNone;
+        }
+
         case OMX_IndexParamAudioPcm:
         {
             OMX_AUDIO_PARAM_PCMMODETYPE *pcmParams =
@@ -111,10 +135,10 @@ OMX_ERRORTYPE SoftRaw::internalGetParameter(
                 return OMX_ErrorUndefined;
             }
 
-            pcmParams->eNumData = OMX_NumericalDataSigned;
+            pcmParams->eNumData = (OMX_NUMERICALDATATYPE)mNumericalData;
             pcmParams->eEndian = OMX_EndianBig;
             pcmParams->bInterleaved = OMX_TRUE;
-            pcmParams->nBitPerSample = 16;
+            pcmParams->nBitPerSample = mBitsPerSample;
             pcmParams->ePCMMode = OMX_AUDIO_PCMModeLinear;
             pcmParams->eChannelMapping[0] = OMX_AUDIO_ChannelLF;
             pcmParams->eChannelMapping[1] = OMX_AUDIO_ChannelRF;
@@ -151,6 +175,26 @@ OMX_ERRORTYPE SoftRaw::internalSetParameter(
             return OMX_ErrorNone;
         }
 
+        case OMX_IndexParamAudioPortFormat:
+        {
+            const OMX_AUDIO_PARAM_PORTFORMATTYPE *formatParams =
+                (const OMX_AUDIO_PARAM_PORTFORMATTYPE *)params;
+
+            if (!isValidOMXParam(formatParams)) {
+                return OMX_ErrorBadParameter;
+            }
+
+            if (formatParams->nPortIndex > 1) {
+                return OMX_ErrorUndefined;
+            }
+
+            if (formatParams->eEncoding != OMX_AUDIO_CodingPCM) {
+                return OMX_ErrorUndefined;
+            }
+
+            return OMX_ErrorNone;
+        }
+
         case OMX_IndexParamAudioPcm:
         {
             const OMX_AUDIO_PARAM_PCMMODETYPE *pcmParams =
@@ -166,12 +210,23 @@ OMX_ERRORTYPE SoftRaw::internalSetParameter(
 
             mChannelCount = pcmParams->nChannels;
             mSampleRate = pcmParams->nSamplingRate;
+            mNumericalData = pcmParams->eNumData;
+            mBitsPerSample = pcmParams->nBitPerSample;
 
             return OMX_ErrorNone;
         }
 
         default:
-            return SimpleSoftOMXComponent::internalSetParameter(index, params);
+        {
+            OMX_ERRORTYPE err = SimpleSoftOMXComponent::internalSetParameter(
+                    index, params);
+            // In case inPort->mDef.nBufferSize changed, the output buffer size
+            // should match the input buffer size.
+            PortInfo *inPort = editPortInfo(0);
+            PortInfo *outPort = editPortInfo(1);
+            outPort->mDef.nBufferSize = inPort->mDef.nBufferSize;
+            return err;
+        }
     }
 }
 

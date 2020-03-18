@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2012 The Android Open Source Project
+ * Copyright (C) 2012-2018 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -42,7 +42,8 @@ JpegProcessor::JpegProcessor(
         mDevice(client->getCameraDevice()),
         mSequencer(sequencer),
         mId(client->getCameraId()),
-        mCaptureAvailable(false),
+        mCaptureDone(false),
+        mCaptureSuccess(false),
         mCaptureStreamId(NO_STREAM) {
 }
 
@@ -53,9 +54,11 @@ JpegProcessor::~JpegProcessor() {
 
 void JpegProcessor::onFrameAvailable(const BufferItem& /*item*/) {
     Mutex::Autolock l(mInputMutex);
-    if (!mCaptureAvailable) {
-        mCaptureAvailable = true;
-        mCaptureAvailableSignal.signal();
+    ALOGV("%s", __FUNCTION__);
+    if (!mCaptureDone) {
+        mCaptureDone = true;
+        mCaptureSuccess = true;
+        mCaptureDoneSignal.signal();
     }
 }
 
@@ -108,22 +111,21 @@ status_t JpegProcessor::updateStream(const Parameters &params) {
             return NO_MEMORY;
         }
     }
-    ALOGV("%s: Camera %d: JPEG capture heap now %d bytes; requested %d bytes",
+    ALOGV("%s: Camera %d: JPEG capture heap now %zu bytes; requested %zd bytes",
             __FUNCTION__, mId, mCaptureHeap->getSize(), maxJpegSize);
 
     if (mCaptureStreamId != NO_STREAM) {
         // Check if stream parameters have to change
-        uint32_t currentWidth, currentHeight;
-        res = device->getStreamInfo(mCaptureStreamId,
-                &currentWidth, &currentHeight, 0, 0);
+        CameraDeviceBase::StreamInfo streamInfo;
+        res = device->getStreamInfo(mCaptureStreamId, &streamInfo);
         if (res != OK) {
             ALOGE("%s: Camera %d: Error querying capture output stream info: "
                     "%s (%d)", __FUNCTION__,
                     mId, strerror(-res), res);
             return res;
         }
-        if (currentWidth != (uint32_t)params.pictureWidth ||
-                currentHeight != (uint32_t)params.pictureHeight) {
+        if (streamInfo.width != (uint32_t)params.pictureWidth ||
+                streamInfo.height != (uint32_t)params.pictureHeight) {
             ALOGV("%s: Camera %d: Deleting stream %d since the buffer dimensions changed",
                 __FUNCTION__, mId, mCaptureStreamId);
             res = device->deleteStream(mCaptureStreamId);
@@ -145,15 +147,15 @@ status_t JpegProcessor::updateStream(const Parameters &params) {
         // Create stream for HAL production
         res = device->createStream(mCaptureWindow,
                 params.pictureWidth, params.pictureHeight,
-                HAL_PIXEL_FORMAT_BLOB, HAL_DATASPACE_JFIF,
-                CAMERA3_STREAM_ROTATION_0, &mCaptureStreamId);
+                HAL_PIXEL_FORMAT_BLOB, HAL_DATASPACE_V0_JFIF,
+                CAMERA3_STREAM_ROTATION_0, &mCaptureStreamId,
+                String8());
         if (res != OK) {
             ALOGE("%s: Camera %d: Can't create output stream for capture: "
                     "%s (%d)", __FUNCTION__, mId,
                     strerror(-res), res);
             return res;
         }
-
     }
     return OK;
 }
@@ -170,7 +172,11 @@ status_t JpegProcessor::deleteStream() {
             return INVALID_OPERATION;
         }
 
-        device->deleteStream(mCaptureStreamId);
+        status_t res = device->deleteStream(mCaptureStreamId);
+        if (res != OK) {
+            ALOGE("%s: delete stream %d failed!", __FUNCTION__, mCaptureStreamId);
+            return res;
+        }
 
         mCaptureHeap.clear();
         mCaptureWindow.clear();
@@ -192,24 +198,26 @@ void JpegProcessor::dump(int /*fd*/, const Vector<String16>& /*args*/) const {
 bool JpegProcessor::threadLoop() {
     status_t res;
 
+    bool captureSuccess = false;
     {
         Mutex::Autolock l(mInputMutex);
-        while (!mCaptureAvailable) {
-            res = mCaptureAvailableSignal.waitRelative(mInputMutex,
+
+        while (!mCaptureDone) {
+            res = mCaptureDoneSignal.waitRelative(mInputMutex,
                     kWaitDuration);
             if (res == TIMED_OUT) return true;
         }
-        mCaptureAvailable = false;
+
+        captureSuccess = mCaptureSuccess;
+        mCaptureDone = false;
     }
 
-    do {
-        res = processNewCapture();
-    } while (res == OK);
+    res = processNewCapture(captureSuccess);
 
     return true;
 }
 
-status_t JpegProcessor::processNewCapture() {
+status_t JpegProcessor::processNewCapture(bool captureSuccess) {
     ATRACE_CALL();
     status_t res;
     sp<Camera2Heap> captureHeap;
@@ -217,7 +225,7 @@ status_t JpegProcessor::processNewCapture() {
 
     CpuConsumer::LockedBuffer imgBuffer;
 
-    {
+    if (captureSuccess) {
         Mutex::Autolock l(mInputMutex);
         if (mCaptureStreamId == NO_STREAM) {
             ALOGW("%s: Camera %d: No stream is available", __FUNCTION__, mId);
@@ -269,7 +277,7 @@ status_t JpegProcessor::processNewCapture() {
 
     sp<CaptureSequencer> sequencer = mSequencer.promote();
     if (sequencer != 0) {
-        sequencer->onCaptureAvailable(imgBuffer.timestamp, captureBuffer);
+        sequencer->onCaptureAvailable(imgBuffer.timestamp, captureBuffer, !captureSuccess);
     }
 
     return OK;
@@ -365,7 +373,7 @@ size_t JpegProcessor::findJpegSize(uint8_t* jpegBuffer, size_t maxSize) {
     }
 
     // Read JFIF segment markers, skip over segment data
-    size = 0;
+    size = MARKER_LENGTH; //jump SOI;
     while (size <= maxSize - MARKER_LENGTH) {
         segment_t *segment = (segment_t*)(jpegBuffer + size);
         uint8_t type = checkJpegMarker(segment->marker);

@@ -18,6 +18,10 @@
 
 #include <inttypes.h>
 #include <cutils/compiler.h>
+#include <iomanip>
+#include <sstream>
+#include <string>
+
 #include "MtpDataPacket.h"
 #include "MtpDebug.h"
 #include "MtpProperty.h"
@@ -204,7 +208,7 @@ void MtpProperty::write(MtpDataPacket& packet) {
     }
     if (!deviceProp)
         packet.putUInt32(mGroupCode);
-        packet.putUInt8(mFormFlag);
+    packet.putUInt8(mFormFlag);
     if (mFormFlag == kFormRange) {
             writeValue(packet, mMinimumValue);
             writeValue(packet, mMaximumValue);
@@ -234,6 +238,12 @@ void MtpProperty::setCurrentValue(const uint16_t* string) {
     }
     else
         mCurrentValue.str = NULL;
+}
+
+void MtpProperty::setCurrentValue(MtpDataPacket& packet) {
+    free(mCurrentValue.str);
+    mCurrentValue.str = NULL;
+    readValue(packet, mCurrentValue);
 }
 
 void MtpProperty::setFormRange(int min, int max, int step) {
@@ -330,7 +340,7 @@ void MtpProperty::setFormDateTime() {
 }
 
 void MtpProperty::print() {
-    MtpString buffer;
+    std::string buffer;
     bool deviceProp = isDeviceProperty();
     if (deviceProp)
         ALOGI("    %s (%04X)", MtpDebug::getDevicePropCodeName(mCode), mCode);
@@ -340,11 +350,11 @@ void MtpProperty::print() {
     ALOGI("    writeable %s", (mWriteable ? "true" : "false"));
     buffer = "    default value: ";
     print(mDefaultValue, buffer);
-    ALOGI("%s", (const char *)buffer);
+    ALOGI("%s", buffer.c_str());
     if (deviceProp) {
         buffer = "    current value: ";
         print(mCurrentValue, buffer);
-        ALOGI("%s", (const char *)buffer);
+        ALOGI("%s", buffer.c_str());
     }
     switch (mFormFlag) {
         case kFormNone:
@@ -357,7 +367,7 @@ void MtpProperty::print() {
             buffer += ", ";
             print(mStepSize, buffer);
             buffer += ")";
-            ALOGI("%s", (const char *)buffer);
+            ALOGI("%s", buffer.c_str());
             break;
         case kFormEnum:
             buffer = "    Enum { ";
@@ -366,7 +376,7 @@ void MtpProperty::print() {
                 buffer += " ";
             }
             buffer += "}";
-            ALOGI("%s", (const char *)buffer);
+            ALOGI("%s", buffer.c_str());
             break;
         case kFormDateTime:
             ALOGI("    DateTime\n");
@@ -377,42 +387,47 @@ void MtpProperty::print() {
     }
 }
 
-void MtpProperty::print(MtpPropertyValue& value, MtpString& buffer) {
+void MtpProperty::print(MtpPropertyValue& value, std::string& buffer) {
+    std::ostringstream s;
     switch (mType) {
         case MTP_TYPE_INT8:
-            buffer.appendFormat("%d", value.u.i8);
+            buffer += std::to_string(value.u.i8);
             break;
         case MTP_TYPE_UINT8:
-            buffer.appendFormat("%d", value.u.u8);
+            buffer += std::to_string(value.u.u8);
             break;
         case MTP_TYPE_INT16:
-            buffer.appendFormat("%d", value.u.i16);
+            buffer += std::to_string(value.u.i16);
             break;
         case MTP_TYPE_UINT16:
-            buffer.appendFormat("%d", value.u.u16);
+            buffer += std::to_string(value.u.u16);
             break;
         case MTP_TYPE_INT32:
-            buffer.appendFormat("%d", value.u.i32);
+            buffer += std::to_string(value.u.i32);
             break;
         case MTP_TYPE_UINT32:
-            buffer.appendFormat("%d", value.u.u32);
+            buffer += std::to_string(value.u.u32);
             break;
         case MTP_TYPE_INT64:
-            buffer.appendFormat("%" PRId64, value.u.i64);
+            buffer += std::to_string(value.u.i64);
             break;
         case MTP_TYPE_UINT64:
-            buffer.appendFormat("%" PRIu64, value.u.u64);
+            buffer += std::to_string(value.u.u64);
             break;
         case MTP_TYPE_INT128:
-            buffer.appendFormat("%08X%08X%08X%08X", value.u.i128[0], value.u.i128[1],
-                    value.u.i128[2], value.u.i128[3]);
+            for (auto i : value.u.i128) {
+                s << std::hex << std::setfill('0') << std::uppercase << i;
+            }
+            buffer += s.str();
             break;
         case MTP_TYPE_UINT128:
-            buffer.appendFormat("%08X%08X%08X%08X", value.u.u128[0], value.u.u128[1],
-                    value.u.u128[2], value.u.u128[3]);
+            for (auto i : value.u.u128) {
+                s << std::hex << std::setfill('0') << std::uppercase << i;
+            }
+            buffer += s.str();
             break;
         case MTP_TYPE_STR:
-            buffer.appendFormat("%s", value.str);
+            buffer += value.str;
             break;
         default:
             ALOGE("unsupported type for MtpProperty::print\n");
@@ -544,7 +559,7 @@ MtpPropertyValue* MtpProperty::readArrayValues(MtpDataPacket& packet, uint32_t& 
     MtpPropertyValue* result = new MtpPropertyValue[length];
     for (uint32_t i = 0; i < length; i++)
         if (!readValue(packet, result[i])) {
-            delete result;
+            delete [] result;
             return NULL;
         }
     return result;

@@ -32,6 +32,10 @@ struct NuPlayer::StreamingSource : public NuPlayer::Source {
             const sp<AMessage> &notify,
             const sp<IStreamSource> &source);
 
+    virtual status_t getBufferingSettings(
+            BufferingSettings* buffering /* nonnull */) override;
+    virtual status_t setBufferingSettings(const BufferingSettings& buffering) override;
+
     virtual void prepareAsync();
     virtual void start();
 
@@ -46,7 +50,7 @@ protected:
 
     virtual void onMessageReceived(const sp<AMessage> &msg);
 
-    virtual sp<MetaData> getFormatMeta(bool audio);
+    virtual sp<AMessage> getFormat(bool audio);
 
 private:
     enum {

@@ -1,9 +1,4 @@
 /*
-* Copyright (C) 2014 MediaTek Inc.
-* Modification based on code covered by the mentioned copyright
-* and/or permission notice(s).
-*/
-/*
  * Copyright (C) 2010 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -33,13 +28,9 @@ extern "C" {
 #define MAX_CALL_SIZE           256
 #define LVREV_MAX_T60           7000
 #define LVREV_MAX_REVERB_LEVEL  2000
-#ifdef MTK_AOSP_ENHANCEMENT
-#define LVREV_MAX_FRAME_SIZE    5120
-#else
 #define LVREV_MAX_FRAME_SIZE    2560
-#endif
 #define LVREV_CUP_LOAD_ARM9E    470    // Expressed in 0.1 MIPS
-#define LVREV_MEM_USAGE         71+(LVREV_MAX_FRAME_SIZE>>7)     // Expressed in kB
+#define LVREV_MEM_USAGE         (71+(LVREV_MAX_FRAME_SIZE>>7))     // Expressed in kB
 //#define LVM_PCM
 
 typedef struct _LPFPair_t

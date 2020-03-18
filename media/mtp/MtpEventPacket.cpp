@@ -19,12 +19,8 @@
 #include <stdio.h>
 #include <sys/types.h>
 #include <fcntl.h>
-#include <sys/ioctl.h>
 
-#ifdef MTP_DEVICE
-#include <linux/usb/f_mtp.h>
-#endif
-
+#include "IMtpHandle.h"
 #include "MtpEventPacket.h"
 
 #include <usbhost/usbhost.h>
@@ -40,7 +36,7 @@ MtpEventPacket::~MtpEventPacket() {
 }
 
 #ifdef MTP_DEVICE
-int MtpEventPacket::write(int fd) {
+int MtpEventPacket::write(IMtpHandle *h) {
     struct mtp_event    event;
 
     putUInt32(MTP_CONTAINER_LENGTH_OFFSET, mPacketSize);
@@ -48,23 +44,32 @@ int MtpEventPacket::write(int fd) {
 
     event.data = mBuffer;
     event.length = mPacketSize;
-    int ret = ::ioctl(fd, MTP_SEND_EVENT, (unsigned long)&event);
+    int ret = h->sendEvent(event);
     return (ret < 0 ? ret : 0);
 }
 #endif
 
 #ifdef MTP_HOST
-int MtpEventPacket::read(struct usb_request *request) {
+int MtpEventPacket::sendRequest(struct usb_request *request) {
     request->buffer = mBuffer;
     request->buffer_length = mBufferSize;
-    int ret = transfer(request);
-     if (ret >= 0)
-        mPacketSize = ret;
-    else
-        mPacketSize = 0;
-    return ret;
+    mPacketSize = 0;
+    if (usb_request_queue(request)) {
+        ALOGE("usb_endpoint_queue failed, errno: %d", errno);
+        return -1;
+    }
+    return 0;
+}
+
+int MtpEventPacket::readResponse(struct usb_device *device) {
+    struct usb_request* const req = usb_request_wait(device, -1);
+    if (req) {
+        mPacketSize = req->actual_length;
+        return req->actual_length;
+    } else {
+        return -1;
+    }
 }
 #endif
 
 }  // namespace android
-

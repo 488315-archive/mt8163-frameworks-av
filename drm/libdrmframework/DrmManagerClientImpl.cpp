@@ -1,9 +1,4 @@
 /*
-* Copyright (C) 2014 MediaTek Inc.
-* Modification based on code covered by the mentioned copyright
-* and/or permission notice(s).
-*/
-/*
  * Copyright (C) 2010 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -33,39 +28,25 @@
 
 using namespace android;
 
-#define INVALID_VALUE -1
+#define INVALID_VALUE (-1)
 
 Mutex DrmManagerClientImpl::sMutex;
 sp<IDrmManagerService> DrmManagerClientImpl::sDrmManagerService;
 sp<DrmManagerClientImpl::DeathNotifier> DrmManagerClientImpl::sDeathNotifier;
 const String8 DrmManagerClientImpl::EMPTY_STRING("");
 
-// M:
-KeyedVector<int, DrmManagerClientImpl*> DrmManagerClientImpl::sClientVector;
-
 DrmManagerClientImpl* DrmManagerClientImpl::create(
         int* pUniqueId, bool isNative) {
     sp<IDrmManagerService> service = getDrmManagerService();
     if (service != NULL) {
         *pUniqueId = getDrmManagerService()->addUniqueId(isNative);
-
-        // M: modified for OMA DRM v1.0 implementation
-        //return new DrmManagerClientImpl();
-        // OMA DRM v1.0 implementation: save unique id for deathnotifier
-        Mutex::Autolock lock(sMutex);
-        DrmManagerClientImpl* impl = new DrmManagerClientImpl();
-        sClientVector.add(*pUniqueId, impl);
-        return impl;
+        return new DrmManagerClientImpl();
     }
     return new NoOpDrmManagerClientImpl();
 }
 
 void DrmManagerClientImpl::remove(int uniqueId) {
     getDrmManagerService()->removeUniqueId(uniqueId);
-
-    // M: modified for OMA DRM v1.0 implementation: remove unique id saved for deathnotifier
-    Mutex::Autolock lock(sMutex);
-    sClientVector.removeItem(uniqueId);
 }
 
 const sp<IDrmManagerService>& DrmManagerClientImpl::getDrmManagerService() {
@@ -74,6 +55,8 @@ const sp<IDrmManagerService>& DrmManagerClientImpl::getDrmManagerService() {
         char value[PROPERTY_VALUE_MAX];
         if (property_get("drm.service.enabled", value, NULL) == 0) {
             // Drm is undefined for this device
+            ALOGE("DrmManagerClientImpl::getDrmManagerService service not defined");
+
             return sDrmManagerService;
         }
 
@@ -202,7 +185,7 @@ status_t DrmManagerClientImpl::consumeRights(
     status_t status = DRM_ERROR_UNKNOWN;
     if (NULL != decryptHandle.get()) {
         status = getDrmManagerService()->consumeRights(
-                uniqueId, decryptHandle.get(), action, reserve);
+                uniqueId, decryptHandle, action, reserve);
     }
     return status;
 }
@@ -213,7 +196,7 @@ status_t DrmManagerClientImpl::setPlaybackStatus(
     status_t status = DRM_ERROR_UNKNOWN;
     if (NULL != decryptHandle.get()) {
         status = getDrmManagerService()->setPlaybackStatus(
-                uniqueId, decryptHandle.get(), playbackStatus, position);
+                uniqueId, decryptHandle, playbackStatus, position);
     }
     return status;
 }
@@ -286,7 +269,7 @@ sp<DecryptHandle> DrmManagerClientImpl::openDecryptSession(
 sp<DecryptHandle> DrmManagerClientImpl::openDecryptSession(
         int uniqueId, const char* uri, const char* mime) {
 
-    DecryptHandle* handle = NULL;
+    sp<DecryptHandle> handle;
     if (NULL != uri) {
         handle = getDrmManagerService()->openDecryptSession(uniqueId, uri, mime);
     }
@@ -303,7 +286,7 @@ status_t DrmManagerClientImpl::closeDecryptSession(
     status_t status = DRM_ERROR_UNKNOWN;
     if (NULL != decryptHandle.get()) {
         status = getDrmManagerService()->closeDecryptSession(
-                uniqueId, decryptHandle.get());
+                uniqueId, decryptHandle);
     }
     return status;
 }
@@ -314,7 +297,7 @@ status_t DrmManagerClientImpl::initializeDecryptUnit(
     status_t status = DRM_ERROR_UNKNOWN;
     if ((NULL != decryptHandle.get()) && (NULL != headerInfo)) {
         status = getDrmManagerService()->initializeDecryptUnit(
-                uniqueId, decryptHandle.get(), decryptUnitId, headerInfo);
+                uniqueId, decryptHandle, decryptUnitId, headerInfo);
     }
     return status;
 }
@@ -327,7 +310,7 @@ status_t DrmManagerClientImpl::decrypt(
     if ((NULL != decryptHandle.get()) && (NULL != encBuffer)
         && (NULL != decBuffer) && (NULL != *decBuffer)) {
         status = getDrmManagerService()->decrypt(
-                uniqueId, decryptHandle.get(), decryptUnitId,
+                uniqueId, decryptHandle, decryptUnitId,
                 encBuffer, decBuffer, IV);
     }
     return status;
@@ -338,7 +321,7 @@ status_t DrmManagerClientImpl::finalizeDecryptUnit(
     status_t status = DRM_ERROR_UNKNOWN;
     if (NULL != decryptHandle.get()) {
         status = getDrmManagerService()->finalizeDecryptUnit(
-                    uniqueId, decryptHandle.get(), decryptUnitId);
+                    uniqueId, decryptHandle, decryptUnitId);
     }
     return status;
 }
@@ -348,7 +331,7 @@ ssize_t DrmManagerClientImpl::pread(int uniqueId, sp<DecryptHandle> &decryptHand
     ssize_t retCode = INVALID_VALUE;
     if ((NULL != decryptHandle.get()) && (NULL != buffer) && (0 < numBytes)) {
         retCode = getDrmManagerService()->pread(
-                uniqueId, decryptHandle.get(), buffer, numBytes, offset);
+                uniqueId, decryptHandle, buffer, numBytes, offset);
     }
     return retCode;
 }
@@ -369,20 +352,10 @@ DrmManagerClientImpl::DeathNotifier::~DeathNotifier() {
     }
 }
 
-void DrmManagerClientImpl::DeathNotifier::binderDied(const wp<IBinder>& who) {
-    // M: for OMA DRM v1.0 implementation
-    { // limit the effect range of Autolock -sMutex
+void DrmManagerClientImpl::DeathNotifier::binderDied(
+            const wp<IBinder>& /* who */) {
     Mutex::Autolock lock(sMutex);
     DrmManagerClientImpl::sDrmManagerService.clear();
     ALOGW("DrmManager server died!");
-    }
-
-    // M: for OMA DRM v1.0 implementation
-    // re-add client to server
-    // Note: the DrmManagerClientImpl::addClient() function will also locks the sMutex! (by calling getDrmManagerService())
-    int size = sClientVector.size();
-    for (int i = 0; i < size; i++) {
-        sClientVector.valueAt(i)->addClient(sClientVector.keyAt(i));
-    }
 }
 

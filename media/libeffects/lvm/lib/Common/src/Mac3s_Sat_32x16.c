@@ -50,11 +50,11 @@ void Mac3s_Sat_32x16(  const LVM_INT32 *src,
         {
             if(temp<0)
             {
-                dOutVal=0x80000000l;
+                dOutVal=0x80000000L;
             }
             else
             {
-                dOutVal=0x7FFFFFFFl;
+                dOutVal=0x7FFFFFFFL;
             }
         }
 
@@ -64,7 +64,44 @@ void Mac3s_Sat_32x16(  const LVM_INT32 *src,
 
     return;
 }
+#ifdef BUILD_FLOAT
+void Mac3s_Sat_Float(const LVM_FLOAT *src,
+                     const LVM_FLOAT val,
+                     LVM_FLOAT *dst,
+                     LVM_INT16 n)
+{
+    LVM_INT16 ii;
+    LVM_FLOAT srcval;
+    LVM_FLOAT Temp,dInVal;
 
+    for (ii = n; ii != 0; ii--)
+    {
+        srcval = *src;
+        src++;
+
+        Temp = srcval * val;
+
+        dInVal  = (LVM_FLOAT)*dst;
+        Temp = Temp + dInVal;
+
+        if (Temp > 1.000000f)
+        {
+            *dst = 1.000000f;
+        }
+        else if (Temp < -1.000000f)
+        {
+            *dst = -1.000000f;
+        }
+        else
+        {
+            *dst = Temp;
+        }
+        dst++;
+    }
+
+    return;
+}
+#endif
 /**********************************************************************************/
 
 

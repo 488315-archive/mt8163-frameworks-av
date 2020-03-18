@@ -1,9 +1,4 @@
 /*
-* Copyright (C) 2014 MediaTek Inc.
-* Modification based on code covered by the mentioned copyright
-* and/or permission notice(s).
-*/
-/*
  * Copyright (C) 2009 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,72 +20,30 @@
 
 #include <media/stagefright/foundation/ADebug.h>
 #include <media/stagefright/FileSource.h>
-#include <sys/types.h>
-#include <unistd.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <fcntl.h>
+#include <media/stagefright/Utils.h>
+#include <private/android_filesystem_config.h>
 
-#ifdef MTK_AOSP_ENHANCEMENT
-#include "FileSourceProxy.h"
-#endif
 namespace android {
 
-#ifdef MTK_AOSP_ENHANCEMENT
-FileSourceProxy gFileSourceProxy;
-static ssize_t readAtProxy(int fd, off64_t offset, void *data, size_t size);
-#endif
-
 FileSource::FileSource(const char *filename)
-    : mFd(-1),
-      mOffset(0),
-      mLength(-1),
+    : ClearFileSource(filename),
       mDecryptHandle(NULL),
       mDrmManagerClient(NULL),
       mDrmBufOffset(0),
       mDrmBufSize(0),
       mDrmBuf(NULL){
-
-    mFd = open(filename, O_LARGEFILE | O_RDONLY);
-
-    if (mFd >= 0) {
-        mLength = lseek64(mFd, 0, SEEK_END);
-    } else {
-        ALOGE("Failed to open file '%s'. (%s)", filename, strerror(errno));
-    }
-
-#ifdef MTK_AOSP_ENHANCEMENT
-    gFileSourceProxy.registerFd(mFd, mOffset, mLength);
-#endif
 }
 
 FileSource::FileSource(int fd, int64_t offset, int64_t length)
-    : mFd(fd),
-      mOffset(offset),
-      mLength(length),
+    : ClearFileSource(fd, offset, length),
       mDecryptHandle(NULL),
       mDrmManagerClient(NULL),
       mDrmBufOffset(0),
       mDrmBufSize(0),
-      mDrmBuf(NULL){
-    CHECK(offset >= 0);
-    CHECK(length >= 0);
-
-
-#ifdef MTK_AOSP_ENHANCEMENT
-    gFileSourceProxy.registerFd(mFd, mOffset, mLength);
-#endif
+      mDrmBuf(NULL) {
 }
 
 FileSource::~FileSource() {
-    if (mFd >= 0) {
-#ifdef MTK_AOSP_ENHANCEMENT
-        gFileSourceProxy.unregisterFd(mFd);
-#endif
-        close(mFd);
-        mFd = -1;
-    }
-
     if (mDrmBuf != NULL) {
         delete[] mDrmBuf;
         mDrmBuf = NULL;
@@ -109,10 +62,6 @@ FileSource::~FileSource() {
     }
 }
 
-status_t FileSource::initCheck() const {
-    return mFd >= 0 ? OK : NO_INIT;
-}
-
 ssize_t FileSource::readAt(off64_t offset, void *data, size_t size) {
     if (mFd < 0) {
         return NO_INIT;
@@ -124,42 +73,22 @@ ssize_t FileSource::readAt(off64_t offset, void *data, size_t size) {
         if (offset >= mLength) {
             return 0;  // read beyond EOF.
         }
-        int64_t numAvailable = mLength - offset;
-        if ((int64_t)size > numAvailable) {
+        uint64_t numAvailable = mLength - offset;
+        if ((uint64_t)size > numAvailable) {
             size = numAvailable;
         }
     }
 
     if (mDecryptHandle != NULL && DecryptApiType::CONTAINER_BASED
             == mDecryptHandle->decryptApiType) {
-        return readAtDRM(offset, data, size);
+        return readAtDRM_l(offset, data, size);
    } else {
-#ifdef MTK_AOSP_ENHANCEMENT
-       return readAtProxy(mFd, offset + mOffset, data, size);
-#else
-        off64_t result = lseek64(mFd, offset + mOffset, SEEK_SET);
-        if (result == -1) {
-            ALOGE("seek to %lld failed", (long long)(offset + mOffset));
-            return UNKNOWN_ERROR;
-        }
-        return ::read(mFd, data, size);
-#endif
+        return readAt_l(offset, data, size);
     }
-}
-
-status_t FileSource::getSize(off64_t *size) {
-    Mutex::Autolock autoLock(mLock);
-
-    if (mFd < 0) {
-        return NO_INIT;
-    }
-
-    *size = mLength;
-
-    return OK;
 }
 
 sp<DecryptHandle> FileSource::DrmInitialization(const char *mime) {
+    if (getuid() == AID_MEDIA_EX) return nullptr; // no DRM in media extractor
     if (mDrmManagerClient == NULL) {
         mDrmManagerClient = new DrmManagerClient();
     }
@@ -181,20 +110,14 @@ sp<DecryptHandle> FileSource::DrmInitialization(const char *mime) {
     return mDecryptHandle;
 }
 
-void FileSource::getDrmInfo(sp<DecryptHandle> &handle, DrmManagerClient **client) {
-    handle = mDecryptHandle;
-
-    *client = mDrmManagerClient;
-}
-
-ssize_t FileSource::readAtDRM(off64_t offset, void *data, size_t size) {
+ssize_t FileSource::readAtDRM_l(off64_t offset, void *data, size_t size) {
     size_t DRM_CACHE_SIZE = 1024;
     if (mDrmBuf == NULL) {
         mDrmBuf = new unsigned char[DRM_CACHE_SIZE];
     }
 
     if (mDrmBuf != NULL && mDrmBufSize > 0 && (offset + mOffset) >= mDrmBufOffset
-            && (offset + mOffset + size) <= (mDrmBufOffset + mDrmBufSize)) {
+            && (offset + mOffset + size) <= static_cast<size_t>(mDrmBufOffset + mDrmBufSize)) {
         /* Use buffered data */
         memcpy(data, (void*)(mDrmBuf+(offset+mOffset-mDrmBufOffset)), size);
         return size;
@@ -205,7 +128,7 @@ ssize_t FileSource::readAtDRM(off64_t offset, void *data, size_t size) {
                 DRM_CACHE_SIZE, offset + mOffset);
         if (mDrmBufSize > 0) {
             int64_t dataRead = 0;
-            dataRead = size > mDrmBufSize ? mDrmBufSize : size;
+            dataRead = size > static_cast<size_t>(mDrmBufSize) ? mDrmBufSize : size;
             memcpy(data, (void*)mDrmBuf, dataRead);
             return dataRead;
         } else {
@@ -216,19 +139,18 @@ ssize_t FileSource::readAtDRM(off64_t offset, void *data, size_t size) {
         return mDrmManagerClient->pread(mDecryptHandle, data, size, offset + mOffset);
     }
 }
-#ifdef MTK_AOSP_ENHANCEMENT
-static ssize_t readAtProxy(int fd, off64_t offset, void *data, size_t size) {
-    ssize_t sz = gFileSourceProxy.read(fd, offset, data, size);
-    if (sz >= 0) {
-        return sz;
-    } else {
-        off64_t result = lseek64(fd, offset, SEEK_SET);
-        if (result == -1) {
-            ALOGE("seek to %lld failed", (long long)offset);
-            return UNKNOWN_ERROR;
-        }
-        return ::read(fd, data, size);
+
+/* static */
+bool FileSource::requiresDrm(int fd, int64_t offset, int64_t length, const char *mime) {
+    std::unique_ptr<DrmManagerClient> drmClient(new DrmManagerClient());
+    sp<DecryptHandle> decryptHandle =
+            drmClient->openDecryptSession(fd, offset, length, mime);
+    bool requiresDrm = false;
+    if (decryptHandle != nullptr) {
+        requiresDrm = decryptHandle->decryptApiType == DecryptApiType::CONTAINER_BASED;
+        drmClient->closeDecryptSession(decryptHandle);
     }
+    return requiresDrm;
 }
-#endif
+
 }  // namespace android

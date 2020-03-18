@@ -22,10 +22,13 @@
 #include "Configuration.h"
 #include <linux/futex.h>
 #include <sys/syscall.h>
+#include <audio_utils/clock.h>
+#include <cutils/atomic.h>
 #include <utils/Log.h>
 #include <utils/Trace.h>
 #include "FastThread.h"
 #include "FastThreadDumpState.h"
+#include "TypedLogger.h"
 
 #define FAST_DEFAULT_NS    999999999L   // ~1 sec: default time to sleep
 #define FAST_HOT_IDLE_NS     1000000L   // 1 ms: time to sleep while hot idling
@@ -35,7 +38,7 @@
 
 namespace android {
 
-FastThread::FastThread() : Thread(false /*canCallJava*/),
+FastThread::FastThread(const char *cycleMs, const char *loadUs) : Thread(false /*canCallJava*/),
     // re-initialized to &sInitial by subclass constructor
     mPrevious(NULL), mCurrent(NULL),
     /* mOldTs({0, 0}), */
@@ -63,8 +66,6 @@ FastThread::FastThread() : Thread(false /*canCallJava*/),
     /* mMeasuredWarmupTs({0, 0}), */
     mWarmupCycles(0),
     mWarmupConsecutiveInRangeCycles(0),
-    // mDummyLogWriter
-    mLogWriter(&mDummyLogWriter),
     mTimestampStatus(INVALID_OPERATION),
 
     mCommand(FastThreadState::INITIAL),
@@ -72,11 +73,15 @@ FastThread::FastThread() : Thread(false /*canCallJava*/),
     frameCount(0),
 #endif
     mAttemptedWrite(false)
+    // mCycleMs(cycleMs)
+    // mLoadUs(loadUs)
 {
     mOldTs.tv_sec = 0;
     mOldTs.tv_nsec = 0;
     mMeasuredWarmupTs.tv_sec = 0;
     mMeasuredWarmupTs.tv_nsec = 0;
+    strlcpy(mCycleMs, cycleMs, sizeof(mCycleMs));
+    strlcpy(mLoadUs, loadUs, sizeof(mLoadUs));
 }
 
 FastThread::~FastThread()
@@ -85,6 +90,9 @@ FastThread::~FastThread()
 
 bool FastThread::threadLoop()
 {
+    // LOGT now works even if tlNBLogWriter is nullptr, but we're considering changing that,
+    // so this initialization permits a future change to remove the check for nullptr.
+    tlNBLogWriter = mDummyNBLogWriter.get();
     for (;;) {
 
         // either nanosleep, sched_yield, or busy wait
@@ -114,8 +122,9 @@ bool FastThread::threadLoop()
 
             // As soon as possible of learning of a new dump area, start using it
             mDumpState = next->mDumpState != NULL ? next->mDumpState : mDummyDumpState;
-            mLogWriter = next->mNBLogWriter != NULL ? next->mNBLogWriter : &mDummyLogWriter;
-            setLog(mLogWriter);
+            tlNBLogWriter = next->mNBLogWriter != NULL ?
+                    next->mNBLogWriter : mDummyNBLogWriter.get();
+            setNBLogWriter(tlNBLogWriter); // FastMixer informs its AudioMixer, FastCapture ignores
 
             // We want to always have a valid reference to the previous (non-idle) state.
             // However, the state queue only guarantees access to current and previous states.
@@ -163,9 +172,9 @@ bool FastThread::threadLoop()
                 if (old <= 0) {
                     syscall(__NR_futex, coldFutexAddr, FUTEX_WAIT_PRIVATE, old - 1, NULL);
                 }
-                int policy = sched_getscheduler(0);
+                int policy = sched_getscheduler(0) & ~SCHED_RESET_ON_FORK;
                 if (!(policy == SCHED_FIFO || policy == SCHED_RR)) {
-                    ALOGE("did not receive expected priority boost");
+                    ALOGE("did not receive expected priority boost on time");
                 }
                 // This may be overly conservative; there could be times that the normal mixer
                 // requests such a brief cold idle that it doesn't require resetting this flag.
@@ -213,7 +222,6 @@ bool FastThread::threadLoop()
         struct timespec newTs;
         int rc = clock_gettime(CLOCK_MONOTONIC, &newTs);
         if (rc == 0) {
-            //mLogWriter->logTimestamp(newTs);
             if (mOldTsValid) {
                 time_t sec = newTs.tv_sec - mOldTs.tv_sec;
                 long nsec = newTs.tv_nsec - mOldTs.tv_nsec;
@@ -251,6 +259,9 @@ bool FastThread::threadLoop()
                         mIsWarm = true;
                         mDumpState->mMeasuredWarmupTs = mMeasuredWarmupTs;
                         mDumpState->mWarmupCycles = mWarmupCycles;
+                        const double measuredWarmupMs = (mMeasuredWarmupTs.tv_sec * 1e3) +
+                                (mMeasuredWarmupTs.tv_nsec * 1e-6);
+                        LOG_WARMUP_TIME(measuredWarmupMs);
                     }
                 }
                 mSleepNs = -1;
@@ -261,6 +272,7 @@ bool FastThread::threadLoop()
                         ALOGV("underrun: time since last cycle %d.%03ld sec",
                                 (int) sec, nsec / 1000000L);
                         mDumpState->mUnderruns++;
+                        LOG_UNDERRUN(audio_utils_ns_from_timespec(&newTs));
                         mIgnoreNextOverrun = true;
                     } else if (nsec < mOverrunNs) {
                         if (mIgnoreNextOverrun) {
@@ -270,6 +282,7 @@ bool FastThread::threadLoop()
                             ALOGV("overrun: time since last cycle %d.%03ld sec",
                                     (int) sec, nsec / 1000000L);
                             mDumpState->mOverruns++;
+                            LOG_OVERRUN(audio_utils_ns_from_timespec(&newTs));
                         }
                         // This forces a minimum cycle time. It:
                         //  - compensates for an audio HAL with jitter due to sample rate conversion
@@ -288,14 +301,19 @@ bool FastThread::threadLoop()
                     size_t i = mBounds & (mDumpState->mSamplingN - 1);
                     mBounds = (mBounds & 0xFFFF0000) | ((mBounds + 1) & 0xFFFF);
                     if (mFull) {
-                        mBounds += 0x10000;
+                        //mBounds += 0x10000;
+                        __builtin_add_overflow(mBounds, 0x10000, &mBounds);
                     } else if (!(mBounds & (mDumpState->mSamplingN - 1))) {
                         mFull = true;
                     }
                     // compute the delta value of clock_gettime(CLOCK_MONOTONIC)
                     uint32_t monotonicNs = nsec;
                     if (sec > 0 && sec < 4) {
+#if defined(MTK_AUDIO_FIX_DEFAULT_DEFECT)
+                        monotonicNs += (uint32_t)sec * (uint32_t)1000000000;
+#else
                         monotonicNs += sec * 1000000000;
+#endif
                     }
                     // compute raw CPU load = delta value of clock_gettime(CLOCK_THREAD_CPUTIME_ID)
                     uint32_t loadNs = 0;
@@ -311,7 +329,11 @@ bool FastThread::threadLoop()
                             }
                             loadNs = nsec;
                             if (sec > 0 && sec < 4) {
+#if defined(MTK_AUDIO_FIX_DEFAULT_DEFECT)
+                                loadNs += (uint32_t)sec * (uint32_t)1000000000;
+#else
                                 loadNs += sec * 1000000000;
+#endif
                             }
                         } else {
                             // first time through the loop
@@ -329,6 +351,7 @@ bool FastThread::threadLoop()
                     // these stores #1, #2, #3 are not atomic with respect to each other,
                     // or with respect to store #4 below
                     mDumpState->mMonotonicNs[i] = monotonicNs;
+                    LOG_WORK_TIME(monotonicNs);
                     mDumpState->mLoadNs[i] = loadNs;
 #ifdef CPU_FREQUENCY_STATISTICS
                     mDumpState->mCpukHz[i] = kHz;
@@ -336,8 +359,8 @@ bool FastThread::threadLoop()
                     // this store #4 is not atomic with respect to stores #1, #2, #3 above, but
                     // the newest open & oldest closed halves are atomic with respect to each other
                     mDumpState->mBounds = mBounds;
-                    ATRACE_INT("cycle_ms", monotonicNs / 1000000);
-                    ATRACE_INT("load_us", loadNs / 1000);
+                    ATRACE_INT(mCycleMs, monotonicNs / 1000000);
+                    ATRACE_INT(mLoadUs, loadNs / 1000);
                 }
 #endif
             } else {

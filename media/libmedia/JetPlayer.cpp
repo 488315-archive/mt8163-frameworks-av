@@ -1,9 +1,4 @@
 /*
-* Copyright (C) 2014 MediaTek Inc.
-* Modification based on code covered by the mentioned copyright
-* and/or permission notice(s).
-*/
-/*
  * Copyright (C) 2008 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -41,6 +36,7 @@ JetPlayer::JetPlayer(void *javaJetPlayer, int maxTracks, int trackBufferSize) :
         mPaused(false),
         mMaxTracks(maxTracks),
         mEasData(NULL),
+        mIoWrapper(NULL),
         mTrackBufferSize(trackBufferSize)
 {
     ALOGV("JetPlayer constructor");
@@ -55,7 +51,6 @@ JetPlayer::~JetPlayer()
 {
     ALOGV("~JetPlayer");
     release();
-
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -143,7 +138,8 @@ int JetPlayer::release()
         JET_Shutdown(mEasData);
         EAS_Shutdown(mEasData);
     }
-    mIoWrapper.clear();
+    delete mIoWrapper;
+    mIoWrapper = NULL;
     if (mAudioTrack != 0) {
         mAudioTrack->stop();
         mAudioTrack->flush();
@@ -234,20 +230,6 @@ int JetPlayer::render() {
 
         // Write data to the audio hardware
         //ALOGV("JetPlayer::render(): writing to audio output");
-#ifdef MTK_AOSP_ENHANCEMENT
-        temp = mAudioTrack->write(mAudioBuffer, num_output);
-        if (temp < 0 && temp != -11) {
-            ALOGE("JetPlayer::render(): Error in writing:%d",temp);
-            return temp;
-        } else {
-            // start audio output if necessary
-            if (!audioStarted) {
-                ALOGV("JetPlayer::render(): starting audio playback");
-                mAudioTrack->start();
-                audioStarted = true;
-            }
-        }
-#else
         if ((temp = mAudioTrack->write(mAudioBuffer, num_output)) < 0) {
             ALOGE("JetPlayer::render(): Error in writing:%d",temp);
             return temp;
@@ -259,7 +241,6 @@ int JetPlayer::render() {
             mAudioTrack->start();
             audioStarted = true;
         }
-#endif
 
     }//while (1)
 
@@ -349,6 +330,7 @@ int JetPlayer::loadFromFile(const char* path)
 
     Mutex::Autolock lock(mMutex);
 
+    delete mIoWrapper;
     mIoWrapper = new MidiIoWrapper(path);
 
     EAS_RESULT result = JET_OpenFile(mEasData, mIoWrapper->getLocator());
@@ -367,6 +349,7 @@ int JetPlayer::loadFromFD(const int fd, const long long offset, const long long 
 
     Mutex::Autolock lock(mMutex);
 
+    delete mIoWrapper;
     mIoWrapper = new MidiIoWrapper(fd, offset, length);
 
     EAS_RESULT result = JET_OpenFile(mEasData, mIoWrapper->getLocator());
@@ -381,16 +364,8 @@ int JetPlayer::loadFromFD(const int fd, const long long offset, const long long 
 //-------------------------------------------------------------------------------------------------
 int JetPlayer::closeFile()
 {
-#ifdef MTK_AOSP_ENHANCEMENT
-    ALOGW("!!!There is a PAUSE before actually CLOSE FILE to workaround CTS case!!!");
-    pause();
-    {
-#endif
     Mutex::Autolock lock(mMutex);
     return JET_CloseFile(mEasData);
-#ifdef MTK_AOSP_ENHANCEMENT
-    }
-#endif
 }
 
 

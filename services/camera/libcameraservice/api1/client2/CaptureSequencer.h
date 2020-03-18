@@ -34,8 +34,7 @@ class Camera2Client;
 
 namespace camera2 {
 
-class ZslProcessorInterface;
-class BurstCapture;
+class ZslProcessor;
 
 /**
  * Manages the still image capture process for
@@ -45,14 +44,14 @@ class CaptureSequencer:
             virtual public Thread,
             virtual public FrameProcessor::FilteredListener {
   public:
-    CaptureSequencer(wp<Camera2Client> client);
+    explicit CaptureSequencer(wp<Camera2Client> client);
     ~CaptureSequencer();
 
     // Get reference to the ZslProcessor, which holds the ZSL buffers and frames
-    void setZslProcessor(wp<ZslProcessorInterface> processor);
+    void setZslProcessor(const wp<ZslProcessor>& processor);
 
     // Begin still image capture
-    status_t startCapture(int msgType);
+    status_t startCapture();
 
     // Wait until current image capture completes; returns immediately if no
     // capture is active. Returns TIMED_OUT if capture does not complete during
@@ -66,11 +65,14 @@ class CaptureSequencer:
     void notifyShutter(const CaptureResultExtras& resultExtras,
                        nsecs_t timestamp);
 
+    // Notifications about shutter (capture start)
+    void notifyError(int32_t errorCode, const CaptureResultExtras& resultExtras);
+
     // Notification from the frame processor
     virtual void onResultAvailable(const CaptureResult &result);
 
     // Notifications from the JPEG processor
-    void onCaptureAvailable(nsecs_t timestamp, sp<MemoryBase> captureBuffer);
+    void onCaptureAvailable(nsecs_t timestamp, const sp<MemoryBase>& captureBuffer, bool captureError);
 
     void dump(int fd, const Vector<String16>& args);
 
@@ -95,6 +97,7 @@ class CaptureSequencer:
     Condition mNewFrameSignal;
 
     bool mNewCaptureReceived;
+    int32_t mNewCaptureErrorCnt;
     nsecs_t mCaptureTimestamp;
     sp<MemoryBase> mCaptureBuffer;
     Condition mNewCaptureSignal;
@@ -111,10 +114,10 @@ class CaptureSequencer:
     static const int kMaxTimeoutsForPrecaptureStart = 10; // 1 sec
     static const int kMaxTimeoutsForPrecaptureEnd = 20;  // 2 sec
     static const int kMaxTimeoutsForCaptureEnd    = 40;  // 4 sec
+    static const int kMaxRetryCount = 3; // 3 retries in case of buffer drop
 
     wp<Camera2Client> mClient;
-    wp<ZslProcessorInterface> mZslProcessor;
-    sp<BurstCapture> mBurstCapture;
+    wp<ZslProcessor> mZslProcessor;
 
     enum CaptureState {
         IDLE,
@@ -126,8 +129,6 @@ class CaptureSequencer:
         STANDARD_PRECAPTURE_WAIT,
         STANDARD_CAPTURE,
         STANDARD_CAPTURE_WAIT,
-        BURST_CAPTURE_START,
-        BURST_CAPTURE_WAIT,
         DONE,
         ERROR,
         NUM_CAPTURE_STATES
@@ -147,7 +148,6 @@ class CaptureSequencer:
     bool mAeInPrecapture;
 
     int32_t mCaptureId;
-    int mMsgType;
 
     // Main internal methods
 
@@ -165,9 +165,6 @@ class CaptureSequencer:
     CaptureState manageStandardCapture(sp<Camera2Client> &client);
     CaptureState manageStandardCaptureWait(sp<Camera2Client> &client);
 
-    CaptureState manageBurstCaptureStart(sp<Camera2Client> &client);
-    CaptureState manageBurstCaptureWait(sp<Camera2Client> &client);
-
     CaptureState manageDone(sp<Camera2Client> &client);
 
     // Utility methods
@@ -177,7 +174,7 @@ class CaptureSequencer:
 
     // Emit Shutter/Raw callback to java, and maybe play a shutter sound
     static void shutterNotifyLocked(const Parameters &params,
-            sp<Camera2Client> client, int msgType);
+            const sp<Camera2Client>& client);
 };
 
 }; // namespace camera2

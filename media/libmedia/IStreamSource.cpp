@@ -20,23 +20,12 @@
 
 #include <media/IStreamSource.h>
 #include <media/stagefright/foundation/AMessage.h>
+#include <media/stagefright/foundation/MediaKeys.h>
 
 #include <binder/IMemory.h>
 #include <binder/Parcel.h>
 
 namespace android {
-
-// static
-const char *const IStreamListener::kKeyResumeAtPTS = "resume-at-PTS";
-
-// static
-const char *const IStreamListener::kKeyDiscontinuityMask = "discontinuity-mask";
-
-// static
-const char *const IStreamListener::kKeyMediaTimeUs = "media-time-us";
-
-// static
-const char *const IStreamListener::kKeyRecentMediaTimeUs = "recent-media-time-us";
 
 enum {
     // IStreamSource
@@ -51,7 +40,7 @@ enum {
 };
 
 struct BpStreamSource : public BpInterface<IStreamSource> {
-    BpStreamSource(const sp<IBinder> &impl)
+    explicit BpStreamSource(const sp<IBinder> &impl)
         : BpInterface<IStreamSource>(impl) {
     }
 
@@ -111,7 +100,11 @@ status_t BnStreamSource::onTransact(
                 sp<IMemory> mem =
                     interface_cast<IMemory>(data.readStrongBinder());
 
-                buffers.push(mem);
+                if (mem != NULL) {
+                    buffers.push(mem);
+                } else if (data.dataAvail() == 0) {
+                    break;
+                }
             }
             setBuffers(buffers);
             break;
@@ -141,7 +134,7 @@ status_t BnStreamSource::onTransact(
 ////////////////////////////////////////////////////////////////////////////////
 
 struct BpStreamListener : public BpInterface<IStreamListener> {
-    BpStreamListener(const sp<IBinder> &impl)
+    explicit BpStreamListener(const sp<IBinder> &impl)
         : BpInterface<IStreamListener>(impl) {
     }
 

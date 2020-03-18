@@ -1,9 +1,4 @@
 /*
-* Copyright (C) 2014 MediaTek Inc.
-* Modification based on code covered by the mentioned copyright
-* and/or permission notice(s).
-*/
-/*
  * Copyright (C) 2010 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,23 +20,16 @@
 
 #include "NuPlayer.h"
 
+#include <media/ICrypto.h>
+#include <media/mediaplayer.h>
 #include <media/stagefright/foundation/AMessage.h>
 #include <media/stagefright/MetaData.h>
-#include <media/mediaplayer.h>
 #include <utils/Vector.h>
 
 namespace android {
 
 struct ABuffer;
 class MediaBuffer;
-
-#ifdef MTK_AOSP_ENHANCEMENT
-// To add Parcel into an AMessage as an object, it should be 'RefBase'.
-struct ParcelEvent : public RefBase {
-    Parcel parcel;
-};
-#endif
-
 
 struct NuPlayer::Source : public AHandler {
     enum Flags {
@@ -50,8 +38,8 @@ struct NuPlayer::Source : public AHandler {
         FLAG_CAN_SEEK_FORWARD   = 4,  // the "10 sec forward button"
         FLAG_CAN_SEEK           = 8,  // the "seek bar"
         FLAG_DYNAMIC_DURATION   = 16,
-        FLAG_SECURE             = 32,
-        FLAG_PROTECTED          = 64,
+        FLAG_SECURE             = 32, // Secure codec is required.
+        FLAG_PROTECTED          = 64, // The screen needs to be protected (screenshot is disabled).
     };
 
     enum {
@@ -59,46 +47,36 @@ struct NuPlayer::Source : public AHandler {
         kWhatFlagsChanged,
         kWhatVideoSizeChanged,
         kWhatBufferingUpdate,
-        kWhatBufferingStart,
-        kWhatBufferingEnd,
         kWhatPauseOnBufferingStart,
         kWhatResumeOnBufferingEnd,
         kWhatCacheStats,
         kWhatSubtitleData,
         kWhatTimedTextData,
         kWhatTimedMetaData,
-#ifdef MTK_AOSP_ENHANCEMENT
-        kWhatTimedTextData2,
-#endif
         kWhatQueueDecoderShutdown,
         kWhatDrmNoLicense,
         kWhatInstantiateSecureDecoders,
-#ifdef MTK_AOSP_ENHANCEMENT
-        kWhatConnDone       = 'cdon',
-        kWhatBufferNotify   = 'buff',
-        kWhatSeekDone       = 'sdon',
-        kWhatPauseDone      = 'psdn',
-        kWhatPlayDone       = 'pldn',
-        kWhatPicture        = 'pict', // orange
-        kWhatSourceError    = 'serr',
-        kWhatDurationUpdate = 'dura'
-#endif
+        // Modular DRM
+        kWhatDrmInfo,
     };
 
     // The provides message is used to notify the player about various
     // events.
-    Source(const sp<AMessage> &notify)
+    explicit Source(const sp<AMessage> &notify)
         : mNotify(notify) {
     }
+
+    virtual status_t getBufferingSettings(
+            BufferingSettings* buffering /* nonnull */) = 0;
+    virtual status_t setBufferingSettings(const BufferingSettings& buffering) = 0;
 
     virtual void prepareAsync() = 0;
 
     virtual void start() = 0;
     virtual void stop() {}
-#ifndef MTK_AOSP_ENHANCEMENT
     virtual void pause() {}
     virtual void resume() {}
-#endif
+
     // Explicitly disconnect the underling data source
     virtual void disconnect() {}
 
@@ -106,7 +84,11 @@ struct NuPlayer::Source : public AHandler {
     // an error or ERROR_END_OF_STREAM if not.
     virtual status_t feedMoreTSData() = 0;
 
+    // Returns non-NULL format when the specified track exists.
+    // When the format has "err" set to -EWOULDBLOCK, source needs more time to get valid meta data.
+    // Returns NULL if the specified track doesn't exist or is invalid;
     virtual sp<AMessage> getFormat(bool audio);
+
     virtual sp<MetaData> getFormatMeta(bool /* audio */) { return NULL; }
     virtual sp<MetaData> getFileFormatMeta() const { return NULL; }
 
@@ -133,11 +115,9 @@ struct NuPlayer::Source : public AHandler {
         return INVALID_OPERATION;
     }
 
-    virtual status_t seekTo(int64_t /* seekTimeUs */) {
-        return INVALID_OPERATION;
-    }
-
-    virtual status_t setBuffers(bool /* audio */, Vector<MediaBuffer *> &/* buffers */) {
+    virtual status_t seekTo(
+            int64_t /* seekTimeUs */,
+            MediaPlayerSeekMode /* mode */ = MediaPlayerSeekMode::SEEK_PREVIOUS_SYNC) {
         return INVALID_OPERATION;
     }
 
@@ -148,6 +128,23 @@ struct NuPlayer::Source : public AHandler {
     virtual bool isStreaming() const {
         return true;
     }
+
+    virtual void setOffloadAudio(bool /* offload */) {}
+
+    // Modular DRM
+    virtual status_t prepareDrm(
+            const uint8_t /*uuid*/[16], const Vector<uint8_t> &/*drmSessionId*/,
+            sp<ICrypto> */*crypto*/) {
+        return INVALID_OPERATION;
+    }
+
+    virtual status_t releaseDrm() {
+        return INVALID_OPERATION;
+    }
+
+//mtkadd+
+    virtual void setGetMp3Param(int32_t *  /*flag*/, bool  /*set*/){};
+//mtkadd-
 
 protected:
     virtual ~Source() {}
@@ -160,54 +157,12 @@ protected:
     void notifyVideoSizeChanged(const sp<AMessage> &format = NULL);
     void notifyInstantiateSecureDecoders(const sp<AMessage> &reply);
     void notifyPrepared(status_t err = OK);
+    // Modular DRM
+    void notifyDrmInfo(const sp<ABuffer> &buffer);
 
 private:
     sp<AMessage> mNotify;
 
-#ifdef MTK_AOSP_ENHANCEMENT
-public:
-    virtual bool hasVideo() { return false;}
-    // mtk80902: just keep default defination..
-    virtual void pause() {
-        sp<AMessage> notify = dupNotify();
-        notify->setInt32("what", kWhatPauseDone);
-        notify->setInt32("result", OK);
-        notify->post();
-    }
-    virtual void resume() {
-        sp<AMessage> notify = dupNotify();
-        notify->setInt32("what", kWhatPlayDone);
-        notify->setInt32("result", OK);
-        notify->post();
-    }
-    //  return -EWOULDBLOCK: not ready
-    //  return OK: is ready
-    //  virtual status_t allTracksPresent() {return INVALID_OPERATION;};
-    virtual status_t initCheck() const {return OK;}
-    virtual void setParams(const sp<MetaData> &) {};
-    virtual status_t getFinalStatus() const {return OK;}
-    virtual status_t getBufferedDuration(bool , int64_t *) {return INVALID_OPERATION;};
-    virtual sp<MetaData> getMetaData() {return mMetaData;};
-    virtual void stopTrack(bool ) { return; }
-    virtual bool notifyCanNotConnectServerIfPossible(int64_t /*curPositionUs*/) {return false;}
-
-    enum DataSourceType {
-        SOURCE_Default,
-        SOURCE_HttpLive,
-        SOURCE_Local,
-        SOURCE_Rtsp,
-        SOURCE_Http,
-    };
-
-    virtual DataSourceType getDataSourceType() { return SOURCE_Default; }
-
-    enum {
-        NOT_USE_RENDEREDPOSITIONUS = -1
-    };
-
-protected:
-    sp<MetaData> mMetaData;
-#endif
     DISALLOW_EVIL_CONSTRUCTORS(Source);
 };
 

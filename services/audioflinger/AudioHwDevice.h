@@ -22,10 +22,9 @@
 #include <stdlib.h>
 #include <sys/types.h>
 
-#include <hardware/audio.h>
+#include <media/audiohal/DeviceHalInterface.h>
 #include <utils/Errors.h>
 #include <system/audio.h>
-
 
 namespace android {
 
@@ -36,11 +35,14 @@ public:
     enum Flags {
         AHWD_CAN_SET_MASTER_VOLUME  = 0x1,
         AHWD_CAN_SET_MASTER_MUTE    = 0x2,
+        // Means that this isn't a terminal module, and software patches
+        // are used to transport audio data further.
+        AHWD_IS_INSERT              = 0x4,
     };
 
     AudioHwDevice(audio_module_handle_t handle,
                   const char *moduleName,
-                  audio_hw_device_t *hwDevice,
+                  sp<DeviceHalInterface> hwDevice,
                   Flags flags)
         : mHandle(handle)
         , mModuleName(strdup(moduleName))
@@ -56,10 +58,13 @@ public:
         return (0 != (mFlags & AHWD_CAN_SET_MASTER_MUTE));
     }
 
+    bool isInsert() const {
+        return (0 != (mFlags & AHWD_IS_INSERT));
+    }
+
     audio_module_handle_t handle() const { return mHandle; }
     const char *moduleName() const { return mModuleName; }
-    audio_hw_device_t *hwDevice() const { return mHwDevice; }
-    uint32_t version() const { return mHwDevice->common.version; }
+    sp<DeviceHalInterface> hwDevice() const { return mHwDevice; }
 
     /** This method creates and opens the audio hardware output stream.
      * The "address" parameter qualifies the "devices" audio device type if needed.
@@ -76,10 +81,12 @@ public:
             struct audio_config *config,
             const char *address);
 
+    bool supportsAudioPatches() const;
+
 private:
     const audio_module_handle_t mHandle;
     const char * const          mModuleName;
-    audio_hw_device_t * const   mHwDevice;
+    sp<DeviceHalInterface>      mHwDevice;
     const Flags                 mFlags;
 };
 

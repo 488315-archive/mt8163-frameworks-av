@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2014 The Android Open Source Project
+ * Copyright (C) 2014-2018 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -42,7 +42,7 @@ class Camera3DummyStream :
      * Set up a dummy stream; doesn't actually connect to anything, and uses
      * a default dummy format and size.
      */
-    Camera3DummyStream(int id);
+    explicit Camera3DummyStream(int id);
 
     virtual ~Camera3DummyStream();
 
@@ -54,6 +54,50 @@ class Camera3DummyStream :
 
     status_t         setTransform(int transform);
 
+    virtual status_t detachBuffer(sp<GraphicBuffer>* buffer, int* fenceFd);
+
+    /**
+     * Drop buffers for stream of streamId if dropping is true. If dropping is false, do not
+     * drop buffers for stream of streamId.
+     */
+    virtual status_t dropBuffers(bool /*dropping*/) override;
+
+    /**
+     * Query the physical camera id for the output stream.
+     */
+    virtual const String8& getPhysicalCameraId() const override;
+
+    /**
+     * Return if this output stream is for video encoding.
+     */
+    bool isVideoStream() const;
+
+    /**
+     * Return if the consumer configuration of this stream is deferred.
+     */
+    virtual bool isConsumerConfigurationDeferred(size_t surface_id) const;
+
+    /**
+     * Set the consumer surfaces to the output stream.
+     */
+    virtual status_t setConsumers(const std::vector<sp<Surface>>& consumers);
+
+    /**
+     * Query the output surface id.
+     */
+    virtual ssize_t getSurfaceId(const sp<Surface> &/*surface*/) { return 0; }
+
+    virtual status_t getUniqueSurfaceIds(const std::vector<size_t>&,
+            /*out*/std::vector<size_t>*) { return INVALID_OPERATION; };
+
+    /**
+     * Update the stream output surfaces.
+     */
+    virtual status_t updateStream(const std::vector<sp<Surface>> &outputSurfaces,
+            const std::vector<OutputStreamInfo> &outputInfo,
+            const std::vector<size_t> &removedSurfaceIds,
+            KeyedVector<sp<Surface>, size_t> *outputMap/*out*/);
+
   protected:
 
     /**
@@ -63,6 +107,7 @@ class Camera3DummyStream :
             const camera3_stream_buffer &buffer,
             nsecs_t timestamp,
             bool output,
+            const std::vector<size_t>& surface_ids,
             /*out*/
             sp<Fence> *releaseFenceOut);
 
@@ -77,19 +122,21 @@ class Camera3DummyStream :
     static const int DUMMY_FORMAT = HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED;
     static const android_dataspace DUMMY_DATASPACE = HAL_DATASPACE_UNKNOWN;
     static const camera3_stream_rotation_t DUMMY_ROTATION = CAMERA3_STREAM_ROTATION_0;
-    static const uint32_t DUMMY_USAGE = GRALLOC_USAGE_HW_COMPOSER;
+    static const uint64_t DUMMY_USAGE = GRALLOC_USAGE_HW_COMPOSER;
+    static const String8 DUMMY_ID;
 
     /**
      * Internal Camera3Stream interface
      */
-    virtual status_t getBufferLocked(camera3_stream_buffer *buffer);
+    virtual status_t getBufferLocked(camera3_stream_buffer *buffer,
+            const std::vector<size_t>& surface_ids = std::vector<size_t>());
     virtual status_t returnBufferLocked(
             const camera3_stream_buffer &buffer,
-            nsecs_t timestamp);
+            nsecs_t timestamp, const std::vector<size_t>& surface_ids);
 
     virtual status_t configureQueueLocked();
 
-    virtual status_t getEndpointUsage(uint32_t *usage) const;
+    virtual status_t getEndpointUsage(uint64_t *usage) const;
 
 }; // class Camera3DummyStream
 

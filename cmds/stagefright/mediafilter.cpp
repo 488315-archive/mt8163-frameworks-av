@@ -26,10 +26,10 @@
 #include <gui/Surface.h>
 #include <media/ICrypto.h>
 #include <media/IMediaHTTPService.h>
+#include <media/MediaCodecBuffer.h>
 #include <media/stagefright/foundation/ABuffer.h>
 #include <media/stagefright/foundation/ADebug.h>
 #include <media/stagefright/foundation/AMessage.h>
-#include <media/stagefright/DataSource.h>
 #include <media/stagefright/MediaCodec.h>
 #include <media/stagefright/NuMediaExtractor.h>
 #include <media/stagefright/RenderScriptWrapper.h>
@@ -69,7 +69,7 @@ static void usage(const char *me) {
 namespace android {
 
 struct SaturationRSFilter : RenderScriptWrapper::RSFilterCallback {
-    void init(RSC::sp<RSC::RS> context) {
+    void init(const RSC::sp<RSC::RS> &context) {
         mScript = new ScriptC_saturation(context);
         mScript->set_gSaturation(3.f);
     }
@@ -90,7 +90,7 @@ private:
 };
 
 struct NightVisionRSFilter : RenderScriptWrapper::RSFilterCallback {
-    void init(RSC::sp<RSC::RS> context) {
+    void init(const RSC::sp<RSC::RS> &context) {
         mScript = new ScriptC_nightvision(context);
     }
 
@@ -110,7 +110,7 @@ private:
 };
 
 struct ARGBToRGBARSFilter : RenderScriptWrapper::RSFilterCallback {
-    void init(RSC::sp<RSC::RS> context) {
+    void init(const RSC::sp<RSC::RS> &context) {
         mScript = new ScriptC_argbtorgba(context);
     }
 
@@ -131,8 +131,8 @@ private:
 
 struct CodecState {
     sp<MediaCodec> mCodec;
-    Vector<sp<ABuffer> > mInBuffers;
-    Vector<sp<ABuffer> > mOutBuffers;
+    Vector<sp<MediaCodecBuffer> > mInBuffers;
+    Vector<sp<MediaCodecBuffer> > mOutBuffers;
     bool mSignalledInputEOS;
     bool mSawOutputEOS;
     int64_t mNumBuffersDecoded;
@@ -183,9 +183,9 @@ void tryCopyDecodedBuffer(
     }
     size_t outIndex = frame.index;
 
-    const sp<ABuffer> &srcBuffer =
+    const sp<MediaCodecBuffer> &srcBuffer =
         vidState->mOutBuffers.itemAt(outIndex);
-    const sp<ABuffer> &destBuffer =
+    const sp<MediaCodecBuffer> &destBuffer =
         filterState->mInBuffers.itemAt(filterIndex);
 
     sp<AMessage> srcFormat, destFormat;
@@ -310,7 +310,7 @@ void tryDrainOutputBuffer(
 }
 
 static int decode(
-        const sp<ALooper> &looper,
+        const sp<android::ALooper> &looper,
         const char *path,
         const sp<Surface> &surface,
         bool renderSurface,
@@ -465,7 +465,7 @@ static int decode(
     filterState->mSignalledInputEOS = false;
     filterState->mSawOutputEOS = false;
 
-    int64_t startTimeUs = ALooper::GetNowUs();
+    int64_t startTimeUs = android::ALooper::GetNowUs();
     int64_t startTimeRender = -1;
 
     for (size_t i = 0; i < stateByTrack.size(); ++i) {
@@ -532,10 +532,12 @@ static int decode(
                 if (err == OK) {
                     ALOGV("filling input buffer %zu", index);
 
-                    const sp<ABuffer> &buffer = state->mInBuffers.itemAt(index);
+                    const sp<MediaCodecBuffer> &buffer = state->mInBuffers.itemAt(index);
+                    sp<ABuffer> abuffer = new ABuffer(buffer->base(), buffer->capacity());
 
-                    err = extractor->readSampleData(buffer);
+                    err = extractor->readSampleData(abuffer);
                     CHECK(err == OK);
+                    buffer->setRange(abuffer->offset(), abuffer->size());
 
                     int64_t timeUs;
                     err = extractor->getSampleTime(&timeUs);
@@ -641,7 +643,7 @@ static int decode(
                 useTimestamp, &startTimeRender);
     }
 
-    int64_t elapsedTimeUs = ALooper::GetNowUs() - startTimeUs;
+    int64_t elapsedTimeUs = android::ALooper::GetNowUs() - startTimeUs;
 
     for (size_t i = 0; i < stateByTrack.size(); ++i) {
         CodecState *state = &stateByTrack.editValueAt(i);
@@ -704,13 +706,13 @@ int main(int argc, char **argv) {
             case 'T':
             {
                 useTimestamp = true;
+                FALLTHROUGH_INTENDED;
             }
-            // fall through
             case 'R':
             {
                 renderSurface = true;
+                FALLTHROUGH_INTENDED;
             }
-            // fall through
             case 'S':
             {
                 useSurface = true;
@@ -735,9 +737,7 @@ int main(int argc, char **argv) {
 
     ProcessState::self()->startThreadPool();
 
-    DataSource::RegisterDefaultSniffers();
-
-    android::sp<ALooper> looper = new ALooper;
+    android::sp<android::ALooper> looper = new android::ALooper;
     looper->start();
 
     android::sp<SurfaceComposerClient> composerClient;
@@ -748,10 +748,12 @@ int main(int argc, char **argv) {
         composerClient = new SurfaceComposerClient;
         CHECK_EQ((status_t)OK, composerClient->initCheck());
 
-        android::sp<IBinder> display(SurfaceComposerClient::getBuiltInDisplay(
-                ISurfaceComposer::eDisplayIdMain));
+        const android::sp<IBinder> display = SurfaceComposerClient::getInternalDisplayToken();
+        CHECK(display != nullptr);
+
         DisplayInfo info;
-        SurfaceComposerClient::getDisplayInfo(display, &info);
+        CHECK_EQ(SurfaceComposerClient::getDisplayInfo(display, &info), NO_ERROR);
+
         ssize_t displayWidth = info.w;
         ssize_t displayHeight = info.h;
 
@@ -764,10 +766,10 @@ int main(int argc, char **argv) {
         CHECK(control != NULL);
         CHECK(control->isValid());
 
-        SurfaceComposerClient::openGlobalTransaction();
-        CHECK_EQ((status_t)OK, control->setLayer(INT_MAX));
-        CHECK_EQ((status_t)OK, control->show());
-        SurfaceComposerClient::closeGlobalTransaction();
+        SurfaceComposerClient::Transaction{}
+                .setLayer(control, INT_MAX)
+                .show(control)
+                .apply();
 
         surface = control->getSurface();
         CHECK(surface != NULL);

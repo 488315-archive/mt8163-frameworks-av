@@ -16,9 +16,9 @@
 
 
 /*--------------------------------------------------------------------------*
- *                         DTX.H					    *
+ *                         DTX.H                        *
  *--------------------------------------------------------------------------*
- *       Static memory, constants and frametypes for the DTX 		    *
+ *       Static memory, constants and frametypes for the DTX            *
  *--------------------------------------------------------------------------*/
 
 #ifndef __DTX_H__
@@ -31,7 +31,7 @@
 #define DTX_HANG_CONST 7                   /* yields eight frames of SP HANGOVER  */
 #define INV_MED_THRESH 14564
 #define ISF_GAP  128                       /* 50 */
-#define ONE_MINUS_ISF_GAP 16384 - ISF_GAP
+#define ONE_MINUS_ISF_GAP (16384 - ISF_GAP)
 #define ISF_GAP   128
 #define ISF_DITH_GAP   448
 #define ISF_FACTOR_LOW 256

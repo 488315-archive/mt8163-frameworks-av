@@ -17,9 +17,8 @@
 #ifndef SOFT_MPEG4_ENCODER_H_
 #define SOFT_MPEG4_ENCODER_H_
 
-#include <media/stagefright/MediaBuffer.h>
 #include <media/stagefright/foundation/ABase.h>
-#include "SoftVideoEncoderOMXComponent.h"
+#include <media/stagefright/omx/SoftVideoEncoderOMXComponent.h>
 #include "mp4enc_api.h"
 
 
@@ -48,6 +47,8 @@ struct SoftMPEG4Encoder : public SoftVideoEncoderOMXComponent {
 
     virtual void onQueueFilled(OMX_U32 portIndex);
 
+    virtual void onReset();
+
 protected:
     virtual ~SoftMPEG4Encoder();
 
@@ -63,7 +64,7 @@ private:
     } InputBufferInfo;
 
     MP4EncodingMode mEncodeMode;
-    int32_t  mIDRFrameRefreshIntervalInSec;
+    int32_t  mKeyFrameInterval; // 1: all I-frames, <0: infinite
 
     int64_t  mNumInputFrames;
     bool     mStarted;

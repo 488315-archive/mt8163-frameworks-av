@@ -1,9 +1,4 @@
 /*
-* Copyright (C) 2014 MediaTek Inc.
-* Modification based on code covered by the mentioned copyright
-* and/or permission notice(s).
-*/
-/*
  * Copyright (C) 2010 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,55 +17,42 @@
 //#define LOG_NDEBUG 0
 #define LOG_TAG "ATSParser"
 #include <utils/Log.h>
-
 #include "ATSParser.h"
-
 #include "AnotherPacketSource.h"
+#include "CasManager.h"
 #include "ESQueue.h"
-#include "include/avc_utils.h"
 
+#include <android/hardware/cas/native/1.0/IDescrambler.h>
+#include <android/hidl/allocator/1.0/IAllocator.h>
+#include <android/hidl/memory/1.0/IMemory.h>
+#include <cutils/native_handle.h>
+#include <hidlmemory/mapping.h>
+#include <media/cas/DescramblerAPI.h>
 #include <media/stagefright/foundation/ABitReader.h>
 #include <media/stagefright/foundation/ABuffer.h>
 #include <media/stagefright/foundation/ADebug.h>
 #include <media/stagefright/foundation/AMessage.h>
+#include <media/stagefright/foundation/ByteUtils.h>
+#include <media/stagefright/foundation/MediaKeys.h>
+#include <media/stagefright/foundation/avc_utils.h>
 #include <media/stagefright/foundation/hexdump.h>
 #include <media/stagefright/MediaDefs.h>
 #include <media/stagefright/MediaErrors.h>
 #include <media/stagefright/MetaData.h>
-#include <media/stagefright/Utils.h>
 #include <media/IStreamSource.h>
 #include <utils/KeyedVector.h>
 #include <utils/Vector.h>
 
 #include <inttypes.h>
 
-#ifdef MTK_AOSP_ENHANCEMENT
-#ifdef MTK_DEMUXER_BLOCK_CAPABILITY
-#ifdef MTK_DEMUXER_QUERY_CAPABILITY_FROM_DRV_SUPPORT
-#include "vdec_drv_if_public.h"
-#include "val_types_public.h"
-#endif
-#endif
-#include <cutils/properties.h>
-#define unuse(x) void(x)
-typedef enum {
-    AAC_NULL = 0,
-    AAC_AAC_MAIN = 1,
-    AAC_AAC_LC = 2,
-    AAC_AAC_SSR = 3,
-    AAC_AAC_LTP = 4,
-    AAC_SBR = 5,
-    AAC_AAC_SCALABLE = 6,
-    AAC_TWINVQ = 7,
-    AAC_ER_AAC_LC = 17,
-    AAC_ER_AAC_LTP = 19,
-    AAC_ER_AAC_SCALABLE = 20,
-    AAC_ER_TWINVQ = 21,
-    AAC_ER_BSAC = 22,
-    AAC_ER_AAC_LD = 23
-} AACObjectType;
-#endif //#ifndef ANDROID_DEFAULT_CODE
 namespace android {
+using hardware::hidl_string;
+using hardware::hidl_vec;
+using hardware::hidl_memory;
+using namespace hardware::cas::V1_0;
+using namespace hardware::cas::native::V1_0;
+typedef hidl::allocator::V1_0::IAllocator TAllocator;
+typedef hidl::memory::V1_0::IMemory TMemory;
 
 // I want the expression "y" evaluated even if verbose logging is off.
 #define MY_LOGV(x, y) \
@@ -91,6 +73,8 @@ struct ATSParser::Program : public RefBase {
     bool parsePID(
             unsigned pid, unsigned continuity_counter,
             unsigned payload_unit_start_indicator,
+            unsigned transport_scrambling_control,
+            unsigned random_access_indicator,
             ABitReader *br, status_t *err, SyncEvent *event);
 
     void signalDiscontinuity(
@@ -98,26 +82,9 @@ struct ATSParser::Program : public RefBase {
 
     void signalEOS(status_t finalResult);
 
-    sp<MediaSource> getSource(SourceType type);
-
+    sp<AnotherPacketSource> getSource(SourceType type);
     bool hasSource(SourceType type) const;
 
-#ifdef MTK_AUDIO_CHANGE_SUPPORT
-    //overload getSource
-    sp<MediaSource> getSource(unsigned PID, unsigned index);
-    size_t getPlayIndex(){return mParser->getPlayIndex();}
-    unsigned getPlayProgramPID();
-#endif
-
-#ifdef MTK_AOSP_ENHANCEMENT
-    int64_t getPTS();
-    bool firstPTSIsValid();
-    bool getDequeueState();
-    uint32_t getmStreamsSize() const {
-        return mStreams.size();
-    }
-    void setFirstPTSIsValid(bool firstPTSIsValid){mFirstPTSValid = firstPTSIsValid;}
-#endif
     int64_t convertPTSToTimestamp(uint64_t PTS);
 
     bool PTSTimeDeltaEstablished() const {
@@ -129,9 +96,6 @@ struct ATSParser::Program : public RefBase {
     void updateProgramMapPID(unsigned programMapPID) {
         mProgramMapPID = programMapPID;
     }
-#ifdef MTK_AOSP_ENHANCEMENT
-    ATSParser *mParser;
-#endif
 
     unsigned programMapPID() const {
         return mProgramMapPID;
@@ -141,52 +105,64 @@ struct ATSParser::Program : public RefBase {
         return mParser->mFlags;
     }
 
-private:
-    struct StreamInfo {
-        unsigned mType;
-#ifdef MTK_SUBTITLE_SUPPORT
-    unsigned mComponentType;
-#endif
-        unsigned mPID;
-    };
+    sp<CasManager> casManager() const {
+        return mParser->mCasManager;
+    }
 
-#ifndef MTK_AOSP_ENHANCEMENT
-    ATSParser * mParser;
-#endif
+    uint64_t firstPTS() const {
+        return mFirstPTS;
+    }
+
+    void updateCasSessions();
+
+    void signalNewSampleAesKey(const sp<AMessage> &keyItem);
+
+private:
+
+    ATSParser *mParser;
     unsigned mProgramNumber;
     unsigned mProgramMapPID;
+    uint32_t mPMTVersion;
+    uint32_t mPMT_CRC;
     KeyedVector<unsigned, sp<Stream> > mStreams;
     bool mFirstPTSValid;
     uint64_t mFirstPTS;
     int64_t mLastRecoveredPTS;
+    sp<AMessage> mSampleAesKeyItem;
 
     status_t parseProgramMap(ABitReader *br);
     int64_t recoverPTS(uint64_t PTS_33bit);
+    bool findCADescriptor(
+            ABitReader *br, unsigned infoLength, CADescriptor *caDescriptor);
     bool switchPIDs(const Vector<StreamInfo> &infos);
 
     DISALLOW_EVIL_CONSTRUCTORS(Program);
 };
 
 struct ATSParser::Stream : public RefBase {
-    Stream(Program *program,
-           unsigned elementaryPID,
-           unsigned streamType,
-           unsigned PCR_PID);
-#ifdef MTK_AOSP_ENHANCEMENT
-#ifdef MTK_SUBTITLE_SUPPORT
-    void setSubtitleType(unsigned subType);
-#endif
-#endif
+    Stream(Program *program, unsigned PCR_PID, const StreamInfo &info);
+
     unsigned type() const { return mStreamType; }
+    unsigned typeExt() const { return mStreamTypeExt; }
     unsigned pid() const { return mElementaryPID; }
     void setPID(unsigned pid) { mElementaryPID = pid; }
+    void setAudioPresentations(AudioPresentationCollection audioPresentations) {
+        mAudioPresentations = audioPresentations;
+    }
+
+    void setCasInfo(
+            int32_t systemId,
+            const sp<IDescrambler> &descrambler,
+            const std::vector<uint8_t> &sessionId);
 
     // Parse the payload and set event when PES with a sync frame is detected.
-    // This method knows when a PES starts; so record mPesStartOffset in that
+    // This method knows when a PES starts; so record mPesStartOffsets in that
     // case.
     status_t parse(
             unsigned continuity_counter,
             unsigned payload_unit_start_indicator,
+            unsigned transport_scrambling_control,
+            unsigned random_access_indicator,
             ABitReader *br,
             SyncEvent *event);
 
@@ -195,41 +171,28 @@ struct ATSParser::Stream : public RefBase {
 
     void signalEOS(status_t finalResult);
 
-    sp<MediaSource> getSource(SourceType type);
-#ifdef MTK_AUDIO_CHANGE_SUPPORT
-    //overload getSource
-   sp<MediaSource> getSource(unsigned PID, unsigned index);
-#endif
+    SourceType getSourceType();
+    sp<AnotherPacketSource> getSource(SourceType type);
 
     bool isAudio() const;
     bool isVideo() const;
     bool isMeta() const;
 
-#ifdef MTK_AOSP_ENHANCEMENT
-    int64_t getPTS();
-    bool isSupportedStream(sp<MetaData> StreamMeta);
-    void signalDiscontinuity_local(DiscontinuityType type,
-                                   const sp<AMessage> &extra);
-    bool BufferIsEmpty() {
-        if (mBuffer == NULL)
-            return true;
-        ALOGD("buffersize = %d", (int) mBuffer->size());
-        return (mBuffer->size() == 0);
-    };
+    void signalNewSampleAesKey(const sp<AMessage> &keyItem);
 
-#endif
 protected:
     virtual ~Stream();
 
 private:
+    struct SubSampleInfo {
+        size_t subSampleSize;
+        unsigned transport_scrambling_mode;
+        unsigned random_access_indicator;
+    };
     Program *mProgram;
-#ifdef MTK_AOSP_ENHANCEMENT
-    //bool seeking;
-    int64_t mMaxTimeUs;
-    bool mSupportedStream;
-#endif
     unsigned mElementaryPID;
     unsigned mStreamType;
+    unsigned mStreamTypeExt;
     unsigned mPCR_PID;
     int32_t mExpectedContinuityCounter;
 
@@ -239,14 +202,37 @@ private:
     bool mEOSReached;
 
     uint64_t mPrevPTS;
-    off64_t mPesStartOffset;
+    List<off64_t> mPesStartOffsets;
 
     ElementaryStreamQueue *mQueue;
+
+    bool mScrambled;
+    bool mSampleEncrypted;
+    sp<AMessage> mSampleAesKeyItem;
+    sp<TMemory> mHidlMemory;
+    sp<TAllocator> mHidlAllocator;
+    hardware::cas::native::V1_0::SharedBuffer mDescramblerSrcBuffer;
+    sp<ABuffer> mDescrambledBuffer;
+    List<SubSampleInfo> mSubSamples;
+    sp<IDescrambler> mDescrambler;
+    AudioPresentationCollection mAudioPresentations;
+
+    // Send audio presentations along with access units.
+    void addAudioPresentations(const sp<ABuffer> &buffer);
 
     // Flush accumulated payload if necessary --- i.e. at EOS or at the start of
     // another payload. event is set if the flushed payload is PES with a sync
     // frame.
     status_t flush(SyncEvent *event);
+
+    // Flush accumulated payload for scrambled streams if necessary --- i.e. at
+    // EOS or at the start of another payload. event is set if the flushed
+    // payload is PES with a sync frame.
+    status_t flushScrambled(SyncEvent *event);
+
+    // Check if a PES packet is scrambled at PES level.
+    uint32_t getPesScramblingControl(ABitReader *br, int32_t *pesOffset);
+
     // Strip and parse PES headers and pass remaining payload into onPayload
     // with parsed metadata. event is set if the PES contains a sync frame.
     status_t parsePES(ABitReader *br, SyncEvent *event);
@@ -256,7 +242,13 @@ private:
     // and timestamp of the packet.
     void onPayloadData(
             unsigned PTS_DTS_flags, uint64_t PTS, uint64_t DTS,
-            const uint8_t *data, size_t size, SyncEvent *event);
+            unsigned PES_scrambling_control,
+            const uint8_t *data, size_t size,
+            int32_t payloadOffset, SyncEvent *event);
+
+    // Ensure internal buffers can hold specified size, and will re-allocate
+    // as needed.
+    bool ensureBufferCapacity(size_t size);
 
     DISALLOW_EVIL_CONSTRUCTORS(Stream);
 };
@@ -287,16 +279,20 @@ private:
 };
 
 ATSParser::SyncEvent::SyncEvent(off64_t offset)
-    : mInit(false), mOffset(offset), mTimeUs(0) {}
+    : mHasReturnedData(false), mOffset(offset), mTimeUs(0) {}
 
-void ATSParser::SyncEvent::init(off64_t offset, const sp<MediaSource> &source,
-        int64_t timeUs) {
-    mInit = true;
+void ATSParser::SyncEvent::init(off64_t offset, const sp<AnotherPacketSource> &source,
+        int64_t timeUs, SourceType type) {
+    mHasReturnedData = true;
     mOffset = offset;
     mMediaSource = source;
     mTimeUs = timeUs;
+    mType = type;
 }
 
+void ATSParser::SyncEvent::reset() {
+    mHasReturnedData = false;
+}
 ////////////////////////////////////////////////////////////////////////////////
 
 ATSParser::Program::Program(
@@ -305,6 +301,8 @@ ATSParser::Program::Program(
     : mParser(parser),
       mProgramNumber(programNumber),
       mProgramMapPID(programMapPID),
+      mPMTVersion(0xffffffff),
+      mPMT_CRC(0xffffffff),
       mFirstPTSValid(false),
       mFirstPTS(0),
       mLastRecoveredPTS(lastRecoveredPTS) {
@@ -327,6 +325,8 @@ bool ATSParser::Program::parsePSISection(
 bool ATSParser::Program::parsePID(
         unsigned pid, unsigned continuity_counter,
         unsigned payload_unit_start_indicator,
+        unsigned transport_scrambling_control,
+        unsigned random_access_indicator,
         ABitReader *br, status_t *err, SyncEvent *event) {
     *err = OK;
 
@@ -336,7 +336,11 @@ bool ATSParser::Program::parsePID(
     }
 
     *err = mStreams.editValueAt(index)->parse(
-            continuity_counter, payload_unit_start_indicator, br, event);
+            continuity_counter,
+            payload_unit_start_indicator,
+            transport_scrambling_control,
+            random_access_indicator,
+            br, event);
 
     return true;
 }
@@ -347,7 +351,7 @@ void ATSParser::Program::signalDiscontinuity(
     if ((type & DISCONTINUITY_TIME)
             && extra != NULL
             && extra->findInt64(
-                IStreamListener::kKeyMediaTimeUs, &mediaTimeUs)) {
+                kATSParserKeyMediaTimeUs, &mediaTimeUs)) {
         mFirstPTSValid = false;
     }
 
@@ -432,53 +436,51 @@ bool ATSParser::Program::switchPIDs(const Vector<StreamInfo> &infos) {
     return success;
 }
 
+bool ATSParser::Program::findCADescriptor(
+        ABitReader *br, unsigned infoLength,
+        ATSParser::CADescriptor *caDescriptor) {
+    bool found = false;
+    while (infoLength > 2) {
+        unsigned descriptor_tag = br->getBits(8);
+        ALOGV("      tag = 0x%02x", descriptor_tag);
+
+        unsigned descriptor_length = br->getBits(8);
+        ALOGV("      len = %u", descriptor_length);
+
+        infoLength -= 2;
+        if (descriptor_length > infoLength) {
+            break;
+        }
+        if (descriptor_tag == DESCRIPTOR_CA && descriptor_length >= 4) {
+            found = true;
+            caDescriptor->mSystemID = br->getBits(16);
+            caDescriptor->mPID = br->getBits(16) & 0x1fff;
+            infoLength -= 4;
+            caDescriptor->mPrivateData.assign(
+                    br->data(), br->data() + descriptor_length - 4);
+            break;
+        } else {
+            infoLength -= descriptor_length;
+            br->skipBits(descriptor_length * 8);
+        }
+    }
+    br->skipBits(infoLength * 8);
+    return found;
+}
+
 status_t ATSParser::Program::parseProgramMap(ABitReader *br) {
     unsigned table_id = br->getBits(8);
     ALOGV("  table_id = %u", table_id);
-
     if (table_id != 0x02u) {
         ALOGE("PMT data error!");
         return ERROR_MALFORMED;
     }
-
-#if 0
-#ifdef MTK_AOSP_ENHANCEMENT
-    if (mParser->mFlags & TS_SOURCE_IS_LOCAL) {
-        if (table_id != 0x02u) {
-            ALOGE("illegal table id %d", table_id);
-            return ERROR_MALFORMED;
-        }
-    } else {
-    CHECK_EQ(table_id, 0x02u);
-
-    }
-
-#else
-    CHECK_EQ(table_id, 0x02u);
-#endif
-#endif
-
-
     unsigned section_syntax_indicator = br->getBits(1);
     ALOGV("  section_syntax_indicator = %u", section_syntax_indicator);
     if (section_syntax_indicator != 1u) {
         ALOGE("PMT data error!");
         return ERROR_MALFORMED;
     }
-#if 0
-#ifdef MTK_AOSP_ENHANCEMENT
-    if (mParser->mFlags & TS_SOURCE_IS_LOCAL) {
-        if (section_syntax_indicator != 1u) {
-            ALOGE("illegal table id %d", section_syntax_indicator);
-            return ERROR_MALFORMED;
-        }
-    } else {
-         CHECK_EQ(section_syntax_indicator, 1u);
-    }
-#else
-    CHECK_EQ(section_syntax_indicator, 1u);
-#endif
-#endif
 
     br->skipBits(1);  // '0'
     MY_LOGV("  reserved = %u", br->getBits(2));
@@ -488,7 +490,13 @@ status_t ATSParser::Program::parseProgramMap(ABitReader *br) {
 
     MY_LOGV("  program_number = %u", br->getBits(16));
     MY_LOGV("  reserved = %u", br->getBits(2));
-    MY_LOGV("  version_number = %u", br->getBits(5));
+    bool audioPresentationsChanged = false;
+    unsigned pmtVersion = br->getBits(5);
+    if (pmtVersion != mPMTVersion) {
+        audioPresentationsChanged = true;
+        mPMTVersion = pmtVersion;
+    }
+    MY_LOGV("  version_number = %u", pmtVersion);
     MY_LOGV("  current_next_indicator = %u", br->getBits(1));
     MY_LOGV("  section_number = %u", br->getBits(8));
     MY_LOGV("  last_section_number = %u", br->getBits(8));
@@ -502,87 +510,179 @@ status_t ATSParser::Program::parseProgramMap(ABitReader *br) {
     unsigned program_info_length = br->getBits(12);
     ALOGV("  program_info_length = %u", program_info_length);
 
-    br->skipBits(program_info_length * 8);  // skip descriptors
+    // descriptors
+    CADescriptor programCA;
+    bool hasProgramCA = findCADescriptor(br, program_info_length, &programCA);
+    if (hasProgramCA && !mParser->mCasManager->addProgram(
+            mProgramNumber, programCA)) {
+        return ERROR_MALFORMED;
+    }
 
     Vector<StreamInfo> infos;
 
     // infoBytesRemaining is the number of bytes that make up the
     // variable length section of ES_infos. It does not include the
     // final CRC.
-    size_t infoBytesRemaining = section_length - 9 - program_info_length - 4;
+    int32_t infoBytesRemaining = section_length - 9 - program_info_length - 4;
 
     while (infoBytesRemaining >= 5) {
-
-#ifdef MTK_AOSP_ENHANCEMENT
-#ifdef MTK_SUBTITLE_SUPPORT
-        unsigned componentType = 0;
-#endif
-#endif
-        unsigned streamType = br->getBits(8);
-        ALOGV("    stream_type = 0x%02x", streamType);
-
+        StreamInfo info;
+        info.mType = br->getBits(8);
+        ALOGV("    stream_type = 0x%02x", info.mType);
         MY_LOGV("    reserved = %u", br->getBits(3));
 
-        unsigned elementaryPID = br->getBits(13);
-        ALOGV("    elementary_PID = 0x%04x", elementaryPID);
+        info.mPID = br->getBits(13);
+        ALOGV("    elementary_PID = 0x%04x", info.mPID);
 
         MY_LOGV("    reserved = %u", br->getBits(4));
 
         unsigned ES_info_length = br->getBits(12);
         ALOGV("    ES_info_length = %u", ES_info_length);
+        infoBytesRemaining -= 5 + ES_info_length;
 
-#if 0
-        br->skipBits(ES_info_length * 8);  // skip descriptors
-#else
-        unsigned info_bytes_remaining = ES_info_length;
-        while (info_bytes_remaining >= 2) {
-#if defined (MTK_AOSP_ENHANCEMENT) && defined (MTK_SUBTITLE_SUPPORT)
-            unsigned tag = br->getBits(8);
-            MY_LOGV("      tag = 0x%02x", tag);
-#else
-            MY_LOGV("      tag = 0x%02x", br->getBits(8));
-#endif
-            unsigned descLength = br->getBits(8);
-            ALOGV("      len = %u", descLength);
+        CADescriptor streamCA;
+        info.mTypeExt = EXT_DESCRIPTOR_DVB_RESERVED_MAX;
 
-            if (info_bytes_remaining < descLength) {
+        info.mAudioPresentations.clear();
+        bool hasStreamCA = false;
+        while (ES_info_length > 2 && infoBytesRemaining >= 0) {
+            unsigned descriptor_tag = br->getBits(8);
+            ALOGV("      tag = 0x%02x", descriptor_tag);
+
+            unsigned descriptor_length = br->getBits(8);
+            ALOGV("      len = %u", descriptor_length);
+
+            ES_info_length -= 2;
+            if (descriptor_length > ES_info_length) {
                 return ERROR_MALFORMED;
             }
-#ifdef MTK_AOSP_ENHANCEMENT
-#ifdef MTK_SUBTITLE_SUPPORT
-            if ((6 == streamType) && (0x59 == tag)) {
-                /*that is subtitle stream, */
-                /* check is it dvb subtitle by check "subtitle type" */
-                ALOGV("   descriptor   data  = %02x,%02x,%02x,%02x\n",
-                      br->data()[0], br->data()[1], br->data()[2],
-                      br->data()[3]);
-                componentType = br->data()[3];
+            if (descriptor_tag == DESCRIPTOR_CA && descriptor_length >= 4) {
+                hasStreamCA = true;
+                streamCA.mSystemID = br->getBits(16);
+                streamCA.mPID = br->getBits(16) & 0x1fff;
+                ES_info_length -= descriptor_length;
+                descriptor_length -= 4;
+                streamCA.mPrivateData.assign(br->data(), br->data() + descriptor_length);
+                br->skipBits(descriptor_length * 8);
+            } else if (info.mType == STREAMTYPE_PES_PRIVATE_DATA &&
+                       descriptor_tag == DESCRIPTOR_DVB_EXTENSION && descriptor_length >= 1) {
+                unsigned descTagExt = br->getBits(8);
+                ALOGV("      tag_ext = 0x%02x", descTagExt);
+                ES_info_length -= descriptor_length;
+                descriptor_length--;
+                // The AC4 descriptor is used in the PSI PMT to identify streams which carry AC4
+                // audio.
+                if (descTagExt == EXT_DESCRIPTOR_DVB_AC4) {
+                    info.mTypeExt = EXT_DESCRIPTOR_DVB_AC4;
+                    br->skipBits(descriptor_length * 8);
+                } else if (descTagExt == EXT_DESCRIPTOR_DVB_AUDIO_PRESELECTION &&
+                           descriptor_length >= 1) {
+                    // DVB BlueBook A038 Table 110
+                    unsigned num_preselections = br->getBits(5);
+                    br->skipBits(3);  // reserved
+                    for (unsigned i = 0; i < num_preselections; ++i) {
+                        if (br->numBitsLeft() < 16) {
+                            ALOGE("Not enough data left in bitreader!");
+                            return ERROR_MALFORMED;
+                        }
+                        AudioPresentationV1 ap;
+                        ap.mPresentationId = br->getBits(5);  // preselection_id
+
+                        // audio_rendering_indication
+                        ap.mMasteringIndication = static_cast<MasteringIndication>(br->getBits(3));
+                        ap.mAudioDescriptionAvailable = (br->getBits(1) == 1);
+                        ap.mSpokenSubtitlesAvailable = (br->getBits(1) == 1);
+                        ap.mDialogueEnhancementAvailable = (br->getBits(1) == 1);
+
+                        bool interactivity_enabled = (br->getBits(1) == 1);
+                        MY_LOGV("      interactivity_enabled = %d", interactivity_enabled);
+
+                        bool language_code_present = (br->getBits(1) == 1);
+                        bool text_label_present = (br->getBits(1) == 1);
+
+                        bool multi_stream_info_present = (br->getBits(1) == 1);
+                        bool future_extension = (br->getBits(1) == 1);
+                        if (language_code_present) {
+                            if (br->numBitsLeft() < 24) {
+                                ALOGE("Not enough data left in bitreader!");
+                                return ERROR_MALFORMED;
+                            }
+                            char language[4];
+                            language[0] = br->getBits(8);
+                            language[1] = br->getBits(8);
+                            language[2] = br->getBits(8);
+                            language[3] = 0;
+                            ap.mLanguage = String8(language);
+                        }
+
+                        // This maps the presentation id to the message id in the
+                        // EXT_DESCRIPTOR_DVB_MESSAGE so that we can get the presentation label.
+                        if (text_label_present) {
+                            if (br->numBitsLeft() < 8) {
+                                ALOGE("Not enough data left in bitreader!");
+                                return ERROR_MALFORMED;
+                            }
+                            unsigned message_id = br->getBits(8);
+                            MY_LOGV("      message_id = %u", message_id);
+                        }
+
+                        if (multi_stream_info_present) {
+                            if (br->numBitsLeft() < 8) {
+                                ALOGE("Not enough data left in bitreader!");
+                                return ERROR_MALFORMED;
+                            }
+                            unsigned num_aux_components = br->getBits(3);
+                            br->skipBits(5);  // reserved
+                            if (br->numBitsLeft() < (num_aux_components * 8)) {
+                                ALOGE("Not enough data left in bitreader!");
+                                return ERROR_MALFORMED;
+                            }
+                            br->skipBits(num_aux_components * 8);  // component_tag
+                        }
+                        if (future_extension) {
+                            if (br->numBitsLeft() < 8) {
+                                return ERROR_MALFORMED;
+                            }
+                            br->skipBits(3);  // reserved
+                            unsigned future_extension_length = br->getBits(5);
+                            if (br->numBitsLeft() < (future_extension_length * 8)) {
+                                ALOGE("Not enough data left in bitreader!");
+                                return ERROR_MALFORMED;
+                            }
+                            br->skipBits(future_extension_length * 8);  // future_extension_byte
+                        }
+                        info.mAudioPresentations.push_back(std::move(ap));
+                    }
+                } else {
+                    br->skipBits(descriptor_length * 8);
+                }
+            } else {
+                ES_info_length -= descriptor_length;
+                br->skipBits(descriptor_length * 8);
             }
-#endif
-#endif
-            br->skipBits(descLength * 8);
-
-            info_bytes_remaining -= descLength + 2;
         }
-#endif
+        if (hasStreamCA && !mParser->mCasManager->addStream(
+                mProgramNumber, info.mPID, streamCA)) {
+            return ERROR_MALFORMED;
+        }
+        if (hasProgramCA) {
+            info.mCADescriptor = programCA;
+        } else if (hasStreamCA) {
+            info.mCADescriptor = streamCA;
+        }
 
-        StreamInfo info;
-        info.mType = streamType;
-#ifdef MTK_AOSP_ENHANCEMENT
-#ifdef MTK_SUBTITLE_SUPPORT
-        info.mComponentType = componentType;
-#endif
-#endif
-        info.mPID = elementaryPID;
         infos.push(info);
-
-        infoBytesRemaining -= 5 + ES_info_length;
     }
 
     if (infoBytesRemaining != 0) {
         ALOGW("Section data remains unconsumed");
     }
-    MY_LOGV("  CRC = 0x%08x", br->getBits(32));
+    unsigned crc = br->getBits(32);
+    if (crc != mPMT_CRC) {
+        audioPresentationsChanged = true;
+        mPMT_CRC = crc;
+    }
+    MY_LOGV("  CRC = 0x%08x", crc);
 
     bool PIDsChanged = false;
     for (size_t i = 0; i < infos.size(); ++i) {
@@ -623,27 +723,36 @@ status_t ATSParser::Program::parseProgramMap(ABitReader *br) {
         }
     }
 
+    bool isAddingScrambledStream = false;
     for (size_t i = 0; i < infos.size(); ++i) {
         StreamInfo &info = infos.editItemAt(i);
 
+        if (mParser->mCasManager->isCAPid(info.mPID)) {
+            // skip CA streams (EMM/ECM)
+            continue;
+        }
         ssize_t index = mStreams.indexOfKey(info.mPID);
 
         if (index < 0) {
-            sp<Stream> stream = new Stream(
-                    this, info.mPID, info.mType, PCR_PID);
+            sp<Stream> stream = new Stream(this, PCR_PID, info);
 
-#ifdef MTK_SUBTITLE_SUPPORT
-                stream->setSubtitleType(info.mComponentType);
-#endif
+            if (mSampleAesKeyItem != NULL) {
+                stream->signalNewSampleAesKey(mSampleAesKeyItem);
+            }
+
+            isAddingScrambledStream |= info.mCADescriptor.mSystemID >= 0;
             mStreams.add(info.mPID, stream);
-#ifdef MTK_AUDIO_CHANGE_SUPPORT
-                mParser->addParsedPID(info.mPID);
-                ALOGD("mStreams:StreamP=%p,mPID=0x%x,mType=0x%x,size=%d,mProgramMapPID=0x%x",
-                    this,info.mPID,info.mType,(int)mStreams.size(),mProgramMapPID);
-#endif
+        }
+        else if (index >= 0 && mStreams.editValueAt(index)->isAudio()
+                 && audioPresentationsChanged) {
+            mStreams.editValueAt(index)->setAudioPresentations(info.mAudioPresentations);
         }
     }
 
+    if (isAddingScrambledStream) {
+        ALOGI("Receiving scrambled streams without descrambler!");
+        return ERROR_DRM_DECRYPT_UNIT_NOT_INITIALIZED;
+    }
     return OK;
 }
 
@@ -652,60 +761,32 @@ int64_t ATSParser::Program::recoverPTS(uint64_t PTS_33bit) {
     // reasonable amount of time. To handle the wrap-around, use fancy math
     // to get an extended PTS that is within [-0xffffffff, 0xffffffff]
     // of the latest recovered PTS.
-    if (mLastRecoveredPTS < 0ll) {
+    if (mLastRecoveredPTS < 0LL) {
         // Use the original 33bit number for 1st frame, the reason is that
         // if 1st frame wraps to negative that's far away from 0, we could
         // never start. Only start wrapping around from 2nd frame.
         mLastRecoveredPTS = static_cast<int64_t>(PTS_33bit);
     } else {
         mLastRecoveredPTS = static_cast<int64_t>(
-                ((mLastRecoveredPTS - PTS_33bit + 0x100000000ll)
+                ((mLastRecoveredPTS - static_cast<int64_t>(PTS_33bit) + 0x100000000LL)
                 & 0xfffffffe00000000ull) | PTS_33bit);
         // We start from 0, but recovered PTS could be slightly below 0.
         // Clamp it to 0 as rest of the pipeline doesn't take negative pts.
         // (eg. video is read first and starts at 0, but audio starts at 0xfffffff0)
-        if (mLastRecoveredPTS < 0ll) {
+        if (mLastRecoveredPTS < 0LL) {
             ALOGI("Clamping negative recovered PTS (%" PRId64 ") to 0", mLastRecoveredPTS);
-            mLastRecoveredPTS = 0ll;
+            mLastRecoveredPTS = 0LL;
         }
-#ifdef MTK_AOSP_ENHANCEMENT
-        if(static_cast<int64_t>(PTS_33bit) != mLastRecoveredPTS)
-            ALOGD("convert pts %lld to %lld", (long long)PTS_33bit, (long long)mLastRecoveredPTS);
-#endif
     }
 
     return mLastRecoveredPTS;
 }
 
-#ifdef MTK_AUDIO_CHANGE_SUPPORT
-sp<MediaSource> ATSParser::Program::getSource(unsigned PID, unsigned index) {
-    int i = -1;
-    i = mStreams.indexOfKey(PID);
-    if (i >= 0) {
-        sp<MediaSource> source = mStreams.editValueAt(i)->getSource(PID, index);
+sp<AnotherPacketSource> ATSParser::Program::getSource(SourceType type) {
+    for (size_t i = 0; i < mStreams.size(); ++i) {
+        sp<AnotherPacketSource> source = mStreams.editValueAt(i)->getSource(type);
         if (source != NULL) {
             return source;
-        }
-    } else {
-        return NULL;
-    }
-    return NULL;
-}
-unsigned ATSParser::Program::getPlayProgramPID(){
-    size_t playindex = mParser->getPlayIndex();
-    return mParser->getPlayProgramPID(playindex);
-}
-#endif
-sp<MediaSource> ATSParser::Program::getSource(SourceType type) {
-    size_t index = (type == AUDIO) ? 0 : 0;
-
-    for (size_t i = 0; i < mStreams.size(); ++i) {
-        sp<MediaSource> source = mStreams.editValueAt(i)->getSource(type);
-        if (source != NULL) {
-            if (index == 0) {
-                return source;
-            }
-            --index;
         }
     }
 
@@ -719,6 +800,8 @@ bool ATSParser::Program::hasSource(SourceType type) const {
             return true;
         } else if (type == VIDEO && stream->isVideo()) {
             return true;
+        } else if (type == META && stream->isMeta()) {
+            return true;
         }
     }
 
@@ -726,20 +809,13 @@ bool ATSParser::Program::hasSource(SourceType type) const {
 }
 
 int64_t ATSParser::Program::convertPTSToTimestamp(uint64_t PTS) {
-#ifndef MTK_AUDIO_CHANGE_SUPPORT
-    /*
-    the PTS maybe calculated wrong when subtitle
-    exsits and its PTS is abnormal;
-    */
     PTS = recoverPTS(PTS);
-#endif
 
     if (!(mParser->mFlags & TS_TIMESTAMPS_ARE_ABSOLUTE)) {
         if (!mFirstPTSValid) {
             mFirstPTSValid = true;
             mFirstPTS = PTS;
             PTS = 0;
-            ALOGE("convertPTSToTimestamp: mFirstPTS(0x%llx) mProgramMapPID  0x%x",(long long)mFirstPTS,mProgramMapPID);
         } else if (PTS < mFirstPTS) {
             PTS = 0;
         } else {
@@ -749,7 +825,7 @@ int64_t ATSParser::Program::convertPTSToTimestamp(uint64_t PTS) {
 
     int64_t timeUs = (PTS * 100) / 9;
 
-    if (mParser->mAbsoluteTimeAnchorUs >= 0ll) {
+    if (mParser->mAbsoluteTimeAnchorUs >= 0LL) {
         timeUs += mParser->mAbsoluteTimeAnchorUs;
     }
 
@@ -760,132 +836,224 @@ int64_t ATSParser::Program::convertPTSToTimestamp(uint64_t PTS) {
     return timeUs;
 }
 
+void ATSParser::Program::updateCasSessions() {
+    for (size_t i = 0; i < mStreams.size(); ++i) {
+        sp<Stream> &stream = mStreams.editValueAt(i);
+        sp<IDescrambler> descrambler;
+        std::vector<uint8_t> sessionId;
+        int32_t systemId;
+        if (mParser->mCasManager->getCasInfo(mProgramNumber, stream->pid(),
+                &systemId, &descrambler, &sessionId)) {
+            stream->setCasInfo(systemId, descrambler, sessionId);
+        }
+    }
+}
+
 ////////////////////////////////////////////////////////////////////////////////
+static const size_t kInitialStreamBufferSize = 192 * 1024;
 
 ATSParser::Stream::Stream(
-        Program *program,
-        unsigned elementaryPID,
-        unsigned streamType,
-        unsigned PCR_PID)
+        Program *program, unsigned PCR_PID, const StreamInfo &info)
     : mProgram(program),
-#ifdef MTK_AOSP_ENHANCEMENT
-      //seeking(false),
-      mMaxTimeUs(0),
-      mSupportedStream(true),
-#endif
-      mElementaryPID(elementaryPID),
-      mStreamType(streamType),
+      mElementaryPID(info.mPID),
+      mStreamType(info.mType),
+      mStreamTypeExt(info.mTypeExt),
       mPCR_PID(PCR_PID),
       mExpectedContinuityCounter(-1),
       mPayloadStarted(false),
       mEOSReached(false),
       mPrevPTS(0),
-      mQueue(NULL) {
+      mQueue(NULL),
+      mScrambled(info.mCADescriptor.mSystemID >= 0),
+      mAudioPresentations(info.mAudioPresentations) {
+    mSampleEncrypted =
+            mStreamType == STREAMTYPE_H264_ENCRYPTED ||
+            mStreamType == STREAMTYPE_AAC_ENCRYPTED  ||
+            mStreamType == STREAMTYPE_AC3_ENCRYPTED;
+
+    ALOGV("new stream PID 0x%02x, type 0x%02x, scrambled %d, SampleEncrypted: %d",
+            info.mPID, info.mType, mScrambled, mSampleEncrypted);
+
+    uint32_t flags = 0;
+    if (((isVideo() || isAudio()) && mScrambled)) {
+        flags = ElementaryStreamQueue::kFlag_ScrambledData;
+    } else if (mSampleEncrypted) {
+        flags = ElementaryStreamQueue::kFlag_SampleEncryptedData;
+    }
+
+    ElementaryStreamQueue::Mode mode = ElementaryStreamQueue::INVALID;
+
     switch (mStreamType) {
         case STREAMTYPE_H264:
-            mQueue = new ElementaryStreamQueue(
-                    ElementaryStreamQueue::H264,
-                    (mProgram->parserFlags() & ALIGNED_VIDEO_DATA)
-                        ? ElementaryStreamQueue::kFlag_AlignedData : 0);
+        case STREAMTYPE_H264_ENCRYPTED:
+            mode = ElementaryStreamQueue::H264;
+            flags |= (mProgram->parserFlags() & ALIGNED_VIDEO_DATA) ?
+                    ElementaryStreamQueue::kFlag_AlignedData : 0;
             break;
-#ifdef MTK_AOSP_ENHANCEMENT
-        case STREAMTYPE_HEVC:
-            mQueue = new ElementaryStreamQueue(ElementaryStreamQueue::HEVC);
-            break;
-#endif
+
         case STREAMTYPE_MPEG2_AUDIO_ADTS:
-            mQueue = new ElementaryStreamQueue(ElementaryStreamQueue::AAC);
+        case STREAMTYPE_AAC_ENCRYPTED:
+            mode = ElementaryStreamQueue::AAC;
             break;
-#ifdef MTK_AOSP_ENHANCEMENT
-    case STREAMTYPE_AUDIO_PSLPCM:
-        mQueue = new ElementaryStreamQueue(ElementaryStreamQueue::PSLPCM);
-        break;
-#if 0                           //BDLPCM is not ready all
-    case STREAMTYPE_AUDIO_BDLPCM:
-        mQueue = new ElementaryStreamQueue(ElementaryStreamQueue::BDLPCM);
-        break;
-#endif
-    case STREAMTYPE_VC1_VIDEO:
-        mQueue = new ElementaryStreamQueue(ElementaryStreamQueue::VC1_VIDEO);
-        break;
-#endif
+
         case STREAMTYPE_MPEG1_AUDIO:
         case STREAMTYPE_MPEG2_AUDIO:
-            mQueue = new ElementaryStreamQueue(
-                    ElementaryStreamQueue::MPEG_AUDIO);
+            mode = ElementaryStreamQueue::MPEG_AUDIO;
             break;
 
         case STREAMTYPE_MPEG1_VIDEO:
         case STREAMTYPE_MPEG2_VIDEO:
-            mQueue = new ElementaryStreamQueue(
-                    ElementaryStreamQueue::MPEG_VIDEO);
+            mode = ElementaryStreamQueue::MPEG_VIDEO;
             break;
 
         case STREAMTYPE_MPEG4_VIDEO:
-            mQueue = new ElementaryStreamQueue(
-                    ElementaryStreamQueue::MPEG4_VIDEO);
+            mode = ElementaryStreamQueue::MPEG4_VIDEO;
             break;
 
-#ifdef MTK_AOSP_ENHANCEMENT
-#ifdef MTK_SUBTITLE_SUPPORT
-    case STREAMTYPE_SUBTITLE:
-        mQueue = new ElementaryStreamQueue(ElementaryStreamQueue::SUBTITLE);
-        break;
-#endif
-#endif
+        case STREAMTYPE_LPCM_AC3:
         case STREAMTYPE_AC3:
-            mQueue = new ElementaryStreamQueue(
-                    ElementaryStreamQueue::AC3);
+        case STREAMTYPE_AC3_ENCRYPTED:
+            mode = ElementaryStreamQueue::AC3;
             break;
-#if defined(MTK_AOSP_ENHANCEMENT) && defined(MTK_AUDIO_DDPLUS_SUPPORT)
-        case STREAMTYPE_EC3:
-            mQueue = new ElementaryStreamQueue(
-                    ElementaryStreamQueue::EC3);
-        break;
-#endif
+
+        case STREAMTYPE_EAC3:
+            mode = ElementaryStreamQueue::EAC3;
+            break;
+
+        case STREAMTYPE_PES_PRIVATE_DATA:
+            if (mStreamTypeExt == EXT_DESCRIPTOR_DVB_AC4) {
+                mode = ElementaryStreamQueue::AC4;
+            }
+            break;
 
         case STREAMTYPE_METADATA:
-            mQueue = new ElementaryStreamQueue(
-                    ElementaryStreamQueue::METADATA);
+            mode = ElementaryStreamQueue::METADATA;
             break;
 
         default:
-            break;
+            ALOGE("stream PID 0x%02x has invalid stream type 0x%02x",
+                    info.mPID, info.mType);
+            return;
     }
 
-    ALOGV("new stream PID 0x%02x, type 0x%02x", elementaryPID, streamType);
+    mQueue = new ElementaryStreamQueue(mode, flags);
 
     if (mQueue != NULL) {
-        mBuffer = new ABuffer(192 * 1024);
-        mBuffer->setRange(0, 0);
+        if (mSampleAesKeyItem != NULL) {
+            mQueue->signalNewSampleAesKey(mSampleAesKeyItem);
+        }
+
+        ensureBufferCapacity(kInitialStreamBufferSize);
+
+        if (mScrambled && (isAudio() || isVideo())) {
+            // Set initial format to scrambled
+            sp<MetaData> meta = new MetaData();
+            meta->setCString(kKeyMIMEType,
+                    isAudio() ? MEDIA_MIMETYPE_AUDIO_SCRAMBLED
+                              : MEDIA_MIMETYPE_VIDEO_SCRAMBLED);
+            // for MediaExtractor.CasInfo
+            const CADescriptor &descriptor = info.mCADescriptor;
+            meta->setInt32(kKeyCASystemID, descriptor.mSystemID);
+
+            meta->setData(kKeyCAPrivateData, 0,
+                    descriptor.mPrivateData.data(),
+                    descriptor.mPrivateData.size());
+
+            mSource = new AnotherPacketSource(meta);
+        }
     }
 }
 
-#ifdef MTK_AOSP_ENHANCEMENT
-#ifdef MTK_SUBTITLE_SUPPORT
-void ATSParser::Stream::setSubtitleType(unsigned subType) {
-    if ((subType >= 0x10) && (subType <= 0x24)) {
-        mQueue->setFormat(kKeyMIMEType, MEDIA_MIMETYPE_TEXT_DVB);
-        sp<MetaData> meta = mQueue->getFormat();
-        mSource = new AnotherPacketSource(meta);
-    }
-}
-#endif
-#endif
 ATSParser::Stream::~Stream() {
     delete mQueue;
     mQueue = NULL;
 }
 
+bool ATSParser::Stream::ensureBufferCapacity(size_t neededSize) {
+    if (mBuffer != NULL && mBuffer->capacity() >= neededSize) {
+        return true;
+    }
+
+    ALOGV("ensureBufferCapacity: current size %zu, new size %zu, scrambled %d",
+            mBuffer == NULL ? 0 : mBuffer->capacity(), neededSize, mScrambled);
+
+    sp<ABuffer> newBuffer, newScrambledBuffer;
+    sp<TMemory> newMem;
+    if (mScrambled) {
+        if (mHidlAllocator == nullptr) {
+            mHidlAllocator = TAllocator::getService("ashmem");
+            if (mHidlAllocator == nullptr) {
+                ALOGE("[stream %d] can't get hidl allocator", mElementaryPID);
+                return false;
+            }
+        }
+
+        hidl_memory hidlMemToken;
+        bool success;
+        auto transStatus = mHidlAllocator->allocate(
+                neededSize,
+                [&success, &hidlMemToken](
+                        bool s,
+                        hidl_memory const& m) {
+                    success = s;
+                    hidlMemToken = m;
+                });
+
+        if (!transStatus.isOk()) {
+            ALOGE("[stream %d] hidl allocator failed at the transport: %s",
+                    mElementaryPID, transStatus.description().c_str());
+            return false;
+        }
+        if (!success) {
+            ALOGE("[stream %d] hidl allocator failed", mElementaryPID);
+            return false;
+        }
+        newMem = mapMemory(hidlMemToken);
+        if (newMem == nullptr || newMem->getPointer() == nullptr) {
+            ALOGE("[stream %d] hidl failed to map memory", mElementaryPID);
+            return false;
+        }
+
+        newScrambledBuffer = new ABuffer(newMem->getPointer(), newMem->getSize());
+
+        if (mDescrambledBuffer != NULL) {
+            memcpy(newScrambledBuffer->data(),
+                    mDescrambledBuffer->data(), mDescrambledBuffer->size());
+            newScrambledBuffer->setRange(0, mDescrambledBuffer->size());
+        } else {
+            newScrambledBuffer->setRange(0, 0);
+        }
+        mHidlMemory = newMem;
+        mDescrambledBuffer = newScrambledBuffer;
+
+        mDescramblerSrcBuffer.heapBase = hidlMemToken;
+        mDescramblerSrcBuffer.offset = 0ULL;
+        mDescramblerSrcBuffer.size =  (uint64_t)neededSize;
+
+        ALOGD("[stream %d] created shared buffer for descrambling, size %zu",
+                mElementaryPID, neededSize);
+    } else {
+        // Align to multiples of 64K.
+        neededSize = (neededSize + 65535) & ~65535;
+    }
+
+    newBuffer = new ABuffer(neededSize);
+    if (mBuffer != NULL) {
+        memcpy(newBuffer->data(), mBuffer->data(), mBuffer->size());
+        newBuffer->setRange(0, mBuffer->size());
+    } else {
+        newBuffer->setRange(0, 0);
+    }
+    mBuffer = newBuffer;
+    return true;
+}
+
 status_t ATSParser::Stream::parse(
         unsigned continuity_counter,
-        unsigned payload_unit_start_indicator, ABitReader *br,
-        SyncEvent *event) {
-#ifdef MTK_AOSP_ENHANCEMENT
-    if (mSource.get() != NULL && mSource->isEOS()) {
-        return OK;
-    }
-#endif
+        unsigned payload_unit_start_indicator,
+        unsigned transport_scrambling_control,
+        unsigned random_access_indicator,
+        ABitReader *br, SyncEvent *event) {
     if (mQueue == NULL) {
         return OK;
     }
@@ -895,7 +1063,9 @@ status_t ATSParser::Stream::parse(
         ALOGI("discontinuity on stream pid 0x%04x", mElementaryPID);
 
         mPayloadStarted = false;
+        mPesStartOffsets.clear();
         mBuffer->setRange(0, 0);
+        mSubSamples.clear();
         mExpectedContinuityCounter = -1;
 
 #if 0
@@ -931,7 +1101,11 @@ status_t ATSParser::Stream::parse(
         }
 
         mPayloadStarted = true;
-        mPesStartOffset = offset;
+        // There should be at most 2 elements in |mPesStartOffsets|.
+        while (mPesStartOffsets.size() >= 2) {
+            mPesStartOffsets.erase(mPesStartOffsets.begin());
+        }
+        mPesStartOffsets.push_back(offset);
     }
 
     if (!mPayloadStarted) {
@@ -945,46 +1119,17 @@ status_t ATSParser::Stream::parse(
     }
 
     size_t neededSize = mBuffer->size() + payloadSizeBits / 8;
-    if (mBuffer->capacity() < neededSize) {
-        // Increment in multiples of 64K.
-        neededSize = (neededSize + 65535) & ~65535;
-
-        ALOGI("resizing buffer to %zu bytes", neededSize);
-
-        sp<ABuffer> newBuffer = new ABuffer(neededSize);
-        memcpy(newBuffer->data(), mBuffer->data(), mBuffer->size());
-        newBuffer->setRange(0, mBuffer->size());
-        mBuffer = newBuffer;
+    if (!ensureBufferCapacity(neededSize)) {
+        return NO_MEMORY;
     }
 
     memcpy(mBuffer->data() + mBuffer->size(), br->data(), payloadSizeBits / 8);
     mBuffer->setRange(0, mBuffer->size() + payloadSizeBits / 8);
-#ifdef MTK_AOSP_ENHANCEMENT
-#ifdef MTK_SUBTITLE_SUPPORT
-    if (STREAMTYPE_SUBTITLE == mStreamType) {
-        //ALOGV("mBuffer data size =  %d(bytes)\n", mBuffer->size());
-        //ALOGV("mBuffer data [4][5], =  %#x,%#x\n", mBuffer->data()[4],
-        //      mBuffer->data()[5]);
-        if (mPayloadStarted
-            && ((int)mBuffer->size() ==
-                (mBuffer->data()[4] << 8) + mBuffer->data()[5] + 6)) {
-            flush(event);
-        }
+
+    if (mScrambled) {
+        mSubSamples.push_back({payloadSizeBits / 8,
+                 transport_scrambling_control, random_access_indicator});
     }
-#endif
-    if (STREAMTYPE_H264 == mStreamType) {
-        ALOGV("mBuffer data size =  %zu(bytes)\n", mBuffer->size());
-        ALOGV("mBuffer data [4][5], =  %#x,%#x\n", mBuffer->data()[4],
-        mBuffer->data()[5]);
-    /* very few PES packet larger than 64K which length set to 0 */
-        if (((mBuffer->data()[4] << 8) + mBuffer->data()[5]) != 0) {
-            if (mPayloadStarted && (mBuffer->size() ==
-                size_t((mBuffer->data()[4] << 8) + mBuffer->data()[5] + 6))) {
-                flush(event);
-            }
-        }
-    }
-#endif
 
     return OK;
 }
@@ -992,13 +1137,10 @@ status_t ATSParser::Stream::parse(
 bool ATSParser::Stream::isVideo() const {
     switch (mStreamType) {
         case STREAMTYPE_H264:
+        case STREAMTYPE_H264_ENCRYPTED:
         case STREAMTYPE_MPEG1_VIDEO:
         case STREAMTYPE_MPEG2_VIDEO:
         case STREAMTYPE_MPEG4_VIDEO:
-#ifdef MTK_AOSP_ENHANCEMENT
-    case STREAMTYPE_VC1_VIDEO:
-        case STREAMTYPE_HEVC:
-#endif
             return true;
 
         default:
@@ -1011,16 +1153,14 @@ bool ATSParser::Stream::isAudio() const {
         case STREAMTYPE_MPEG1_AUDIO:
         case STREAMTYPE_MPEG2_AUDIO:
         case STREAMTYPE_MPEG2_AUDIO_ADTS:
-        case STREAMTYPE_PCM_AUDIO:
-#ifdef MTK_AOSP_ENHANCEMENT
-        case STREAMTYPE_AUDIO_PSLPCM:
-        case STREAMTYPE_AUDIO_BDLPCM:
-#endif
+        case STREAMTYPE_LPCM_AC3:
         case STREAMTYPE_AC3:
-#if defined(MTK_AOSP_ENHANCEMENT) && defined(MTK_AUDIO_DDPLUS_SUPPORT)
-        case STREAMTYPE_EC3:
-#endif // DOLBY_END
+        case STREAMTYPE_EAC3:
+        case STREAMTYPE_AAC_ENCRYPTED:
+        case STREAMTYPE_AC3_ENCRYPTED:
             return true;
+        case STREAMTYPE_PES_PRIVATE_DATA:
+            return mStreamTypeExt == EXT_DESCRIPTOR_DVB_AC4;
 
         default:
             return false;
@@ -1037,56 +1177,23 @@ bool ATSParser::Stream::isMeta() const {
 void ATSParser::Stream::signalDiscontinuity(
         DiscontinuityType type, const sp<AMessage> &extra) {
     mExpectedContinuityCounter = -1;
-#ifdef MTK_AOSP_ENHANCEMENT
-#if 0
-    int64_t mediaTimeUs;
-    if ((type & DISCONTINUITY_HTTPLIVE_MEDIATIME)
-            && extra != NULL
-            && extra->findInt64(
-                IStreamListener::kKeyMediaTimeUs, &mediaTimeUs)){
-        if(mediaTimeUs >= 0) {
-            flush();
-            mPayloadStarted = false;
-            return;
-        } else {
-            //need to clear stale data
-        }
-    }
-
-    /*
-    if (type == DISCONTINUITY_NONE) {
-		if(mStreamType == STREAMTYPE_PES_METADATA){
-			ALOGD("receive DISCONTINUITY_NONE ,  try to get album picture now");
-			flush();
-            mPayloadStarted = false;
-		}
-        return;
-    }
-    */
-#endif
-    if (mProgram->mParser->mFlags & TS_SOURCE_IS_LOCAL) {
-        return signalDiscontinuity_local(type, extra);
-    }
-#endif
 
     if (mQueue == NULL) {
         return;
     }
 
     mPayloadStarted = false;
+    mPesStartOffsets.clear();
     mEOSReached = false;
     mBuffer->setRange(0, 0);
+    mSubSamples.clear();
 
     bool clearFormat = false;
     if (isAudio()) {
         if (type & DISCONTINUITY_AUDIO_FORMAT) {
             clearFormat = true;
         }
-#ifdef MTK_AOSP_ENHANCEMENT
-    } else if (isVideo()) {
-#else
     } else {
-#endif
         if (type & DISCONTINUITY_VIDEO_FORMAT) {
             clearFormat = true;
         }
@@ -1098,7 +1205,7 @@ void ATSParser::Stream::signalDiscontinuity(
         uint64_t resumeAtPTS;
         if (extra != NULL
                 && extra->findInt64(
-                    IStreamListener::kKeyResumeAtPTS,
+                    kATSParserKeyResumeAtPTS,
                     (int64_t *)&resumeAtPTS)) {
             int64_t resumeAtMediaTimeUs =
                 mProgram->convertPTSToTimestamp(resumeAtPTS);
@@ -1108,7 +1215,15 @@ void ATSParser::Stream::signalDiscontinuity(
     }
 
     if (mSource != NULL) {
-        mSource->queueDiscontinuity(type, extra, true);
+        sp<MetaData> meta = mSource->getFormat();
+        const char* mime;
+        if (clearFormat && meta != NULL && meta->findCString(kKeyMIMEType, &mime)
+                && (!strncasecmp(mime, MEDIA_MIMETYPE_AUDIO_SCRAMBLED, 15)
+                 || !strncasecmp(mime, MEDIA_MIMETYPE_VIDEO_SCRAMBLED, 15))){
+            mSource->clear();
+        } else {
+            mSource->queueDiscontinuity(type, extra, true);
+        }
     }
 }
 
@@ -1121,6 +1236,8 @@ void ATSParser::Stream::signalEOS(status_t finalResult) {
 }
 
 status_t ATSParser::Stream::parsePES(ABitReader *br, SyncEvent *event) {
+    const uint8_t *basePtr = br->data();
+
     unsigned packet_startcode_prefix = br->getBits(24);
 
     ALOGV("packet_startcode_prefix = 0x%08x", packet_startcode_prefix);
@@ -1150,7 +1267,9 @@ status_t ATSParser::Stream::parsePES(ABitReader *br, SyncEvent *event) {
             return ERROR_MALFORMED;
         }
 
-        MY_LOGV("PES_scrambling_control = %u", br->getBits(2));
+        unsigned PES_scrambling_control = br->getBits(2);
+        ALOGV("PES_scrambling_control = %u", PES_scrambling_control);
+
         MY_LOGV("PES_priority = %u", br->getBits(1));
         MY_LOGV("data_alignment_indicator = %u", br->getBits(1));
         MY_LOGV("copyright = %u", br->getBits(1));
@@ -1186,18 +1305,9 @@ status_t ATSParser::Stream::parsePES(ABitReader *br, SyncEvent *event) {
                 return ERROR_MALFORMED;
             }
 
-#ifdef MTK_AOSP_ENHANCEMENT
-            unsigned PTS_DTS_Idendity;
-            if((PTS_DTS_Idendity = br->getBits(4))!= PTS_DTS_flags)
-            {
-                ALOGE("[CHECK_ERROR]parsePES PTS_DTS_flags = %u fail", PTS_DTS_flags);
-//              return OK;
-            }
-#else
             if (br->getBits(4) != PTS_DTS_flags) {
                 return ERROR_MALFORMED;
             }
-#endif
             PTS = ((uint64_t)br->getBits(3)) << 30;
             if (br->getBits(1) != 1u) {
                 return ERROR_MALFORMED;
@@ -1216,18 +1326,9 @@ status_t ATSParser::Stream::parsePES(ABitReader *br, SyncEvent *event) {
             optional_bytes_remaining -= 5;
 
             if (PTS_DTS_flags == 3) {
-#ifdef MTK_AOSP_ENHANCEMENT
-                if (PTS_DTS_Idendity == 3){
-                    if (optional_bytes_remaining < 5)
-                    {
-                        ALOGD("[CHECK_ERROR]invalid optional_bytes_remaining =%u",optional_bytes_remaining);
-                        return OK;
-                    }
-#else
                 if (optional_bytes_remaining < 5u) {
                     return ERROR_MALFORMED;
                 }
-#endif
 
                 if (br->getBits(4) != 1u) {
                     return ERROR_MALFORMED;
@@ -1249,9 +1350,6 @@ status_t ATSParser::Stream::parsePES(ABitReader *br, SyncEvent *event) {
                 ALOGV("DTS = %" PRIu64, DTS);
 
                 optional_bytes_remaining -= 5;
-#ifdef MTK_AOSP_ENHANCEMENT
-                }
-#endif
             }
         }
 
@@ -1304,13 +1402,12 @@ status_t ATSParser::Stream::parsePES(ABitReader *br, SyncEvent *event) {
         br->skipBits(optional_bytes_remaining * 8);
 
         // ES data follows.
+        int32_t pesOffset = br->data() - basePtr;
 
         if (PES_packet_length != 0) {
-#ifndef MTK_AOSP_ENHANCEMENT
             if (PES_packet_length < PES_header_data_length + 3) {
                 return ERROR_MALFORMED;
             }
-#endif
 
             unsigned dataLength =
                 PES_packet_length - 3 - PES_header_data_length;
@@ -1323,21 +1420,26 @@ status_t ATSParser::Stream::parsePES(ABitReader *br, SyncEvent *event) {
                 return ERROR_MALFORMED;
             }
 
+            ALOGV("There's %u bytes of payload, PES_packet_length=%u, offset=%d",
+                    dataLength, PES_packet_length, pesOffset);
+
             onPayloadData(
-                    PTS_DTS_flags, PTS, DTS, br->data(), dataLength, event);
+                    PTS_DTS_flags, PTS, DTS, PES_scrambling_control,
+                    br->data(), dataLength, pesOffset, event);
 
             br->skipBits(dataLength * 8);
         } else {
             onPayloadData(
-                    PTS_DTS_flags, PTS, DTS,
-                    br->data(), br->numBitsLeft() / 8, event);
+                    PTS_DTS_flags, PTS, DTS, PES_scrambling_control,
+                    br->data(), br->numBitsLeft() / 8, pesOffset, event);
 
             size_t payloadSizeBits = br->numBitsLeft();
             if (payloadSizeBits % 8 != 0u) {
                 return ERROR_MALFORMED;
             }
 
-            ALOGV("There's %zu bytes of payload.", payloadSizeBits / 8);
+            ALOGV("There's %zu bytes of payload, offset=%d",
+                    payloadSizeBits / 8, pesOffset);
         }
     } else if (stream_id == 0xbe) {  // padding_stream
         if (PES_packet_length == 0u) {
@@ -1354,6 +1456,240 @@ status_t ATSParser::Stream::parsePES(ABitReader *br, SyncEvent *event) {
     return OK;
 }
 
+uint32_t ATSParser::Stream::getPesScramblingControl(
+        ABitReader *br, int32_t *pesOffset) {
+    unsigned packet_startcode_prefix = br->getBits(24);
+
+    ALOGV("packet_startcode_prefix = 0x%08x", packet_startcode_prefix);
+
+    if (packet_startcode_prefix != 1) {
+        ALOGV("unit does not start with startcode.");
+        return 0;
+    }
+
+    if (br->numBitsLeft() < 48) {
+        return 0;
+    }
+
+    unsigned stream_id = br->getBits(8);
+    ALOGV("stream_id = 0x%02x", stream_id);
+
+    br->skipBits(16); // PES_packet_length
+
+    if (stream_id != 0xbc  // program_stream_map
+            && stream_id != 0xbe  // padding_stream
+            && stream_id != 0xbf  // private_stream_2
+            && stream_id != 0xf0  // ECM
+            && stream_id != 0xf1  // EMM
+            && stream_id != 0xff  // program_stream_directory
+            && stream_id != 0xf2  // DSMCC
+            && stream_id != 0xf8) {  // H.222.1 type E
+        if (br->getBits(2) != 2u) {
+            return 0;
+        }
+
+        unsigned PES_scrambling_control = br->getBits(2);
+        ALOGV("PES_scrambling_control = %u", PES_scrambling_control);
+
+        if (PES_scrambling_control == 0) {
+            return 0;
+        }
+
+        br->skipBits(12); // don't care
+
+        unsigned PES_header_data_length = br->getBits(8);
+        ALOGV("PES_header_data_length = %u", PES_header_data_length);
+
+        if (PES_header_data_length * 8 > br->numBitsLeft()) {
+            return 0;
+        }
+
+        *pesOffset = 9 + PES_header_data_length;
+        ALOGD("found PES_scrambling_control=%d, PES offset=%d",
+                PES_scrambling_control, *pesOffset);
+        return PES_scrambling_control;
+    }
+
+    return 0;
+}
+
+status_t ATSParser::Stream::flushScrambled(SyncEvent *event) {
+    if (mDescrambler == NULL) {
+        ALOGE("received scrambled packets without descrambler!");
+        return UNKNOWN_ERROR;
+    }
+
+    if (mDescrambledBuffer == NULL || mHidlMemory == NULL) {
+        ALOGE("received scrambled packets without shared memory!");
+
+        return UNKNOWN_ERROR;
+    }
+
+    int32_t pesOffset = 0;
+    int32_t descrambleSubSamples = 0, descrambleBytes = 0;
+    uint32_t tsScramblingControl = 0, pesScramblingControl = 0;
+
+    // First, go over subsamples to find TS-level scrambling key id, and
+    // calculate how many subsample we need to descramble (assuming we don't
+    // have PES-level scrambling).
+    for (auto it = mSubSamples.begin(); it != mSubSamples.end(); it++) {
+        if (it->transport_scrambling_mode != 0) {
+            // TODO: handle keyId change, use the first non-zero keyId for now.
+            if (tsScramblingControl == 0) {
+                tsScramblingControl = it->transport_scrambling_mode;
+            }
+        }
+        if (tsScramblingControl == 0 || descrambleSubSamples == 0
+                || !mQueue->isScrambled()) {
+            descrambleSubSamples++;
+            descrambleBytes += it->subSampleSize;
+        }
+    }
+    // If not scrambled at TS-level, check PES-level scrambling
+    if (tsScramblingControl == 0) {
+        ABitReader br(mBuffer->data(), mBuffer->size());
+        pesScramblingControl = getPesScramblingControl(&br, &pesOffset);
+        // If not scrambled at PES-level either, or scrambled at PES-level but
+        // requires output to remain scrambled, we don't need to descramble
+        // anything.
+        if (pesScramblingControl == 0 || mQueue->isScrambled()) {
+            descrambleSubSamples = 0;
+            descrambleBytes = 0;
+        }
+    }
+
+    uint32_t sctrl = tsScramblingControl != 0 ?
+            tsScramblingControl : pesScramblingControl;
+    if (mQueue->isScrambled()) {
+        sctrl |= DescramblerPlugin::kScrambling_Flag_PesHeader;
+    }
+
+    // Perform the 1st pass descrambling if needed
+    if (descrambleBytes > 0) {
+        memcpy(mDescrambledBuffer->data(), mBuffer->data(), descrambleBytes);
+        mDescrambledBuffer->setRange(0, mBuffer->size());
+
+        hidl_vec<SubSample> subSamples;
+        subSamples.resize(descrambleSubSamples);
+
+        int32_t i = 0;
+        for (auto it = mSubSamples.begin();
+                it != mSubSamples.end() && i < descrambleSubSamples; it++, i++) {
+            if (it->transport_scrambling_mode != 0 || pesScramblingControl != 0) {
+                subSamples[i].numBytesOfClearData = 0;
+                subSamples[i].numBytesOfEncryptedData = it->subSampleSize;
+            } else {
+                subSamples[i].numBytesOfClearData = it->subSampleSize;
+                subSamples[i].numBytesOfEncryptedData = 0;
+            }
+        }
+
+        // If scrambled at PES-level, PES header is in the clear
+        if (pesScramblingControl != 0) {
+            subSamples[0].numBytesOfClearData = pesOffset;
+            subSamples[0].numBytesOfEncryptedData -= pesOffset;
+        }
+
+        Status status = Status::OK;
+        uint32_t bytesWritten = 0;
+        hidl_string detailedError;
+
+        DestinationBuffer dstBuffer;
+        dstBuffer.type = BufferType::SHARED_MEMORY;
+        dstBuffer.nonsecureMemory = mDescramblerSrcBuffer;
+
+        auto returnVoid = mDescrambler->descramble(
+                (ScramblingControl) sctrl,
+                subSamples,
+                mDescramblerSrcBuffer,
+                0 /*srcOffset*/,
+                dstBuffer,
+                0 /*dstOffset*/,
+                [&status, &bytesWritten, &detailedError] (
+                        Status _status, uint32_t _bytesWritten,
+                        const hidl_string& _detailedError) {
+                    status = _status;
+                    bytesWritten = _bytesWritten;
+                    detailedError = _detailedError;
+                });
+
+        if (!returnVoid.isOk() || status != Status::OK) {
+            ALOGE("[stream %d] descramble failed, trans=%s, status=%d",
+                    mElementaryPID, returnVoid.description().c_str(), status);
+            return UNKNOWN_ERROR;
+        }
+
+        ALOGV("[stream %d] descramble succeeded, %d bytes",
+                mElementaryPID, bytesWritten);
+
+        // Set descrambleBytes to the returned result.
+        // Note that this might be smaller than the total length of input data.
+        // (eg. when we're descrambling the PES header portion of a secure stream,
+        // the plugin might cut it off right after the PES header.)
+        descrambleBytes = bytesWritten;
+    }
+
+    // |buffer| points to the buffer from which we'd parse the PES header.
+    // When the output stream is scrambled, it points to mDescrambledBuffer
+    // (unless all packets in this PES are actually clear, in which case,
+    // it points to mBuffer since we never copied into mDescrambledBuffer).
+    // When the output stream is clear, it points to mBuffer, and we'll
+    // copy all descrambled data back to mBuffer.
+    sp<ABuffer> buffer = mBuffer;
+    if (mQueue->isScrambled()) {
+        // Queue subSample info for scrambled queue
+        sp<ABuffer> clearSizesBuffer = new ABuffer(mSubSamples.size() * 4);
+        sp<ABuffer> encSizesBuffer = new ABuffer(mSubSamples.size() * 4);
+        int32_t *clearSizePtr = (int32_t*)clearSizesBuffer->data();
+        int32_t *encSizePtr = (int32_t*)encSizesBuffer->data();
+        int32_t isSync = 0;
+        int32_t i = 0;
+        for (auto it = mSubSamples.begin();
+                it != mSubSamples.end(); it++, i++) {
+            if ((it->transport_scrambling_mode == 0
+                    && pesScramblingControl == 0)) {
+                clearSizePtr[i] = it->subSampleSize;
+                encSizePtr[i] = 0;
+            } else {
+                clearSizePtr[i] = 0;
+                encSizePtr[i] = it->subSampleSize;
+            }
+            isSync |= it->random_access_indicator;
+        }
+
+        // If scrambled at PES-level, PES header is in the clear
+        if (pesScramblingControl != 0) {
+            clearSizePtr[0] = pesOffset;
+            encSizePtr[0] -= pesOffset;
+        }
+        // Pass the original TS subsample size now. The PES header adjust
+        // will be applied when the scrambled AU is dequeued.
+        // Note that if descrambleBytes is 0, it means this PES contains only
+        // all ts packets, leadingClearBytes is entire buffer size.
+        mQueue->appendScrambledData(
+                mBuffer->data(), mBuffer->size(),
+                (descrambleBytes > 0) ? descrambleBytes : mBuffer->size(),
+                sctrl, isSync, clearSizesBuffer, encSizesBuffer);
+
+        if (descrambleBytes > 0) {
+            buffer = mDescrambledBuffer;
+        }
+    } else {
+        memcpy(mBuffer->data(), mDescrambledBuffer->data(), descrambleBytes);
+    }
+
+    ABitReader br(buffer->data(), buffer->size());
+    status_t err = parsePES(&br, event);
+
+    if (err != OK) {
+        ALOGE("[stream %d] failed to parse descrambled PES, err=%d",
+                mElementaryPID, err);
+    }
+
+    return err;
+}
+
+
 status_t ATSParser::Stream::flush(SyncEvent *event) {
     if (mBuffer == NULL || mBuffer->size() == 0) {
         return OK;
@@ -1361,18 +1697,32 @@ status_t ATSParser::Stream::flush(SyncEvent *event) {
 
     ALOGV("flushing stream 0x%04x size = %zu", mElementaryPID, mBuffer->size());
 
-    ABitReader br(mBuffer->data(), mBuffer->size());
-
-    status_t err = parsePES(&br, event);
+    status_t err = OK;
+    if (mScrambled) {
+        err = flushScrambled(event);
+        mSubSamples.clear();
+    } else {
+        ABitReader br(mBuffer->data(), mBuffer->size());
+        err = parsePES(&br, event);
+    }
 
     mBuffer->setRange(0, 0);
 
     return err;
 }
 
+void ATSParser::Stream::addAudioPresentations(const sp<ABuffer> &buffer) {
+    std::ostringstream outStream(std::ios::out);
+    serializeAudioPresentations(mAudioPresentations, &outStream);
+    sp<ABuffer> ap = ABuffer::CreateAsCopy(outStream.str().data(), outStream.str().size());
+    buffer->meta()->setBuffer("audio-presentation-info", ap);
+}
+
 void ATSParser::Stream::onPayloadData(
         unsigned PTS_DTS_flags, uint64_t PTS, uint64_t /* DTS */,
-        const uint8_t *data, size_t size, SyncEvent *event) {
+        unsigned PES_scrambling_control,
+        const uint8_t *data, size_t size,
+        int32_t payloadOffset, SyncEvent *event) {
 #if 0
     ALOGI("payload streamType 0x%02x, PTS = 0x%016llx, dPTS = %lld",
           mStreamType,
@@ -1380,63 +1730,20 @@ void ATSParser::Stream::onPayloadData(
           (int64_t)PTS - mPrevPTS);
     mPrevPTS = PTS;
 #endif
-#ifdef MTK_AOSP_ENHANCEMENT
-#ifdef MTK_AUDIO_CHANGE_SUPPORT
-    if(!isVideo() && !isAudio() && (!mProgram->getDequeueState() ||
-        (!mProgram->firstPTSIsValid()&&(mProgram->mParser->mFlags & TS_SOURCE_IS_LOCAL)))){
-#else
-    if(!isVideo() && !isAudio() && !mProgram->getDequeueState()){
-#endif
-        ALOGD("not video and not audio when inquery pts %d,mElementaryPID:0x%x", mStreamType,mElementaryPID);
-        return;
-    }
-#endif
-    ALOGV("onPayloadData mStreamType=0x%02x", mStreamType);
 
-    int64_t timeUs = 0ll;  // no presentation timestamp available.
+    ALOGV("onPayloadData mStreamType=0x%02x size: %zu", mStreamType, size);
+
+    int64_t timeUs = 0LL;  // no presentation timestamp available.
     if (PTS_DTS_flags == 2 || PTS_DTS_flags == 3) {
         timeUs = mProgram->convertPTSToTimestamp(PTS);
     }
 
-#ifdef MTK_AOSP_ENHANCEMENT
-    if(event!=NULL){
-        ALOGV("event is not null");}
-    //if (timeUs > mMaxTimeUs && timeUs!=0xFFFFFFFF){
-    if (timeUs > mMaxTimeUs && (isAudio() || isVideo())) {
-        mMaxTimeUs = timeUs;
-    }
-    if (!mProgram->getDequeueState()) {
-        return;
-    }
-    if (timeUs == -1) {
-        ALOGE
-            ("onPayloadData: timeUs< firstPTS, only skip audio, isVideo()=%d",
-             isVideo());
-        if (isVideo()) {
-            timeUs = 0;
-        } else
-            return;
-    }
-    if (!mSupportedStream) {
-        return;
-    }
-#ifdef MTK_AUDIO_CHANGE_SUPPORT
-        if (mProgram->mParser->mPrograms.size()> 1 && (mProgram->getPlayProgramPID() != mProgram->programMapPID())){
-            /*ALOGD("appenddata PID:0x%x,PTS:%lld  not queue;playing PID:0x%x,currentPID0x%x",
-                mElementaryPID,(long long)PTS,mProgram->getPlayProgramPID(),mProgram->programMapPID());*/
-            return;
-        }
-#endif
-
-#endif
-    status_t err = mQueue->appendData(data, size, timeUs);
+    status_t err = mQueue->appendData(
+            data, size, timeUs, payloadOffset, PES_scrambling_control);
 
     if (mEOSReached) {
         mQueue->signalEOS();
     }
-#ifdef MTK_AOSP_ENHANCEMENT
-    ALOGD("appendData PID:0x%x,PTS:%lld timeUs:%lld,size:%zu",mElementaryPID,(long long)PTS,(long long)timeUs,size);
-#endif
 
     if (err != OK) {
         return;
@@ -1451,25 +1758,22 @@ void ATSParser::Stream::onPayloadData(
             if (meta != NULL) {
                 ALOGV("Stream PID 0x%08x of type 0x%02x now has data.",
                      mElementaryPID, mStreamType);
-#ifdef MTK_AOSP_ENHANCEMENT
-                if (!isSupportedStream(meta)) {
-                    mSupportedStream = false;
-                    return;
-                }
-#else
 
                 const char *mime;
                 if (meta->findCString(kKeyMIMEType, &mime)
-                        && !strcasecmp(mime, MEDIA_MIMETYPE_VIDEO_AVC)
-                        && !IsIDR(accessUnit)) {
-                    continue;
+                        && !strcasecmp(mime, MEDIA_MIMETYPE_VIDEO_AVC)) {
+                    int32_t sync = 0;
+                    if (!accessUnit->meta()->findInt32("isSync", &sync) || !sync) {
+                        continue;
+                    }
                 }
-#endif
                 mSource = new AnotherPacketSource(meta);
-#ifdef MTK_AOSP_ENHANCEMENT
-                mSource->setSourcePID(mElementaryPID);
-#endif
+                if (mAudioPresentations.size() > 0) {
+                    addAudioPresentations(accessUnit);
+                }
                 mSource->queueAccessUnit(accessUnit);
+                ALOGV("onPayloadData: created AnotherPacketSource PID 0x%08x of type 0x%02x",
+                        mElementaryPID, mStreamType);
             }
         } else if (mQueue->getFormat() != NULL) {
             // After a discontinuity we invalidate the queue's format
@@ -1479,23 +1783,44 @@ void ATSParser::Stream::onPayloadData(
             if (mSource->getFormat() == NULL) {
                 mSource->setFormat(mQueue->getFormat());
             }
+            if (mAudioPresentations.size() > 0) {
+                addAudioPresentations(accessUnit);
+            }
             mSource->queueAccessUnit(accessUnit);
         }
 
-        if ((event != NULL) && !found && mQueue->getFormat() != NULL) {
+        // Every access unit has a pesStartOffset queued in |mPesStartOffsets|.
+        off64_t pesStartOffset = -1;
+        if (!mPesStartOffsets.empty()) {
+            pesStartOffset = *mPesStartOffsets.begin();
+            mPesStartOffsets.erase(mPesStartOffsets.begin());
+        }
+
+        if (pesStartOffset >= 0 && (event != NULL) && !found && mQueue->getFormat() != NULL) {
             int32_t sync = 0;
             if (accessUnit->meta()->findInt32("isSync", &sync) && sync) {
                 int64_t timeUs;
                 if (accessUnit->meta()->findInt64("timeUs", &timeUs)) {
                     found = true;
-                    event->init(mPesStartOffset, mSource, timeUs);
+                    event->init(pesStartOffset, mSource, timeUs, getSourceType());
                 }
             }
         }
     }
 }
 
-sp<MediaSource> ATSParser::Stream::getSource(SourceType type) {
+ATSParser::SourceType ATSParser::Stream::getSourceType() {
+    if (isVideo()) {
+        return VIDEO;
+    } else if (isAudio()) {
+        return AUDIO;
+    } else if (isMeta()) {
+        return META;
+    }
+    return NUM_SOURCE_TYPES;
+}
+
+sp<AnotherPacketSource> ATSParser::Stream::getSource(SourceType type) {
     switch (type) {
         case VIDEO:
         {
@@ -1521,17 +1846,6 @@ sp<MediaSource> ATSParser::Stream::getSource(SourceType type) {
             break;
         }
 
-#ifdef MTK_AOSP_ENHANCEMENT
-#ifdef MTK_SUBTITLE_SUPPORT
-    case SUBTITLE:
-    {
-        if (STREAMTYPE_SUBTITLE == mStreamType) {
-            return mSource;
-        }
-        break;
-    }
-#endif
-#endif
         default:
             break;
     }
@@ -1539,35 +1853,33 @@ sp<MediaSource> ATSParser::Stream::getSource(SourceType type) {
     return NULL;
 }
 
+void ATSParser::Stream::setCasInfo(
+        int32_t systemId, const sp<IDescrambler> &descrambler,
+        const std::vector<uint8_t> &sessionId) {
+    if (mSource != NULL && mDescrambler == NULL && descrambler != NULL) {
+        signalDiscontinuity(DISCONTINUITY_FORMAT_ONLY, NULL);
+        mDescrambler = descrambler;
+        if (mQueue->isScrambled()) {
+            mQueue->setCasInfo(systemId, sessionId);
+        }
+    }
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 
 ATSParser::ATSParser(uint32_t flags)
     : mFlags(flags),
-      mAbsoluteTimeAnchorUs(-1ll),
+      mAbsoluteTimeAnchorUs(-1LL),
       mTimeOffsetValid(false),
-      mTimeOffsetUs(0ll),
-      mLastRecoveredPTS(-1ll),
+      mTimeOffsetUs(0LL),
+      mLastRecoveredPTS(-1LL),
       mNumTSPacketsParsed(0),
       mNumPCRs(0) {
     mPSISections.add(0 /* PID */, new PSISection);
-#ifdef MTK_AOSP_ENHANCEMENT  
-    configureTSDump();
-      mDumptsfile = NULL;
-      Dumptsfile = false;
-      mNeedDequeuePES = true;
-      currentPlayIndex = 0xFFFFFFFF;
-#endif
+    mCasManager = new CasManager();
 }
 
 ATSParser::~ATSParser() {
-    ALOGD("~ATSParser");
-#ifdef MTK_AOSP_ENHANCEMENT     
-    if (mDumptsfile != NULL) {
-        fclose(mDumptsfile);
-        mDumptsfile = NULL;
-        ALOGD("dump file closed");
-     }
-#endif
 }
 
 status_t ATSParser::feedTSPacket(const void *data, size_t size,
@@ -1577,27 +1889,32 @@ status_t ATSParser::feedTSPacket(const void *data, size_t size,
         return BAD_VALUE;
     }
 
-#ifdef MTK_AOSP_ENHANCEMENT     // mtk08123 for ts dump
-    if(Dumptsfile){
-       DumpTS(data);
-    }
-#endif
     ABitReader br((const uint8_t *)data, kTSPacketSize);
     return parseTS(&br, event);
+}
+
+status_t ATSParser::setMediaCas(const sp<ICas> &cas) {
+    status_t err = mCasManager->setMediaCas(cas);
+    if (err != OK) {
+        return err;
+    }
+    for (size_t i = 0; i < mPrograms.size(); ++i) {
+        mPrograms.editItemAt(i)->updateCasSessions();
+    }
+    return OK;
 }
 
 void ATSParser::signalDiscontinuity(
         DiscontinuityType type, const sp<AMessage> &extra) {
     int64_t mediaTimeUs;
-    ALOGD("signalDiscontinuity %d", type);
     if ((type & DISCONTINUITY_TIME) && extra != NULL) {
-        if (extra->findInt64(IStreamListener::kKeyMediaTimeUs, &mediaTimeUs)) {
+        if (extra->findInt64(kATSParserKeyMediaTimeUs, &mediaTimeUs)) {
             mAbsoluteTimeAnchorUs = mediaTimeUs;
         }
         if ((mFlags & TS_TIMESTAMPS_ARE_ABSOLUTE)
                 && extra->findInt64(
-                    IStreamListener::kKeyRecentMediaTimeUs, &mediaTimeUs)) {
-            if (mAbsoluteTimeAnchorUs >= 0ll) {
+                    kATSParserKeyRecentMediaTimeUs, &mediaTimeUs)) {
+            if (mAbsoluteTimeAnchorUs >= 0LL) {
                 mediaTimeUs -= mAbsoluteTimeAnchorUs;
             }
             if (mTimeOffsetValid) {
@@ -1605,20 +1922,6 @@ void ATSParser::signalDiscontinuity(
             }
             mLastRecoveredPTS = (mediaTimeUs * 9) / 100;
         }
-#if 0
-#ifdef MTK_AOSP_ENHANCEMENT
-    if ((type & DISCONTINUITY_HTTPLIVE_MEDIATIME)
-            && extra != NULL
-            && extra->findInt64(
-                IStreamListener::kKeyMediaTimeUs, &mediaTimeUs) && (mPrograms.size() == 0)){
-        if(mediaTimeUs >= 0) {
-            mAbsoluteTimeAnchorUs = mediaTimeUs;
-            ALOGD("@debug: discontinuity: new AnchorUs = %.2f", mAbsoluteTimeAnchorUs / 1E6);
-        }
-        return;
-    }
-#endif
-#endif
     } else if (type == DISCONTINUITY_ABSOLUTE_TIME) {
         int64_t timeUs;
         if (!extra->findInt64("timeUs", &timeUs)) {
@@ -1660,24 +1963,13 @@ void ATSParser::signalEOS(status_t finalResult) {
     }
 }
 
-#ifdef MTK_AOSP_ENHANCEMENT   //cherry
-status_t ATSParser::parseProgramAssociationTable(ABitReader *br) {
-#else
 void ATSParser::parseProgramAssociationTable(ABitReader *br) {
-#endif
     unsigned table_id = br->getBits(8);
     ALOGV("  table_id = %u", table_id);
-
-#ifdef MTK_AOSP_ENHANCEMENT
-    if(table_id != 0x00u){
-      return ERROR_UNSUPPORTED;
-    }
-#else
     if (table_id != 0x00u) {
         ALOGE("PAT data error!");
         return ;
     }
-#endif
     unsigned section_syntax_indictor = br->getBits(1);
     ALOGV("  section_syntax_indictor = %u", section_syntax_indictor);
 
@@ -1723,6 +2015,9 @@ void ATSParser::parseProgramAssociationTable(ABitReader *br) {
             if (!found) {
                 mPrograms.push(
                         new Program(this, program_number, programMapPID, mLastRecoveredPTS));
+                if (mSampleAesKeyItem != NULL) {
+                    mPrograms.top()->signalNewSampleAesKey(mSampleAesKeyItem);
+                }
             }
 
             if (mPSISections.indexOfKey(programMapPID) < 0) {
@@ -1732,15 +2027,14 @@ void ATSParser::parseProgramAssociationTable(ABitReader *br) {
     }
 
     MY_LOGV("  CRC = 0x%08x", br->getBits(32));
-#ifdef MTK_AOSP_ENHANCEMENT //cherry
-    return OK;
-#endif
 }
 
 status_t ATSParser::parsePID(
         ABitReader *br, unsigned PID,
         unsigned continuity_counter,
         unsigned payload_unit_start_indicator,
+        unsigned transport_scrambling_control,
+        unsigned random_access_indicator,
         SyncEvent *event) {
     ssize_t sectionIndex = mPSISections.indexOfKey(PID);
 
@@ -1748,35 +2042,13 @@ status_t ATSParser::parsePID(
         sp<PSISection> section = mPSISections.valueAt(sectionIndex);
 
         if (payload_unit_start_indicator) {
-
             if (!section->isEmpty()) {
                 ALOGW("parsePID encounters payload_unit_start_indicator when section is not empty");
                 section->clear();
             }
-#if 0
-#ifdef MTK_AOSP_ENHANCEMENT
-            if (mFlags & TS_SOURCE_IS_LOCAL) {
-                if (!section->isEmpty())
-                    return ERROR_UNSUPPORTED;
-            } else {
-            CHECK(section->isEmpty());
-            }
-#else
-            CHECK(section->isEmpty());
-#endif
-#endif
 
             unsigned skip = br->getBits(8);
-
             section->setSkipBytes(skip + 1);  // skip filler bytes + pointer field itself
-#ifdef MTK_AOSP_ENHANCEMENT
-            if (mFlags & TS_SOURCE_IS_LOCAL) {
-                if ((skip * 8) > (br->numBitsLeft())) {
-                    ALOGE("need skip too much...");
-                    return OK;
-                }
-            }
-#endif
             br->skipBits(skip * 8);
         }
 
@@ -1794,22 +2066,12 @@ status_t ATSParser::parsePID(
         }
 
         if (!section->isCRCOkay()) {
-#ifdef MTK_AOSP_ENHANCEMENT
-            ALOGE("CRC not OK..");
-#endif
             return BAD_VALUE;
         }
         ABitReader sectionBits(section->data(), section->size());
 
         if (PID == 0) {
-#ifdef MTK_AOSP_ENHANCEMENT
-        status_t err = parseProgramAssociationTable(&sectionBits);
-        if (err != OK) {
-            return err;
-        }
-#else
             parseProgramAssociationTable(&sectionBits);
-#endif
         } else {
             bool handled = false;
             for (size_t i = 0; i < mPrograms.size(); ++i) {
@@ -1844,7 +2106,10 @@ status_t ATSParser::parsePID(
     for (size_t i = 0; i < mPrograms.size(); ++i) {
         status_t err;
         if (mPrograms.editItemAt(i)->parsePID(
-                    PID, continuity_counter, payload_unit_start_indicator,
+                    PID, continuity_counter,
+                    payload_unit_start_indicator,
+                    transport_scrambling_control,
+                    random_access_indicator,
                     br, &err, event)) {
             if (err != OK) {
                 return err;
@@ -1856,24 +2121,21 @@ status_t ATSParser::parsePID(
     }
 
     if (!handled) {
+        handled = mCasManager->parsePID(br, PID);
+    }
+
+    if (!handled) {
         ALOGV("PID 0x%04x not handled.", PID);
     }
 
     return OK;
 }
 
-status_t ATSParser::parseAdaptationField(ABitReader *br, unsigned PID) {
+status_t ATSParser::parseAdaptationField(
+        ABitReader *br, unsigned PID, unsigned *random_access_indicator) {
+    *random_access_indicator = 0;
     unsigned adaptation_field_length = br->getBits(8);
-#ifdef MTK_AOSP_ENHANCEMENT
-    if (adaptation_field_length * 8 > br->numBitsLeft()) {
-        ALOGE
-            ("[TS_ERROR:func=%s, line=%d]: adaptation_field_length=%d >  br->numBitsLeft %zu",
-             __FUNCTION__, __LINE__, adaptation_field_length,
-             br->numBitsLeft());
-        br->skipBits(br->numBitsLeft());
-        return OK;
-    }
-#endif
+
     if (adaptation_field_length > 0) {
         if (adaptation_field_length * 8 > br->numBitsLeft()) {
             ALOGV("Adaptation field should be included in a single TS packet.");
@@ -1886,7 +2148,16 @@ status_t ATSParser::parseAdaptationField(ABitReader *br, unsigned PID) {
             ALOGV("PID 0x%04x: discontinuity_indicator = 1 (!!!)", PID);
         }
 
-        br->skipBits(2);
+        *random_access_indicator = br->getBits(1);
+        if (*random_access_indicator) {
+            ALOGV("PID 0x%04x: random_access_indicator = 1", PID);
+        }
+
+        unsigned elementary_stream_priority_indicator = br->getBits(1);
+        if (elementary_stream_priority_indicator) {
+            ALOGV("PID 0x%04x: elementary_stream_priority_indicator = 1", PID);
+        }
+
         unsigned PCR_flag = br->getBits(1);
 
         size_t numBitsRead = 4;
@@ -1915,8 +2186,8 @@ status_t ATSParser::parseAdaptationField(ABitReader *br, unsigned PID) {
 
             // The number of bytes received by this parser up to and
             // including the final byte of this PCR_ext field.
-            size_t byteOffsetFromStart =
-                mNumTSPacketsParsed * 188 + byteOffsetFromStartOfTSPacket;
+            uint64_t byteOffsetFromStart =
+                uint64_t(mNumTSPacketsParsed) * 188 + byteOffsetFromStartOfTSPacket;
 
             for (size_t i = 0; i < mPrograms.size(); ++i) {
                 updatePCR(PID, PCR, byteOffsetFromStart);
@@ -1924,13 +2195,6 @@ status_t ATSParser::parseAdaptationField(ABitReader *br, unsigned PID) {
 
             numBitsRead += 52;
         }
-#ifdef MTK_AOSP_ENHANCEMENT
-        if (adaptation_field_length * 8 < numBitsRead) {
-            ALOGE("adaptation_field_length:%d, numBitRead:%zu",
-                  adaptation_field_length, numBitsRead);
-            return OK;
-        }
-#endif
 
         br->skipBits(adaptation_field_length * 8 - numBitsRead);
     }
@@ -1959,7 +2223,8 @@ status_t ATSParser::parseTS(ABitReader *br, SyncEvent *event) {
     unsigned PID = br->getBits(13);
     ALOGV("PID = 0x%04x", PID);
 
-    MY_LOGV("transport_scrambling_control = %u", br->getBits(2));
+    unsigned transport_scrambling_control = br->getBits(2);
+    ALOGV("transport_scrambling_control = %u", transport_scrambling_control);
 
     unsigned adaptation_field_control = br->getBits(2);
     ALOGV("adaptation_field_control = %u", adaptation_field_control);
@@ -1971,20 +2236,17 @@ status_t ATSParser::parseTS(ABitReader *br, SyncEvent *event) {
 
     status_t err = OK;
 
+    unsigned random_access_indicator = 0;
     if (adaptation_field_control == 2 || adaptation_field_control == 3) {
-        err = parseAdaptationField(br, PID);
+        err = parseAdaptationField(br, PID, &random_access_indicator);
     }
     if (err == OK) {
         if (adaptation_field_control == 1 || adaptation_field_control == 3) {
-#ifdef MTK_AOSP_ENHANCEMENT
-        if (br->numBitsLeft() == 0) {
-            ALOGE("[TS_ERROR:func=%s, line=%d]:   br->numBitsLeft %zu",
-                  __FUNCTION__, __LINE__, br->numBitsLeft());
-            return OK;
-        }
-#endif
             err = parsePID(br, PID, continuity_counter,
-                    payload_unit_start_indicator, event);
+                    payload_unit_start_indicator,
+                    transport_scrambling_control,
+                    random_access_indicator,
+                    event);
         }
     }
 
@@ -1992,172 +2254,40 @@ status_t ATSParser::parseTS(ABitReader *br, SyncEvent *event) {
 
     return err;
 }
-#ifdef MTK_AOSP_ENHANCEMENT
-//get duration
-int64_t ATSParser::getMaxPTS() {
-#ifdef MTK_AUDIO_CHANGE_SUPPORT
-    int64_t maxPTS = 0;
 
-    size_t playindex = getPlayIndex();
-    if (playindex == 0xFFFFFFFF){
-        ALOGV("durations is not valid");
-        return 0;
-    }
-    maxPTS = mPrograms.editItemAt(playindex)->getPTS();
-
-    return maxPTS;
-
-#else
-    int64_t maxPTS = 0;
-    for (size_t i = 0; i < mPrograms.size(); ++i) {
-        int64_t pts = mPrograms.editItemAt(i)->getPTS();
-        if (maxPTS < pts) {
-            maxPTS = pts;
-        }
-    }
-    return maxPTS;
-#endif
-}
-#ifdef MTK_AOSP_ENHANCEMENT
-#ifdef MTK_AUDIO_CHANGE_SUPPORT
-void ATSParser::setFirstPTSIsValid(){
-
-    size_t playindex = getPlayIndex();
-    if (playindex == 0xFFFFFFFF){
-        ALOGV("durations is not valid");
-        return;
-    }
-//reset the mfirstPtsisvalid of the program that is not the current playing
-    for (size_t i = 0; i < mPrograms.size(); i++){
-        if (i != playindex){
-            ALOGD("reset mfirstPTSIsvalid of program:%x",mPrograms.editItemAt(i)->programMapPID());
-            mPrograms.editItemAt(i)->setFirstPTSIsValid(false);
-        }
-    }
-//reset end ,inorder to calculate the timeUs of other program correctly
-}
-#endif
-#endif
-bool ATSParser::firstPTSIsValid() {
-#ifdef MTK_AUDIO_CHANGE_SUPPORT
-    size_t i = 0;
-    size_t playindex = getPlayIndex();
-
-    if (playindex == 0xFFFFFFFF){
-        for (i = 0; i < mPrograms.size(); ++i) {
-            if (mPrograms.editItemAt(i)->getmStreamsSize() > 0) {
-                setPlayIndex(i);
-                break;
-            }
-        }
-    }
-
-    size_t playindex2 = getPlayIndex();
-    if (playindex2 != 0xFFFFFFFF){
-
-        if (mPrograms.editItemAt(playindex2)->firstPTSIsValid()) {
-                ALOGV("mPrograms.editItemAt(i) in firstPTSIsValid =%d",(int)i);
-            return true;
-        }
-    }
-    return false;
-#else
-    for (size_t i = 0; i < mPrograms.size(); ++i) {
-        if (mPrograms.editItemAt(i)->firstPTSIsValid()) {
-            return true;
-        }
-    }
-    return false;
-#endif
-}
-#endif
-
-sp<MediaSource> ATSParser::getSource(unsigned PID, unsigned index) {
-#ifdef MTK_AUDIO_CHANGE_SUPPORT
+sp<AnotherPacketSource> ATSParser::getSource(SourceType type) {
+    sp<AnotherPacketSource> firstSourceFound;
     for (size_t i = 0; i < mPrograms.size(); ++i) {
         const sp<Program> &program = mPrograms.editItemAt(i);
-        sp<MediaSource> source = program->getSource(PID, index);
-        if (source != NULL) {
-            return source;
-        }
-    }
-    return NULL;
-#else
-    ALOGV("unsigned PID %u, unsigned index %u", PID, index);
-    return NULL;
-#endif
-}
-bool ATSParser::isParsedPIDEmpty(){
-#ifdef MTK_AUDIO_CHANGE_SUPPORT
-    return mParsedPID.empty();
-#else
-    return false;
-#endif
-   }
-unsigned ATSParser::parsedPIDSize(){
-#ifdef MTK_AUDIO_CHANGE_SUPPORT
-    return mParsedPID.size();
-#else
-    return 0;
-#endif
-}
-void ATSParser::removeParsedPID(unsigned index){
-    ALOGV(" unsigned index %u", index);
-#ifdef MTK_AUDIO_CHANGE_SUPPORT
-    mParsedPID.removeAt(index);
-#endif
-}
-void ATSParser::addParsedPID(unsigned elemPID) {
-    ALOGV(" unsigned elemPID %u", elemPID);
-#ifdef MTK_AUDIO_CHANGE_SUPPORT
-        mParsedPID.push(elemPID);
-#endif
-}
-unsigned ATSParser::getParsedPID(unsigned index) {
-    ALOGV(" unsigned  index %u", index);
-#ifdef MTK_AUDIO_CHANGE_SUPPORT
-    return mParsedPID[index];
-#else
-    return 0;
-#endif
-}
-
-size_t ATSParser::getPlayProgramPID(size_t playindex){
-    ALOGV(" unsigned  playindex %zu", playindex);
-#ifdef MTK_AUDIO_CHANGE_SUPPORT
-    if (playindex == 0xFFFFFFFF){
-        for (size_t i = 0; i < mPrograms.size(); ++i) {
-            if (mPrograms.editItemAt(i)->getmStreamsSize() > 0) {
-                setPlayIndex(i);
-                break;
-            }
-        }
-        playindex = getPlayIndex();
-    }
-
-    return mPrograms.editItemAt(playindex)->programMapPID();
-#else
-    return 0;
-#endif
-}
-sp<MediaSource> ATSParser::getSource(SourceType type) {
-    int which = -1;  // any
-
-    for (size_t i = 0; i < mPrograms.size(); ++i) {
-        const sp<Program> &program = mPrograms.editItemAt(i);
-
-        if (which >= 0 && (int)program->number() != which) {
+        sp<AnotherPacketSource> source = program->getSource(type);
+        if (source == NULL) {
             continue;
         }
+        if (firstSourceFound == NULL) {
+            firstSourceFound = source;
+        }
+        // Prefer programs with both audio/video
+        switch (type) {
+            case VIDEO: {
+                if (program->hasSource(AUDIO)) {
+                    return source;
+                }
+                break;
+            }
 
-        sp<MediaSource> source = program->getSource(type);
+            case AUDIO: {
+                if (program->hasSource(VIDEO)) {
+                    return source;
+                }
+                break;
+            }
 
-        if (source != NULL) {
-            return source;
+            default:
+                return source;
         }
     }
 
-    return NULL;
+    return firstSourceFound;
 }
 
 bool ATSParser::hasSource(SourceType type) const {
@@ -2179,9 +2309,20 @@ bool ATSParser::PTSTimeDeltaEstablished() {
     return mPrograms.editItemAt(0)->PTSTimeDeltaEstablished();
 }
 
+int64_t ATSParser::getFirstPTSTimeUs() {
+    for (size_t i = 0; i < mPrograms.size(); ++i) {
+        sp<ATSParser::Program> program = mPrograms.itemAt(i);
+        if (program->PTSTimeDeltaEstablished()) {
+            return (program->firstPTS() * 100) / 9;
+        }
+    }
+    return -1;
+}
+
+__attribute__((no_sanitize("integer")))
 void ATSParser::updatePCR(
-        unsigned /* PID */, uint64_t PCR, size_t byteOffsetFromStart) {
-    ALOGV("PCR 0x%016" PRIx64 " @ %zu", PCR, byteOffsetFromStart);
+        unsigned /* PID */, uint64_t PCR, uint64_t byteOffsetFromStart) {
+    ALOGV("PCR 0x%016" PRIx64 " @ %" PRIx64, PCR, byteOffsetFromStart);
 
     if (mNumPCRs == 2) {
         mPCR[0] = mPCR[1];
@@ -2197,6 +2338,7 @@ void ATSParser::updatePCR(
     ++mNumPCRs;
 
     if (mNumPCRs == 2) {
+        /* Unsigned overflow here */
         double transportRate =
             (mPCRBytes[1] - mPCRBytes[0]) * 27E6 / (mPCR[1] - mPCR[0]);
 
@@ -2358,7 +2500,7 @@ bool ATSParser::PSISection::isCRCOkay() const {
 
     if(sectionLength < mSkipBytes) {
         ALOGE("b/28333006");
-        //android_errorWriteLog(0x534e4554, "28333006");
+        android_errorWriteLog(0x534e4554, "28333006");
         return false;
     }
 
@@ -2374,334 +2516,40 @@ bool ATSParser::PSISection::isCRCOkay() const {
     ALOGV("crc: %08x\n", crc);
     return (crc == 0);
 }
-#ifdef MTK_AOSP_ENHANCEMENT ////////////////
-int64_t ATSParser::Program::getPTS() {
 
-    int64_t maxPTS = 0;
+// SAMPLE_AES key handling
+// TODO: Merge these to their respective class after Widevine-HLS
+void ATSParser::signalNewSampleAesKey(const sp<AMessage> &keyItem) {
+    ALOGD("signalNewSampleAesKey: %p", keyItem.get());
+
+    mSampleAesKeyItem = keyItem;
+
+    // a NULL key item will propagate to existing ElementaryStreamQueues
+    for (size_t i = 0; i < mPrograms.size(); ++i) {
+        mPrograms[i]->signalNewSampleAesKey(keyItem);
+    }
+}
+
+void ATSParser::Program::signalNewSampleAesKey(const sp<AMessage> &keyItem) {
+    ALOGD("Program::signalNewSampleAesKey: %p", keyItem.get());
+
+    mSampleAesKeyItem = keyItem;
+
+    // a NULL key item will propagate to existing ElementaryStreamQueues
     for (size_t i = 0; i < mStreams.size(); ++i) {
-        int64_t pts = mStreams.editValueAt(i)->getPTS();
-        if (maxPTS < pts) {
-            maxPTS = pts;
-        }
-    }
-
-    return maxPTS;
-}
-
-bool ATSParser::Program::getDequeueState() {
-    return mParser->getDequeueState();
-}
-
-bool ATSParser::Program::firstPTSIsValid() {
-    return mFirstPTSValid;
-}
-void ATSParser::Stream::signalDiscontinuity_local(DiscontinuityType type,
-                                                  const sp<AMessage>
-                                                  &extra) {
-    if (mQueue == NULL) {
-        return;
-    }
-
-    mPayloadStarted = false;
-    mEOSReached = false;
-    mBuffer->setRange(0, 0);
-
-    if (!mProgram->getDequeueState()) {
-        if (type & DISCONTINUITY_TIME) {
-            int64_t maxtimeUs = 0;
-            if (extra != NULL && extra->findInt64("MaxtimeUs", &maxtimeUs)) {
-                mMaxTimeUs = maxtimeUs;
-            } else {
-                mMaxTimeUs = 0;
-            }
-            ALOGI("set MaxTimeUs:%lld", (long long)mMaxTimeUs);
-        }
-        return;
-    }
-    bool clearFormat = false;
-    if (isAudio()) {
-        if (type & DISCONTINUITY_AUDIO_FORMAT) {
-            clearFormat = true;
-        }
-    } else if (isVideo()) {
-        if (type & DISCONTINUITY_VIDEO_FORMAT) {
-            clearFormat = true;
-        }
-    }
-
-    mQueue->clear(clearFormat);
-
-    if (type & DISCONTINUITY_TIME) {
-        bool usePPs = true;
-        mQueue->setSeeking(usePPs);
-        if (mSource.get())      //TODO: clear the data can implemented in mSource
-        {
-            mSource->clear(true);
-            ALOGD("source cleared, %d", mSource == NULL);
-        } else {
-            ALOGE("[error]this stream has not source\n");
-        }
-    }
-
-}
-
-#ifdef MTK_AUDIO_CHANGE_SUPPORT
-sp<MediaSource> ATSParser::Stream::getSource(unsigned PID, unsigned index){
-    unsigned i = PID; //only for build error
-    i++;              //only for build error
-    unsigned j = index;//only for build error
-    j++;              //only for build error
-    if(!isAudio()&&!isVideo()){
-        if (mProgram->getPlayProgramPID() != mProgram->programMapPID()){
-            return NULL;
-        }else{
-            return mSource;
-        }
-    }else{
-        return mSource;
+        mStreams[i]->signalNewSampleAesKey(keyItem);
     }
 }
-#endif
 
+void ATSParser::Stream::signalNewSampleAesKey(const sp<AMessage> &keyItem) {
+    ALOGD("Stream::signalNewSampleAesKey: 0x%04x size = %zu keyItem: %p",
+          mElementaryPID, mBuffer->size(), keyItem.get());
 
-int64_t ATSParser::Stream::getPTS() {
-    return mMaxTimeUs;
+    // a NULL key item will propagate to existing ElementaryStreamQueues
+    mSampleAesKeyItem = keyItem;
 
+    flush(NULL);
+    mQueue->signalNewSampleAesKey(keyItem);
 }
 
-bool ATSParser::Stream::isSupportedStream(sp<MetaData> StreamMeta) {
-    char value[PROPERTY_VALUE_MAX];
-    int _res = 0;
-    bool ignoreaudio = 0;
-    bool ignorevideo = 0;
-    ALOGV("StreamMeta is %p", StreamMeta.get());
-
-    property_get("ts.ignoreaudio", value, "0");
-    _res = atoi(value);
-    if (_res)
-        ignoreaudio = 1;
-
-    property_get("ts.ignorevideo", value, "0");
-    _res = atoi(value);
-    if (_res)
-        ignorevideo = 1;
-
-    if (isVideo()) {
-        int32_t width=0;
-        int32_t height=0;
-        int32_t MaxWidth=0;
-        int32_t MaxHeight=0;
-        ALOGV("width %d,height %d,MaxWidth %d,MaxHeight %d",width,height,MaxWidth,MaxHeight);
-#ifdef MTK_DEMUXER_BLOCK_CAPABILITY
-#ifdef MTK_DEMUXER_QUERY_CAPABILITY_FROM_DRV_SUPPORT
-
-        VDEC_DRV_QUERY_VIDEO_FORMAT_T qinfo;
-        VDEC_DRV_QUERY_VIDEO_FORMAT_T outinfo;
-        memset(&qinfo, 0, sizeof(VDEC_DRV_QUERY_VIDEO_FORMAT_T));
-        memset(&outinfo, 0, sizeof(VDEC_DRV_QUERY_VIDEO_FORMAT_T));
-
-        switch (mStreamType) {
-        case STREAMTYPE_H264:
-        {
-            qinfo.u4VideoFormat = VDEC_DRV_VIDEO_FORMAT_H264;
-            break;
-        }
-        case STREAMTYPE_MPEG1_VIDEO:
-        {
-            qinfo.u4VideoFormat = VDEC_DRV_VIDEO_FORMAT_MPEG1;
-            break;
-        }
-        case STREAMTYPE_MPEG2_VIDEO:
-        {
-            qinfo.u4VideoFormat = VDEC_DRV_VIDEO_FORMAT_MPEG2;
-            break;
-        }
-        case STREAMTYPE_MPEG4_VIDEO:
-        {
-            qinfo.u4VideoFormat = VDEC_DRV_VIDEO_FORMAT_MPEG4;
-            break;
-        }
-        default:
-        {
-            ALOGE
-                ("[TS capability error]Unsupport video format!!!mStreamType=0x%x ",
-                 mStreamType);
-            return false;
-        }
-        }
-
-        VDEC_DRV_MRESULT_T ret;
-        ret =
-            eVDecDrvQueryCapability(VDEC_DRV_QUERY_TYPE_VIDEO_FORMAT,
-                                    &qinfo, &outinfo);
-
-//resolution
-        MaxWidth = outinfo.u4Width;
-        MaxHeight = outinfo.u4Height;
-        StreamMeta->findInt32(kKeyWidth, &width);
-        StreamMeta->findInt32(kKeyHeight, &height);
-        ALOGE
-            ("[TS DRV capability info] ret =%d ,MaxWidth=%d, MaxHeight=%d ,profile=%d,level=%d",
-             ret, MaxWidth, MaxHeight, outinfo.u4Profile, outinfo.u4Level);
-
-        if ((ret == VDEC_DRV_MRESULT_OK)
-            && (width > MaxWidth || height > MaxHeight || width < 32
-                || height < 32)) {
-            ALOGE
-                ("[TS capability error]Unsupport video resolution!!! width %d> MaxWidth %d || height %d > MaxHeight %d ",
-                 width, MaxWidth, height, MaxHeight);
-            return false;
-        }
-#else //MTK_DEMUXER_QUERY_CAPABILITY_FROM_DRV_SUPPORT
-        if (StreamMeta != NULL) {
-            StreamMeta->findInt32(kKeyWidth, &width);
-            StreamMeta->findInt32(kKeyHeight, &height);
-        } else {
-            ALOGE("[TS capability error]No mFormat");
-            return false;
-        }
-        if ((width > 1280) || (height > 720) ||
-            ((width * height) > (1280 * 720)) || (width <= 0)
-            || (height <= 0)) {
-            ALOGE
-                ("[TS capability error]Unsupport video resolution!!!width %d> 1280 || height %d > 720 ",
-                 width, height);
-            return false;
-        }
-//profile and level
-        if (mStreamType == STREAMTYPE_H264) {
-            bool err = false;
-            uint32_t type;
-            const void *data;
-            size_t size;
-            unsigned profile, level;
-            if (StreamMeta->findData(kKeyAVCC, &type, &data, &size)) {
-                const uint8_t *ptr = (const uint8_t *) data;
-
-                // verify minimum size and configurationVersion == 1.
-                if (size < 7 || ptr[0] != 1) {
-                    return false;
-                }
-
-                profile = ptr[1];
-                level = ptr[3];
-
-                if (level > 31) {
-                    //workaround: let youku can play http live streaming
-                    if ((mProgram->mParser)->mFlags & TS_SOURCE_IS_LOCAL) {
-                        ALOGE
-                            ("[TS capability error]Unsupport H264 leve!!!level=%d  >31",
-                             level);
-                        return false;
-                    }
-                }
-            } else {
-                ALOGE("[TS_ERROR]:can not find the kKeyAVCC");
-                return false;
-            }
-        }
-#endif ////MTK_DEMUXER_QUERY_CAPABILITY_FROM_DRV_SUPPORT
-#endif //#ifdef MTK_DEMUXER_BLOCK_CAPABILITY
-
-        if (ignorevideo) {
-            ALOGE("[TS_ERROR]:we ignorevideo");
-            return false;
-        }
-
-    } else if (isAudio()) {
-#ifdef MTK_DEMUXER_BLOCK_CAPABILITY
-#ifdef MTK_DEMUXER_QUERY_CAPABILITY_FROM_DRV_SUPPORT
-
-#else
-        if (mStreamType == STREAMTYPE_MPEG2_AUDIO_ADTS) {
-            bool err = false;
-            uint32_t type;
-            const void *data;
-            size_t size;
-            uint8_t audio_config[2], object_type;
-            if (StreamMeta->findData(kKeyESDS, &type, &data, &size)) {
-                audio_config[0] = *((uint8_t *) (data + size - 2));
-                audio_config[1] = *((uint8_t *) (data + size - 1));
-                object_type = ((audio_config[0] >> 3) & 7);
-                // only support LC,LTP,SBR audio object
-                if ((object_type != AAC_AAC_LC) &&
-                    (object_type != AAC_AAC_LTP) &&
-                    (object_type != AAC_SBR) && (object_type != 29)) {
-                    ALOGE
-                        ("[TS capability error]Unsupport AAC  profile!!!object_type =  %d  audio_config=0x%x,0x%x",
-                         object_type, audio_config[0], audio_config[1]);
-                    return false;
-                }
-
-            } else {
-                ALOGE("[TS_ERROR]:can not find  the kKeyESDS");
-                return false;
-            }
-
-        }
-#endif // MTK_DEMUXER_QUERY_CAPABILITY_FROM_DRV_SUPPORT
-#endif //#ifdef MTK_DEMUXER_BLOCK_CAPABILITY
-        if (ignoreaudio) {
-            ALOGE("[TS_ERROR]:we ignoreaudio");
-            return false;
-        }
-
-    }
-
-    return true;
-}
-
-bool ATSParser::findPAT(const void *data, size_t size) {
-    //ALOGE("isPAT---");
-    CHECK_EQ(size, kTSPacketSize);
-    ABitReader br((const uint8_t *) data, kTSPacketSize);
-    unsigned sync_byte = br.getBits(8);
-    //ALOGE("isPAT-sync_byte=0x%x ",sync_byte );
-    //CHECK_EQ(sync_byte, 0x47u);
-    if (sync_byte != 0x47u) {
-        ALOGE("[error]isPAT-sync_byte=0x%x ", sync_byte);
-        return false;
-    }
-    br.getBits(1);
-    br.getBits(1);
-    br.getBits(1);
-
-    unsigned PID = br.getBits(13);
-    if (PID == 0)
-        return true;
-    else
-        return false;
-}
-
-void ATSParser::setDequeueState(bool needDequeuePES) {
-    mNeedDequeuePES = needDequeuePES;
-}
-
-bool ATSParser::getDequeueState() {
-    return mNeedDequeuePES;
-}
-
-#ifdef MTK_AOSP_ENHANCEMENT // mtk08123 for ts dump
-void ATSParser::configureTSDump(){
-    int32_t dummyts = 0;
-    char value[PROPERTY_VALUE_MAX];
-    property_get("atsparser.ts.dump", value, "0");
-    dummyts = atof(value);
-    if(dummyts>0){
-       Dumptsfile = true;
-       mDumptsfile = fopen("/sdcard/atsparser_dump_file.ts","wb");
-       if(mDumptsfile == NULL){
-          ALOGE("dump file cannot create");
-        }
-     }
-}
-
-void ATSParser::DumpTS(const void *data){
-   if(mDumptsfile != NULL){ 
-      fwrite(data, 1, kTSPacketSize, this->mDumptsfile);
-    }
-}
-#endif
-
-#endif
 }  // namespace android

@@ -20,6 +20,7 @@
 #include <sys/types.h>
 #include <fcntl.h>
 
+#include "IMtpHandle.h"
 #include "MtpRequestPacket.h"
 
 #include <usbhost/usbhost.h>
@@ -36,19 +37,20 @@ MtpRequestPacket::~MtpRequestPacket() {
 }
 
 #ifdef MTP_DEVICE
-int MtpRequestPacket::read(int fd) {
-    int ret = ::read(fd, mBuffer, mBufferSize);
+int MtpRequestPacket::read(IMtpHandle *h) {
+    int ret = h->read(mBuffer, mBufferSize);
     if (ret < 0) {
         // file read error
         return ret;
     }
 
     // request packet should have 12 byte header followed by 0 to 5 32-bit arguments
-    if (ret >= MTP_CONTAINER_HEADER_SIZE
-            && ret <= MTP_CONTAINER_HEADER_SIZE + 5 * sizeof(uint32_t)
-            && ((ret - MTP_CONTAINER_HEADER_SIZE) & 3) == 0) {
-        mPacketSize = ret;
-        mParameterCount = (ret - MTP_CONTAINER_HEADER_SIZE) / sizeof(uint32_t);
+    const size_t read_size = static_cast<size_t>(ret);
+    if (read_size >= MTP_CONTAINER_HEADER_SIZE
+            && read_size <= MTP_CONTAINER_HEADER_SIZE + 5 * sizeof(uint32_t)
+            && ((read_size - MTP_CONTAINER_HEADER_SIZE) & 3) == 0) {
+        mPacketSize = read_size;
+        mParameterCount = (read_size - MTP_CONTAINER_HEADER_SIZE) / sizeof(uint32_t);
     } else {
         ALOGE("Malformed MTP request packet");
         ret = -1;

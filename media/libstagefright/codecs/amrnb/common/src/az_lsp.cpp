@@ -103,7 +103,7 @@ terms listed above has been obtained from the copyright holder.
 ; Include all pre-processor statements here. Include conditional
 ; compile variables also.
 ----------------------------------------------------------------------------*/
-#define NC   M/2                  /* M = LPC order, NC = M/2 */
+#define NC   (M/2)                  /* M = LPC order, NC = M/2 */
 
 /*----------------------------------------------------------------------------
 ; LOCAL FUNCTION DEFINITIONS
@@ -237,7 +237,9 @@ static Word16 Chebps (Word16 x,
 
 ------------------------------------------------------------------------------
 */
-
+#ifdef __clang__
+__attribute__((no_sanitize("integer")))
+#endif
 static Word16 Chebps(Word16 x,
                      Word16 f[], /* (n) */
                      Word16 n,

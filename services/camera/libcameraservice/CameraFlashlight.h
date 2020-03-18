@@ -17,13 +17,14 @@
 #ifndef ANDROID_SERVERS_CAMERA_CAMERAFLASHLIGHT_H
 #define ANDROID_SERVERS_CAMERA_CAMERAFLASHLIGHT_H
 
-#include "hardware/camera_common.h"
-#include "utils/KeyedVector.h"
-#include "utils/SortedVector.h"
-#include "gui/GLConsumer.h"
-#include "gui/Surface.h"
+#include <gui/GLConsumer.h>
+#include <gui/Surface.h>
+#include <utils/KeyedVector.h>
+#include <utils/SortedVector.h>
+#include "common/CameraProviderManager.h"
 #include "common/CameraDeviceBase.h"
 #include "device1/CameraHardwareInterface.h"
+
 
 namespace android {
 
@@ -52,8 +53,8 @@ class FlashControlBase : public virtual VirtualLightRefBase {
  */
 class CameraFlashlight : public virtual VirtualLightRefBase {
     public:
-        CameraFlashlight(CameraModule& cameraModule,
-                const camera_module_callbacks_t& callbacks);
+        CameraFlashlight(sp<CameraProviderManager> providerManager,
+                CameraProviderManager::StatusListener* callbacks);
         virtual ~CameraFlashlight();
 
         // Find all flash units. This must be called before other methods. All
@@ -87,9 +88,15 @@ class CameraFlashlight : public virtual VirtualLightRefBase {
         // mLock should be locked.
         bool hasFlashUnitLocked(const String8& cameraId);
 
+        // Check if flash control is in backward compatible mode (simulated torch API by
+        // opening cameras)
+        bool isBackwardCompatibleMode(const String8& cameraId);
+
         sp<FlashControlBase> mFlashControl;
-        CameraModule *mCameraModule;
-        const camera_module_callbacks_t *mCallbacks;
+
+        sp<CameraProviderManager> mProviderManager;
+
+        CameraProviderManager::StatusListener* mCallbacks;
         SortedVector<String8> mOpenedCameraIds;
 
         // camera id -> if it has a flash unit
@@ -100,74 +107,19 @@ class CameraFlashlight : public virtual VirtualLightRefBase {
 };
 
 /**
- * Flash control for camera module v2.4 and above.
+ * Flash control for camera provider v2.4 and above.
  */
-class ModuleFlashControl : public FlashControlBase {
+class ProviderFlashControl : public FlashControlBase {
     public:
-        ModuleFlashControl(CameraModule& cameraModule,
-                const camera_module_callbacks_t& callbacks);
-        virtual ~ModuleFlashControl();
+        ProviderFlashControl(sp<CameraProviderManager> providerManager);
+        virtual ~ProviderFlashControl();
 
         // FlashControlBase
         status_t hasFlashUnit(const String8& cameraId, bool *hasFlash);
         status_t setTorchMode(const String8& cameraId, bool enabled);
 
     private:
-        CameraModule *mCameraModule;
-
-        Mutex mLock;
-};
-
-/**
- * Flash control for camera module <= v2.3 and camera HAL v2-v3
- */
-class CameraDeviceClientFlashControl : public FlashControlBase {
-    public:
-        CameraDeviceClientFlashControl(CameraModule& cameraModule,
-                const camera_module_callbacks_t& callbacks);
-        virtual ~CameraDeviceClientFlashControl();
-
-        // FlashControlBase
-        status_t setTorchMode(const String8& cameraId, bool enabled);
-        status_t hasFlashUnit(const String8& cameraId, bool *hasFlash);
-
-    private:
-        // connect to a camera device
-        status_t connectCameraDevice(const String8& cameraId);
-        // disconnect and free mDevice
-        status_t disconnectCameraDevice();
-
-        // initialize a surface
-        status_t initializeSurface(sp<CameraDeviceBase>& device, int32_t width,
-                int32_t height);
-
-        // submit a request to enable the torch mode
-        status_t submitTorchEnabledRequest();
-
-        // get the smallest surface size of IMPLEMENTATION_DEFINED
-        status_t getSmallestSurfaceSize(const camera_info& info, int32_t *width,
-                    int32_t *height);
-
-        // protected by mLock
-        status_t hasFlashUnitLocked(const String8& cameraId, bool *hasFlash);
-
-        CameraModule *mCameraModule;
-        const camera_module_callbacks_t *mCallbacks;
-        String8 mCameraId;
-        bool mTorchEnabled;
-        CameraMetadata *mMetadata;
-        // WORKAROUND: will be set to true for HAL v2 devices where
-        // setStreamingRequest() needs to be call for torch mode settings to
-        // take effect.
-        bool mStreaming;
-
-        sp<CameraDeviceBase> mDevice;
-
-        sp<IGraphicBufferProducer> mProducer;
-        sp<IGraphicBufferConsumer>  mConsumer;
-        sp<GLConsumer> mSurfaceTexture;
-        sp<Surface> mSurface;
-        int32_t mStreamId;
+        sp<CameraProviderManager> mProviderManager;
 
         Mutex mLock;
 };
@@ -177,8 +129,9 @@ class CameraDeviceClientFlashControl : public FlashControlBase {
  */
 class CameraHardwareInterfaceFlashControl : public FlashControlBase {
     public:
-        CameraHardwareInterfaceFlashControl(CameraModule& cameraModule,
-                const camera_module_callbacks_t& callbacks);
+        CameraHardwareInterfaceFlashControl(
+                sp<CameraProviderManager> manager,
+                CameraProviderManager::StatusListener* callbacks);
         virtual ~CameraHardwareInterfaceFlashControl();
 
         // FlashControlBase
@@ -193,7 +146,7 @@ class CameraHardwareInterfaceFlashControl : public FlashControlBase {
         status_t disconnectCameraDevice();
 
         // initialize the preview window
-        status_t initializePreviewWindow(sp<CameraHardwareInterface> device,
+        status_t initializePreviewWindow(const sp<CameraHardwareInterface>& device,
                 int32_t width, int32_t height);
 
         // start preview and enable torch
@@ -203,10 +156,14 @@ class CameraHardwareInterfaceFlashControl : public FlashControlBase {
         status_t getSmallestSurfaceSize(int32_t *width, int32_t *height);
 
         // protected by mLock
-        status_t hasFlashUnitLocked(const String8& cameraId, bool *hasFlash);
+        // If this function opens camera device in order to check if it has a flash unit, the
+        // camera device will remain open if keepDeviceOpen is true and the camera device will be
+        // closed if keepDeviceOpen is false. If camera device is already open when calling this
+        // function, keepDeviceOpen is ignored.
+        status_t hasFlashUnitLocked(const String8& cameraId, bool *hasFlash, bool keepDeviceOpen);
 
-        CameraModule *mCameraModule;
-        const camera_module_callbacks_t *mCallbacks;
+        sp<CameraProviderManager> mProviderManager;
+        CameraProviderManager::StatusListener* mCallbacks;
         sp<CameraHardwareInterface> mDevice;
         String8 mCameraId;
         CameraParameters mParameters;

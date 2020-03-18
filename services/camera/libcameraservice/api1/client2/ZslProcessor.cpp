@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2012 The Android Open Source Project
+ * Copyright (C) 2013-2018 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,7 +22,7 @@
 #ifdef LOG_NNDEBUG
 #define ALOGVV(...) ALOGV(__VA_ARGS__)
 #else
-#define ALOGVV(...) ((void)0)
+#define ALOGVV(...) if (0) ALOGV(__VA_ARGS__)
 #endif
 
 #include <inttypes.h>
@@ -35,43 +35,151 @@
 #include "api1/Camera2Client.h"
 #include "api1/client2/CaptureSequencer.h"
 #include "api1/client2/ZslProcessor.h"
+#include "device3/Camera3Device.h"
+
+typedef android::RingBufferConsumer::PinnedBufferItem PinnedBufferItem;
 
 namespace android {
 namespace camera2 {
+
+namespace {
+struct TimestampFinder : public RingBufferConsumer::RingBufferComparator {
+    typedef RingBufferConsumer::BufferInfo BufferInfo;
+
+    enum {
+        SELECT_I1 = -1,
+        SELECT_I2 = 1,
+        SELECT_NEITHER = 0,
+    };
+
+    explicit TimestampFinder(nsecs_t timestamp) : mTimestamp(timestamp) {}
+    ~TimestampFinder() {}
+
+    template <typename T>
+    static void swap(T& a, T& b) {
+        T tmp = a;
+        a = b;
+        b = tmp;
+    }
+
+    /**
+     * Try to find the best candidate for a ZSL buffer.
+     * Match priority from best to worst:
+     *  1) Timestamps match.
+     *  2) Timestamp is closest to the needle (and lower).
+     *  3) Timestamp is closest to the needle (and higher).
+     *
+     */
+    virtual int compare(const BufferInfo *i1,
+                        const BufferInfo *i2) const {
+        // Try to select non-null object first.
+        if (i1 == NULL) {
+            return SELECT_I2;
+        } else if (i2 == NULL) {
+            return SELECT_I1;
+        }
+
+        // Best result: timestamp is identical
+        if (i1->mTimestamp == mTimestamp) {
+            return SELECT_I1;
+        } else if (i2->mTimestamp == mTimestamp) {
+            return SELECT_I2;
+        }
+
+        const BufferInfo* infoPtrs[2] = {
+            i1,
+            i2
+        };
+        int infoSelectors[2] = {
+            SELECT_I1,
+            SELECT_I2
+        };
+
+        // Order i1,i2 so that always i1.timestamp < i2.timestamp
+        if (i1->mTimestamp > i2->mTimestamp) {
+            swap(infoPtrs[0], infoPtrs[1]);
+            swap(infoSelectors[0], infoSelectors[1]);
+        }
+
+        // Second best: closest (lower) timestamp
+        if (infoPtrs[1]->mTimestamp < mTimestamp) {
+            return infoSelectors[1];
+        } else if (infoPtrs[0]->mTimestamp < mTimestamp) {
+            return infoSelectors[0];
+        }
+
+        // Worst: closest (higher) timestamp
+        return infoSelectors[0];
+
+        /**
+         * The above cases should cover all the possibilities,
+         * and we get an 'empty' result only if the ring buffer
+         * was empty itself
+         */
+    }
+
+    const nsecs_t mTimestamp;
+}; // struct TimestampFinder
+} // namespace anonymous
 
 ZslProcessor::ZslProcessor(
     sp<Camera2Client> client,
     wp<CaptureSequencer> sequencer):
         Thread(false),
+        mLatestClearedBufferTimestamp(0),
         mState(RUNNING),
         mClient(client),
-        mDevice(client->getCameraDevice()),
         mSequencer(sequencer),
         mId(client->getCameraId()),
-        mDeleted(false),
-        mZslBufferAvailable(false),
         mZslStreamId(NO_STREAM),
-        mZslReprocessStreamId(NO_STREAM),
+        mInputStreamId(NO_STREAM),
         mFrameListHead(0),
-        mZslQueueHead(0),
-        mZslQueueTail(0) {
-    mZslQueue.insertAt(0, kZslBufferDepth);
-    mFrameList.insertAt(0, kFrameListDepth);
+        mHasFocuser(false),
+        mInputBuffer(nullptr),
+        mProducer(nullptr),
+        mInputProducer(nullptr),
+        mInputProducerSlot(-1),
+        mBuffersToDetach(0) {
+    // Initialize buffer queue and frame list based on pipeline max depth.
+    size_t pipelineMaxDepth = kDefaultMaxPipelineDepth;
+    if (client != 0) {
+        sp<Camera3Device> device =
+        static_cast<Camera3Device*>(client->getCameraDevice().get());
+        if (device != 0) {
+            camera_metadata_ro_entry_t entry =
+                device->info().find(ANDROID_REQUEST_PIPELINE_MAX_DEPTH);
+            if (entry.count == 1) {
+                pipelineMaxDepth = entry.data.u8[0];
+            } else {
+                ALOGW("%s: Unable to find the android.request.pipelineMaxDepth,"
+                        " use default pipeline max depth %d", __FUNCTION__,
+                        kDefaultMaxPipelineDepth);
+            }
+
+            entry = device->info().find(ANDROID_LENS_INFO_MINIMUM_FOCUS_DISTANCE);
+            if (entry.count > 0 && entry.data.f[0] != 0.) {
+                mHasFocuser = true;
+            }
+        }
+    }
+
+    ALOGV("%s: Initialize buffer queue and frame list depth based on max pipeline depth (%zu)",
+          __FUNCTION__, pipelineMaxDepth);
+    // Need to keep buffer queue longer than metadata queue because sometimes buffer arrives
+    // earlier than metadata which causes the buffer corresponding to oldest metadata being
+    // removed.
+    mFrameListDepth = pipelineMaxDepth;
+    mBufferQueueDepth = mFrameListDepth + 1;
+
+    mZslQueue.insertAt(0, mBufferQueueDepth);
+    mFrameList.insertAt(0, mFrameListDepth);
     sp<CaptureSequencer> captureSequencer = mSequencer.promote();
     if (captureSequencer != 0) captureSequencer->setZslProcessor(this);
 }
 
 ZslProcessor::~ZslProcessor() {
     ALOGV("%s: Exit", __FUNCTION__);
-    disconnect();
-}
-
-void ZslProcessor::onFrameAvailable(const BufferItem& /*item*/) {
-    Mutex::Autolock l(mInputMutex);
-    if (!mZslBufferAvailable) {
-        mZslBufferAvailable = true;
-        mZslBufferAvailableSignal.signal();
-    }
+    deleteStream();
 }
 
 void ZslProcessor::onResultAvailable(const CaptureResult &result) {
@@ -81,35 +189,27 @@ void ZslProcessor::onResultAvailable(const CaptureResult &result) {
     camera_metadata_ro_entry_t entry;
     entry = result.mMetadata.find(ANDROID_SENSOR_TIMESTAMP);
     nsecs_t timestamp = entry.data.i64[0];
-    (void)timestamp;
-    ALOGVV("Got preview frame for timestamp %" PRId64, timestamp);
+    if (entry.count == 0) {
+        ALOGE("%s: metadata doesn't have timestamp, skip this result", __FUNCTION__);
+        return;
+    }
+
+    entry = result.mMetadata.find(ANDROID_REQUEST_FRAME_COUNT);
+    if (entry.count == 0) {
+        ALOGE("%s: metadata doesn't have frame number, skip this result", __FUNCTION__);
+        return;
+    }
+    int32_t frameNumber = entry.data.i32[0];
+
+    ALOGVV("Got preview metadata for frame %d with timestamp %" PRId64, frameNumber, timestamp);
 
     if (mState != RUNNING) return;
 
+    // Corresponding buffer has been cleared. No need to push into mFrameList
+    if (timestamp <= mLatestClearedBufferTimestamp) return;
+
     mFrameList.editItemAt(mFrameListHead) = result.mMetadata;
-    mFrameListHead = (mFrameListHead + 1) % kFrameListDepth;
-
-    findMatchesLocked();
-}
-
-void ZslProcessor::onBufferReleased(buffer_handle_t *handle) {
-    Mutex::Autolock l(mInputMutex);
-
-    // Verify that the buffer is in our queue
-    size_t i = 0;
-    for (; i < mZslQueue.size(); i++) {
-        if (&(mZslQueue[i].buffer.mGraphicBuffer->handle) == handle) break;
-    }
-    if (i == mZslQueue.size()) {
-        ALOGW("%s: Released buffer %p not found in queue",
-                __FUNCTION__, handle);
-    }
-
-    // Erase entire ZSL queue since we've now completed the capture and preview
-    // is stopped.
-    clearZslQueueLocked();
-
-    mState = RUNNING;
+    mFrameListHead = (mFrameListHead + 1) % mFrameListDepth;
 }
 
 status_t ZslProcessor::updateStream(const Parameters &params) {
@@ -124,84 +224,49 @@ status_t ZslProcessor::updateStream(const Parameters &params) {
         ALOGE("%s: Camera %d: Client does not exist", __FUNCTION__, mId);
         return INVALID_OPERATION;
     }
-    sp<CameraDeviceBase> device = mDevice.promote();
+    sp<Camera3Device> device =
+        static_cast<Camera3Device*>(client->getCameraDevice().get());
     if (device == 0) {
         ALOGE("%s: Camera %d: Device does not exist", __FUNCTION__, mId);
         return INVALID_OPERATION;
     }
 
-    if (mZslConsumer == 0) {
-        // Create CPU buffer queue endpoint
-        sp<IGraphicBufferProducer> producer;
-        sp<IGraphicBufferConsumer> consumer;
-        BufferQueue::createBufferQueue(&producer, &consumer);
-        mZslConsumer = new BufferItemConsumer(consumer,
-            GRALLOC_USAGE_HW_CAMERA_ZSL,
-            kZslBufferDepth);
-        mZslConsumer->setFrameAvailableListener(this);
-        mZslConsumer->setName(String8("Camera2-ZslConsumer"));
-        mZslWindow = new Surface(producer);
-    }
-
-    if (mZslStreamId != NO_STREAM) {
-        // Check if stream parameters have to change
-        uint32_t currentWidth, currentHeight;
-        res = device->getStreamInfo(mZslStreamId,
-                &currentWidth, &currentHeight, 0, 0);
+    if (mInputStreamId == NO_STREAM) {
+        res = device->createInputStream(params.fastInfo.maxZslSize.width,
+            params.fastInfo.maxZslSize.height, HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED,
+            &mInputStreamId);
         if (res != OK) {
-            ALOGE("%s: Camera %d: Error querying capture output stream info: "
-                    "%s (%d)", __FUNCTION__,
-                    mId, strerror(-res), res);
+            ALOGE("%s: Camera %d: Can't create input stream: "
+                    "%s (%d)", __FUNCTION__, client->getCameraId(),
+                    strerror(-res), res);
             return res;
         }
-        if (currentWidth != (uint32_t)params.fastInfo.arrayWidth ||
-                currentHeight != (uint32_t)params.fastInfo.arrayHeight) {
-            res = device->deleteReprocessStream(mZslReprocessStreamId);
-            if (res != OK) {
-                ALOGE("%s: Camera %d: Unable to delete old reprocess stream "
-                        "for ZSL: %s (%d)", __FUNCTION__,
-                        mId, strerror(-res), res);
-                return res;
-            }
-            ALOGV("%s: Camera %d: Deleting stream %d since the buffer dimensions changed",
-                __FUNCTION__, mId, mZslStreamId);
-            res = device->deleteStream(mZslStreamId);
-            if (res != OK) {
-                ALOGE("%s: Camera %d: Unable to delete old output stream "
-                        "for ZSL: %s (%d)", __FUNCTION__,
-                        mId, strerror(-res), res);
-                return res;
-            }
-            mZslStreamId = NO_STREAM;
-        }
     }
-
-    mDeleted = false;
 
     if (mZslStreamId == NO_STREAM) {
         // Create stream for HAL production
         // TODO: Sort out better way to select resolution for ZSL
-        int streamType = params.quirks.useZslFormat ?
-                (int)CAMERA2_HAL_PIXEL_FORMAT_ZSL :
-                (int)HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED;
-        res = device->createStream(mZslWindow,
-                params.fastInfo.arrayWidth, params.fastInfo.arrayHeight, streamType,
-                HAL_DATASPACE_UNKNOWN, CAMERA3_STREAM_ROTATION_0, &mZslStreamId);
+
+        sp<IGraphicBufferProducer> producer;
+        sp<IGraphicBufferConsumer> consumer;
+        BufferQueue::createBufferQueue(&producer, &consumer);
+        mProducer = new RingBufferConsumer(consumer, GRALLOC_USAGE_HW_CAMERA_ZSL,
+            mBufferQueueDepth);
+        mProducer->setName(String8("Camera2-ZslRingBufferConsumer"));
+        sp<Surface> outSurface = new Surface(producer);
+
+        res = device->createStream(outSurface, params.fastInfo.maxZslSize.width,
+            params.fastInfo.maxZslSize.height, HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED,
+            HAL_DATASPACE_UNKNOWN, CAMERA3_STREAM_ROTATION_0, &mZslStreamId,
+            String8());
         if (res != OK) {
-            ALOGE("%s: Camera %d: Can't create output stream for ZSL: "
-                    "%s (%d)", __FUNCTION__, mId,
-                    strerror(-res), res);
-            return res;
-        }
-        res = device->createReprocessStreamFromStream(mZslStreamId,
-                &mZslReprocessStreamId);
-        if (res != OK) {
-            ALOGE("%s: Camera %d: Can't create reprocess stream for ZSL: "
-                    "%s (%d)", __FUNCTION__, mId,
+            ALOGE("%s: Camera %d: Can't create ZSL stream: "
+                    "%s (%d)", __FUNCTION__, client->getCameraId(),
                     strerror(-res), res);
             return res;
         }
     }
+
     client->registerFrameListener(Camera2Client::kPreviewRequestIdStart,
             Camera2Client::kPreviewRequestIdEnd,
             this,
@@ -212,55 +277,145 @@ status_t ZslProcessor::updateStream(const Parameters &params) {
 
 status_t ZslProcessor::deleteStream() {
     ATRACE_CALL();
-    Mutex::Autolock l(mInputMutex);
-    // WAR(b/15408128): do not delete stream unless client is being disconnected.
-    mDeleted = true;
-    return OK;
-}
-
-status_t ZslProcessor::disconnect() {
-    ATRACE_CALL();
     status_t res;
+    sp<Camera3Device> device = nullptr;
+    sp<Camera2Client> client = nullptr;
 
     Mutex::Autolock l(mInputMutex);
 
-    if (mZslStreamId != NO_STREAM) {
-        sp<CameraDeviceBase> device = mDevice.promote();
+    if ((mZslStreamId != NO_STREAM) || (mInputStreamId != NO_STREAM)) {
+        client = mClient.promote();
+        if (client == 0) {
+            ALOGE("%s: Camera %d: Client does not exist", __FUNCTION__, mId);
+            return INVALID_OPERATION;
+        }
+
+        device =
+            reinterpret_cast<Camera3Device*>(client->getCameraDevice().get());
         if (device == 0) {
             ALOGE("%s: Camera %d: Device does not exist", __FUNCTION__, mId);
             return INVALID_OPERATION;
         }
+    }
 
-        clearZslQueueLocked();
-
-        res = device->deleteReprocessStream(mZslReprocessStreamId);
-        if (res != OK) {
-            ALOGE("%s: Camera %d: Cannot delete ZSL reprocessing stream %d: "
-                    "%s (%d)", __FUNCTION__, mId,
-                    mZslReprocessStreamId, strerror(-res), res);
-            return res;
-        }
-
-        mZslReprocessStreamId = NO_STREAM;
+    if (mZslStreamId != NO_STREAM) {
         res = device->deleteStream(mZslStreamId);
         if (res != OK) {
             ALOGE("%s: Camera %d: Cannot delete ZSL output stream %d: "
-                    "%s (%d)", __FUNCTION__, mId,
+                    "%s (%d)", __FUNCTION__, client->getCameraId(),
                     mZslStreamId, strerror(-res), res);
             return res;
         }
 
-        mZslWindow.clear();
-        mZslConsumer.clear();
-
         mZslStreamId = NO_STREAM;
     }
+    if (mInputStreamId != NO_STREAM) {
+        res = device->deleteStream(mInputStreamId);
+        if (res != OK) {
+            ALOGE("%s: Camera %d: Cannot delete input stream %d: "
+                    "%s (%d)", __FUNCTION__, client->getCameraId(),
+                    mInputStreamId, strerror(-res), res);
+            return res;
+        }
+
+        mInputStreamId = NO_STREAM;
+    }
+
+    if (nullptr != mInputProducer.get()) {
+        mInputProducer->disconnect(NATIVE_WINDOW_API_CPU);
+        mInputProducer.clear();
+    }
+
     return OK;
 }
 
 int ZslProcessor::getStreamId() const {
     Mutex::Autolock l(mInputMutex);
     return mZslStreamId;
+}
+
+status_t ZslProcessor::updateRequestWithDefaultStillRequest(CameraMetadata &request) const {
+    sp<Camera2Client> client = mClient.promote();
+    if (client == 0) {
+        ALOGE("%s: Camera %d: Client does not exist", __FUNCTION__, mId);
+        return INVALID_OPERATION;
+    }
+    sp<Camera3Device> device =
+        static_cast<Camera3Device*>(client->getCameraDevice().get());
+    if (device == 0) {
+        ALOGE("%s: Camera %d: Device does not exist", __FUNCTION__, mId);
+        return INVALID_OPERATION;
+    }
+
+    CameraMetadata stillTemplate;
+    device->createDefaultRequest(CAMERA3_TEMPLATE_STILL_CAPTURE, &stillTemplate);
+
+    // Find some of the post-processing tags, and assign the value from template to the request.
+    // Only check the aberration mode and noise reduction mode for now, as they are very important
+    // for image quality.
+    uint32_t postProcessingTags[] = {
+            ANDROID_NOISE_REDUCTION_MODE,
+            ANDROID_COLOR_CORRECTION_ABERRATION_MODE,
+            ANDROID_COLOR_CORRECTION_MODE,
+            ANDROID_TONEMAP_MODE,
+            ANDROID_SHADING_MODE,
+            ANDROID_HOT_PIXEL_MODE,
+            ANDROID_EDGE_MODE
+    };
+
+    camera_metadata_entry_t entry;
+    for (size_t i = 0; i < sizeof(postProcessingTags) / sizeof(uint32_t); i++) {
+        entry = stillTemplate.find(postProcessingTags[i]);
+        if (entry.count > 0) {
+            request.update(postProcessingTags[i], entry.data.u8, 1);
+        }
+    }
+
+    return OK;
+}
+
+void ZslProcessor::notifyInputReleased() {
+    Mutex::Autolock l(mInputMutex);
+
+    mBuffersToDetach++;
+    mBuffersToDetachSignal.signal();
+}
+
+void ZslProcessor::doNotifyInputReleasedLocked() {
+    assert(nullptr != mInputBuffer.get());
+    assert(nullptr != mInputProducer.get());
+
+    sp<GraphicBuffer> gb;
+    sp<Fence> fence;
+    auto rc = mInputProducer->detachNextBuffer(&gb, &fence);
+    if (NO_ERROR != rc) {
+        ALOGE("%s: Failed to detach buffer from input producer: %d",
+            __FUNCTION__, rc);
+        return;
+    }
+
+    BufferItem &item = mInputBuffer->getBufferItem();
+    sp<GraphicBuffer> inputBuffer = item.mGraphicBuffer;
+    if (gb->handle != inputBuffer->handle) {
+        ALOGE("%s: Input mismatch, expected buffer %p received %p", __FUNCTION__,
+            inputBuffer->handle, gb->handle);
+        return;
+    }
+
+    mInputBuffer.clear();
+    ALOGV("%s: Memory optimization, clearing ZSL queue",
+          __FUNCTION__);
+    clearZslResultQueueLocked();
+
+    // Required so we accept more ZSL requests
+    mState = RUNNING;
+}
+
+void ZslProcessor::InputProducerListener::onBufferReleased() {
+    sp<ZslProcessor> parent = mParent.promote();
+    if (nullptr != parent.get()) {
+        parent->notifyInputReleased();
+    }
 }
 
 status_t ZslProcessor::pushToReprocess(int32_t requestId) {
@@ -279,21 +434,53 @@ status_t ZslProcessor::pushToReprocess(int32_t requestId) {
         dumpZslQueue(-1);
     }
 
-    if (mZslQueueTail != mZslQueueHead) {
-        CameraMetadata request;
-        size_t index = mZslQueueTail;
-        while (index != mZslQueueHead) {
-            if (!mZslQueue[index].frame.isEmpty()) {
-                request = mZslQueue[index].frame;
-                break;
-            }
-            index = (index + 1) % kZslBufferDepth;
+    size_t metadataIdx;
+    nsecs_t candidateTimestamp = getCandidateTimestampLocked(&metadataIdx);
+
+    if (candidateTimestamp == -1) {
+        ALOGV("%s: Could not find good candidate for ZSL reprocessing",
+              __FUNCTION__);
+        return NOT_ENOUGH_DATA;
+    } else {
+        ALOGV("%s: Found good ZSL candidate idx: %u",
+            __FUNCTION__, (unsigned int) metadataIdx);
+    }
+
+    if (nullptr == mInputProducer.get()) {
+        res = client->getCameraDevice()->getInputBufferProducer(
+            &mInputProducer);
+        if (res != OK) {
+            ALOGE("%s: Camera %d: Unable to retrieve input producer: "
+                    "%s (%d)", __FUNCTION__, client->getCameraId(),
+                    strerror(-res), res);
+            return res;
         }
-        if (index == mZslQueueHead) {
-            ALOGV("%s: ZSL queue has no valid frames to send yet.",
-                  __FUNCTION__);
-            return NOT_ENOUGH_DATA;
+
+        IGraphicBufferProducer::QueueBufferOutput output;
+        res = mInputProducer->connect(new InputProducerListener(this),
+            NATIVE_WINDOW_API_CPU, false, &output);
+        if (res != OK) {
+            ALOGE("%s: Camera %d: Unable to connect to input producer: "
+                    "%s (%d)", __FUNCTION__, client->getCameraId(),
+                    strerror(-res), res);
+            return res;
         }
+    }
+
+    res = enqueueInputBufferByTimestamp(candidateTimestamp,
+        /*actualTimestamp*/NULL);
+    if (res == NO_BUFFER_AVAILABLE) {
+        ALOGV("%s: No ZSL buffers yet", __FUNCTION__);
+        return NOT_ENOUGH_DATA;
+    } else if (res != OK) {
+        ALOGE("%s: Unable to push buffer for reprocessing: %s (%d)",
+                __FUNCTION__, strerror(-res), res);
+        return res;
+    }
+
+    {
+        CameraMetadata request = mFrameList[metadataIdx];
+
         // Verify that the frame is reasonable for reprocessing
 
         camera_metadata_entry_t entry;
@@ -310,25 +497,51 @@ status_t ZslProcessor::pushToReprocess(int32_t requestId) {
             return NOT_ENOUGH_DATA;
         }
 
-        buffer_handle_t *handle =
-            &(mZslQueue[index].buffer.mGraphicBuffer->handle);
-
         uint8_t requestType = ANDROID_REQUEST_TYPE_REPROCESS;
         res = request.update(ANDROID_REQUEST_TYPE,
                 &requestType, 1);
+        if (res != OK) {
+            ALOGE("%s: Unable to update request type",
+                  __FUNCTION__);
+            return INVALID_OPERATION;
+        }
+
         int32_t inputStreams[1] =
-                { mZslReprocessStreamId };
-        if (res == OK) request.update(ANDROID_REQUEST_INPUT_STREAMS,
+                { mInputStreamId };
+        res = request.update(ANDROID_REQUEST_INPUT_STREAMS,
                 inputStreams, 1);
+        if (res != OK) {
+            ALOGE("%s: Unable to update request input streams",
+                  __FUNCTION__);
+            return INVALID_OPERATION;
+        }
+
+        uint8_t captureIntent =
+                static_cast<uint8_t>(ANDROID_CONTROL_CAPTURE_INTENT_STILL_CAPTURE);
+        res = request.update(ANDROID_CONTROL_CAPTURE_INTENT,
+                &captureIntent, 1);
+        if (res != OK ) {
+            ALOGE("%s: Unable to update request capture intent",
+                  __FUNCTION__);
+            return INVALID_OPERATION;
+        }
+
+        // TODO: Shouldn't we also update the latest preview frame?
         int32_t outputStreams[1] =
                 { client->getCaptureStreamId() };
-        if (res == OK) request.update(ANDROID_REQUEST_OUTPUT_STREAMS,
+        res = request.update(ANDROID_REQUEST_OUTPUT_STREAMS,
                 outputStreams, 1);
+        if (res != OK) {
+            ALOGE("%s: Unable to update request output streams",
+                  __FUNCTION__);
+            return INVALID_OPERATION;
+        }
+
         res = request.update(ANDROID_REQUEST_ID,
                 &requestId, 1);
-
         if (res != OK ) {
-            ALOGE("%s: Unable to update frame to a reprocess request", __FUNCTION__);
+            ALOGE("%s: Unable to update frame to a reprocess request",
+                  __FUNCTION__);
             return INVALID_OPERATION;
         }
 
@@ -336,16 +549,8 @@ status_t ZslProcessor::pushToReprocess(int32_t requestId) {
         if (res != OK) {
             ALOGE("%s: Camera %d: Unable to stop preview for ZSL capture: "
                 "%s (%d)",
-                __FUNCTION__, mId, strerror(-res), res);
+                __FUNCTION__, client->getCameraId(), strerror(-res), res);
             return INVALID_OPERATION;
-        }
-        // TODO: have push-and-clear be atomic
-        res = client->getCameraDevice()->pushReprocessBuffer(mZslReprocessStreamId,
-                handle, this);
-        if (res != OK) {
-            ALOGE("%s: Unable to push buffer for reprocessing: %s (%d)",
-                    __FUNCTION__, strerror(-res), res);
-            return res;
         }
 
         // Update JPEG settings
@@ -355,26 +560,95 @@ status_t ZslProcessor::pushToReprocess(int32_t requestId) {
             if (res != OK) {
                 ALOGE("%s: Camera %d: Unable to update JPEG entries of ZSL "
                         "capture request: %s (%d)", __FUNCTION__,
-                        mId,
+                        client->getCameraId(),
                         strerror(-res), res);
                 return res;
             }
         }
 
+        // Update post-processing settings
+        res = updateRequestWithDefaultStillRequest(request);
+        if (res != OK) {
+            ALOGW("%s: Unable to update post-processing tags, the reprocessed image quality "
+                    "may be compromised", __FUNCTION__);
+        }
+
         mLatestCapturedRequest = request;
         res = client->getCameraDevice()->capture(request);
         if (res != OK ) {
-            ALOGE("%s: Unable to send ZSL reprocess request to capture: %s (%d)",
-                    __FUNCTION__, strerror(-res), res);
+            ALOGE("%s: Unable to send ZSL reprocess request to capture: %s"
+                  " (%d)", __FUNCTION__, strerror(-res), res);
             return res;
         }
 
         mState = LOCKED;
-    } else {
-        ALOGV("%s: No ZSL buffers yet", __FUNCTION__);
-        return NOT_ENOUGH_DATA;
     }
+
     return OK;
+}
+
+status_t ZslProcessor::enqueueInputBufferByTimestamp(
+        nsecs_t timestamp,
+        nsecs_t* actualTimestamp) {
+
+    TimestampFinder timestampFinder = TimestampFinder(timestamp);
+
+    mInputBuffer = mProducer->pinSelectedBuffer(timestampFinder,
+        /*waitForFence*/false);
+
+    if (nullptr == mInputBuffer.get()) {
+        ALOGE("%s: No ZSL buffers were available yet", __FUNCTION__);
+        return NO_BUFFER_AVAILABLE;
+    }
+
+    nsecs_t actual = mInputBuffer->getBufferItem().mTimestamp;
+
+    if (actual != timestamp) {
+        // TODO: This is problematic, the metadata queue timestamp should
+        //       usually have a corresponding ZSL buffer with the same timestamp.
+        //       If this is not the case, then it is possible that we will use
+        //       a ZSL buffer from a different request, which can result in
+        //       side effects during the reprocess pass.
+        ALOGW("%s: ZSL buffer candidate search didn't find an exact match --"
+              " requested timestamp = %" PRId64 ", actual timestamp = %" PRId64,
+              __FUNCTION__, timestamp, actual);
+    }
+
+    if (nullptr != actualTimestamp) {
+        *actualTimestamp = actual;
+    }
+
+    BufferItem &item = mInputBuffer->getBufferItem();
+    auto rc = mInputProducer->attachBuffer(&mInputProducerSlot,
+        item.mGraphicBuffer);
+    if (OK != rc) {
+        ALOGE("%s: Failed to attach input ZSL buffer to producer: %d",
+            __FUNCTION__, rc);
+        return rc;
+    }
+
+    IGraphicBufferProducer::QueueBufferOutput output;
+    IGraphicBufferProducer::QueueBufferInput input(item.mTimestamp,
+            item.mIsAutoTimestamp, item.mDataSpace, item.mCrop,
+            item.mScalingMode, item.mTransform, item.mFence);
+    rc = mInputProducer->queueBuffer(mInputProducerSlot, input, &output);
+    if (OK != rc) {
+        ALOGE("%s: Failed to queue ZSL buffer to producer: %d",
+            __FUNCTION__, rc);
+        return rc;
+    }
+
+    return rc;
+}
+
+status_t ZslProcessor::clearInputRingBufferLocked(nsecs_t* latestTimestamp) {
+
+    if (nullptr != latestTimestamp) {
+        *latestTimestamp = mProducer->getLatestTimestamp();
+    }
+    mInputBuffer.clear();
+
+    return mProducer->clear();
 }
 
 status_t ZslProcessor::clearZslQueue() {
@@ -386,15 +660,18 @@ status_t ZslProcessor::clearZslQueue() {
 }
 
 status_t ZslProcessor::clearZslQueueLocked() {
-    for (size_t i = 0; i < mZslQueue.size(); i++) {
-        if (mZslQueue[i].buffer.mTimestamp != 0) {
-            mZslConsumer->releaseBuffer(mZslQueue[i].buffer);
-        }
-        mZslQueue.replaceAt(i);
+    if (NO_STREAM != mZslStreamId) {
+        // clear result metadata list first.
+        clearZslResultQueueLocked();
+        return clearInputRingBufferLocked(&mLatestClearedBufferTimestamp);
     }
-    mZslQueueHead = 0;
-    mZslQueueTail = 0;
     return OK;
+}
+
+void ZslProcessor::clearZslResultQueueLocked() {
+    mFrameList.clear();
+    mFrameListHead = 0;
+    mFrameList.insertAt(0, mFrameListDepth);
 }
 
 void ZslProcessor::dump(int fd, const Vector<String16>& /*args*/) const {
@@ -411,128 +688,18 @@ void ZslProcessor::dump(int fd, const Vector<String16>& /*args*/) const {
 }
 
 bool ZslProcessor::threadLoop() {
-    status_t res;
-
-    {
-        Mutex::Autolock l(mInputMutex);
-        while (!mZslBufferAvailable) {
-            res = mZslBufferAvailableSignal.waitRelative(mInputMutex,
-                    kWaitDuration);
-            if (res == TIMED_OUT) return true;
-        }
-        mZslBufferAvailable = false;
-    }
-
-    do {
-        res = processNewZslBuffer();
-    } while (res == OK);
-
-    return true;
-}
-
-status_t ZslProcessor::processNewZslBuffer() {
-    ATRACE_CALL();
-    status_t res;
-    sp<BufferItemConsumer> zslConsumer;
-    {
-        Mutex::Autolock l(mInputMutex);
-        if (mZslConsumer == 0) return OK;
-        zslConsumer = mZslConsumer;
-    }
-    ALOGVV("Trying to get next buffer");
-    BufferItem item;
-    res = zslConsumer->acquireBuffer(&item, 0);
-    if (res != OK) {
-        if (res != BufferItemConsumer::NO_BUFFER_AVAILABLE) {
-            ALOGE("%s: Camera %d: Error receiving ZSL image buffer: "
-                    "%s (%d)", __FUNCTION__,
-                    mId, strerror(-res), res);
-        } else {
-            ALOGVV("  No buffer");
-        }
-        return res;
-    }
-
     Mutex::Autolock l(mInputMutex);
 
-    if (mState == LOCKED) {
-        ALOGVV("In capture, discarding new ZSL buffers");
-        zslConsumer->releaseBuffer(item);
-        return OK;
+    if (mBuffersToDetach == 0) {
+        status_t res = mBuffersToDetachSignal.waitRelative(mInputMutex, kWaitDuration);
+        if (res == TIMED_OUT) return true;
+    }
+    while (mBuffersToDetach > 0) {
+        doNotifyInputReleasedLocked();
+        mBuffersToDetach--;
     }
 
-    ALOGVV("Got ZSL buffer: head: %d, tail: %d", mZslQueueHead, mZslQueueTail);
-
-    if ( (mZslQueueHead + 1) % kZslBufferDepth == mZslQueueTail) {
-        ALOGVV("Releasing oldest buffer");
-        zslConsumer->releaseBuffer(mZslQueue[mZslQueueTail].buffer);
-        mZslQueue.replaceAt(mZslQueueTail);
-        mZslQueueTail = (mZslQueueTail + 1) % kZslBufferDepth;
-    }
-
-    ZslPair &queueHead = mZslQueue.editItemAt(mZslQueueHead);
-
-    queueHead.buffer = item;
-    queueHead.frame.release();
-
-    mZslQueueHead = (mZslQueueHead + 1) % kZslBufferDepth;
-
-    ALOGVV("  Acquired buffer, timestamp %" PRId64, queueHead.buffer.mTimestamp);
-
-    findMatchesLocked();
-
-    return OK;
-}
-
-void ZslProcessor::findMatchesLocked() {
-    ALOGVV("Scanning");
-    for (size_t i = 0; i < mZslQueue.size(); i++) {
-        ZslPair &queueEntry = mZslQueue.editItemAt(i);
-        nsecs_t bufferTimestamp = queueEntry.buffer.mTimestamp;
-        IF_ALOGV() {
-            camera_metadata_entry_t entry;
-            nsecs_t frameTimestamp = 0;
-            if (!queueEntry.frame.isEmpty()) {
-                entry = queueEntry.frame.find(ANDROID_SENSOR_TIMESTAMP);
-                frameTimestamp = entry.data.i64[0];
-            }
-            ALOGVV("   %d: b: %" PRId64 "\tf: %" PRId64, i,
-                    bufferTimestamp, frameTimestamp );
-        }
-        if (queueEntry.frame.isEmpty() && bufferTimestamp != 0) {
-            // Have buffer, no matching frame. Look for one
-            for (size_t j = 0; j < mFrameList.size(); j++) {
-                bool match = false;
-                CameraMetadata &frame = mFrameList.editItemAt(j);
-                if (!frame.isEmpty()) {
-                    camera_metadata_entry_t entry;
-                    entry = frame.find(ANDROID_SENSOR_TIMESTAMP);
-                    if (entry.count == 0) {
-                        ALOGE("%s: Can't find timestamp in frame!",
-                                __FUNCTION__);
-                        continue;
-                    }
-                    nsecs_t frameTimestamp = entry.data.i64[0];
-                    if (bufferTimestamp == frameTimestamp) {
-                        ALOGVV("%s: Found match %" PRId64, __FUNCTION__,
-                                frameTimestamp);
-                        match = true;
-                    } else {
-                        int64_t delta = abs(bufferTimestamp - frameTimestamp);
-                        if ( delta < 1000000) {
-                            ALOGVV("%s: Found close match %" PRId64 " (delta %" PRId64 ")",
-                                    __FUNCTION__, bufferTimestamp, delta);
-                            match = true;
-                        }
-                    }
-                }
-                if (match) {
-                    queueEntry.frame.acquire(frame);
-                    break;
-                }
-            }
-        }
-    }
+    return true;
 }
 
 void ZslProcessor::dumpZslQueue(int fd) const {
@@ -565,6 +732,130 @@ void ZslProcessor::dumpZslQueue(int fd) const {
         }
 
     }
+}
+
+bool ZslProcessor::isFixedFocusMode(uint8_t afMode) const {
+    switch (afMode) {
+        case ANDROID_CONTROL_AF_MODE_AUTO:
+        case ANDROID_CONTROL_AF_MODE_CONTINUOUS_VIDEO:
+        case ANDROID_CONTROL_AF_MODE_CONTINUOUS_PICTURE:
+        case ANDROID_CONTROL_AF_MODE_MACRO:
+            return false;
+            break;
+        case ANDROID_CONTROL_AF_MODE_OFF:
+        case ANDROID_CONTROL_AF_MODE_EDOF:
+            return true;
+        default:
+            ALOGE("%s: unknown focus mode %d", __FUNCTION__, afMode);
+            return false;
+    }
+}
+
+nsecs_t ZslProcessor::getCandidateTimestampLocked(size_t* metadataIdx) const {
+    /**
+     * Find the smallest timestamp we know about so far
+     * - ensure that aeState is either converged or locked
+     */
+
+    size_t idx = 0;
+    nsecs_t minTimestamp = -1;
+
+    size_t emptyCount = mFrameList.size();
+
+    for (size_t j = 0; j < mFrameList.size(); j++) {
+        const CameraMetadata &frame = mFrameList[j];
+        if (!frame.isEmpty()) {
+
+            emptyCount--;
+
+            camera_metadata_ro_entry_t entry;
+            entry = frame.find(ANDROID_SENSOR_TIMESTAMP);
+            if (entry.count == 0) {
+                ALOGE("%s: Can't find timestamp in frame!",
+                        __FUNCTION__);
+                continue;
+            }
+            nsecs_t frameTimestamp = entry.data.i64[0];
+            if (minTimestamp > frameTimestamp || minTimestamp == -1) {
+
+                entry = frame.find(ANDROID_CONTROL_AE_STATE);
+
+                if (entry.count == 0) {
+                    /**
+                     * This is most likely a HAL bug. The aeState field is
+                     * mandatory, so it should always be in a metadata packet.
+                     */
+                    ALOGW("%s: ZSL queue frame has no AE state field!",
+                            __FUNCTION__);
+                    continue;
+                }
+                if (entry.data.u8[0] != ANDROID_CONTROL_AE_STATE_CONVERGED &&
+                        entry.data.u8[0] != ANDROID_CONTROL_AE_STATE_LOCKED) {
+                    ALOGVV("%s: ZSL queue frame AE state is %d, need "
+                           "full capture",  __FUNCTION__, entry.data.u8[0]);
+                    continue;
+                }
+
+                entry = frame.find(ANDROID_CONTROL_AF_MODE);
+                if (entry.count == 0) {
+                    ALOGW("%s: ZSL queue frame has no AF mode field!",
+                            __FUNCTION__);
+                    continue;
+                }
+                // Check AF state if device has focuser and focus mode isn't fixed
+                if (mHasFocuser) {
+                    uint8_t afMode = entry.data.u8[0];
+                    if (!isFixedFocusMode(afMode)) {
+                        // Make sure the candidate frame has good focus.
+                        entry = frame.find(ANDROID_CONTROL_AF_STATE);
+                        if (entry.count == 0) {
+                            ALOGW("%s: ZSL queue frame has no AF state field!",
+                                    __FUNCTION__);
+                            continue;
+                        }
+                        uint8_t afState = entry.data.u8[0];
+                        if (afState != ANDROID_CONTROL_AF_STATE_PASSIVE_FOCUSED &&
+                                afState != ANDROID_CONTROL_AF_STATE_FOCUSED_LOCKED &&
+                                afState != ANDROID_CONTROL_AF_STATE_NOT_FOCUSED_LOCKED) {
+                            ALOGVV("%s: ZSL queue frame AF state is %d is not good for capture,"
+                                    " skip it", __FUNCTION__, afState);
+                            continue;
+                        }
+                    }
+                }
+
+                minTimestamp = frameTimestamp;
+                idx = j;
+            }
+
+            ALOGVV("%s: Saw timestamp %" PRId64, __FUNCTION__, frameTimestamp);
+        }
+    }
+
+    if (emptyCount == mFrameList.size()) {
+        /**
+         * This could be mildly bad and means our ZSL was triggered before
+         * there were any frames yet received by the camera framework.
+         *
+         * This is a fairly corner case which can happen under:
+         * + a user presses the shutter button real fast when the camera starts
+         *     (startPreview followed immediately by takePicture).
+         * + burst capture case (hitting shutter button as fast possible)
+         *
+         * If this happens in steady case (preview running for a while, call
+         *     a single takePicture) then this might be a fwk bug.
+         */
+        ALOGW("%s: ZSL queue has no metadata frames", __FUNCTION__);
+    }
+
+    ALOGV("%s: Candidate timestamp %" PRId64 " (idx %zu), empty frames: %zu",
+          __FUNCTION__, minTimestamp, idx, emptyCount);
+
+    if (metadataIdx) {
+        *metadataIdx = idx;
+    }
+
+    return minTimestamp;
 }
 
 }; // namespace camera2

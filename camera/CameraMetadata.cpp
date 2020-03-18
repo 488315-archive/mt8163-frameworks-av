@@ -20,8 +20,8 @@
 #include <utils/Log.h>
 #include <utils/Errors.h>
 
-#include <camera/CameraMetadata.h>
 #include <binder/Parcel.h>
+#include <camera/CameraMetadata.h>
 
 namespace android {
 
@@ -79,7 +79,7 @@ const camera_metadata_t* CameraMetadata::getAndLock() const {
     return mBuffer;
 }
 
-status_t CameraMetadata::unlock(const camera_metadata_t *buffer) {
+status_t CameraMetadata::unlock(const camera_metadata_t *buffer) const {
     if (!mLocked) {
         ALOGE("%s: Can't unlock a non-locked CameraMetadata!", __FUNCTION__);
         return INVALID_OPERATION;
@@ -169,7 +169,7 @@ status_t CameraMetadata::sort() {
 }
 
 status_t CameraMetadata::checkType(uint32_t tag, uint8_t expectedType) {
-    int tagType = get_camera_metadata_tag_type(tag);
+    int tagType = get_local_camera_metadata_tag_type(tag, mBuffer);
     if ( CC_UNLIKELY(tagType == -1)) {
         ALOGE("Update metadata entry: Unknown tag %d", tag);
         return INVALID_OPERATION;
@@ -177,7 +177,7 @@ status_t CameraMetadata::checkType(uint32_t tag, uint8_t expectedType) {
     if ( CC_UNLIKELY(tagType != expectedType) ) {
         ALOGE("Mismatched tag type when updating entry %s (%d) of type %s; "
                 "got type %s data instead ",
-                get_camera_metadata_tag_name(tag), tag,
+                get_local_camera_metadata_tag_name(tag, mBuffer), tag,
                 camera_metadata_type_names[tagType],
                 camera_metadata_type_names[expectedType]);
         return INVALID_OPERATION;
@@ -277,6 +277,18 @@ status_t CameraMetadata::update(uint32_t tag,
     return updateImpl(tag, (const void*)string.string(), string.size() + 1);
 }
 
+status_t CameraMetadata::update(const camera_metadata_ro_entry &entry) {
+    status_t res;
+    if (mLocked) {
+        ALOGE("%s: CameraMetadata is locked", __FUNCTION__);
+        return INVALID_OPERATION;
+    }
+    if ( (res = checkType(entry.tag, entry.type)) != OK) {
+        return res;
+    }
+    return updateImpl(entry.tag, (const void*)entry.data.u8, entry.count);
+}
+
 status_t CameraMetadata::updateImpl(uint32_t tag, const void *data,
         size_t data_count) {
     status_t res;
@@ -284,7 +296,7 @@ status_t CameraMetadata::updateImpl(uint32_t tag, const void *data,
         ALOGE("%s: CameraMetadata is locked", __FUNCTION__);
         return INVALID_OPERATION;
     }
-    int type = get_camera_metadata_tag_type(tag);
+    int type = get_local_camera_metadata_tag_type(tag, mBuffer);
     if (type == -1) {
         ALOGE("%s: Tag %d not found", __FUNCTION__, tag);
         return BAD_VALUE;
@@ -319,8 +331,9 @@ status_t CameraMetadata::updateImpl(uint32_t tag, const void *data,
 
     if (res != OK) {
         ALOGE("%s: Unable to update metadata entry %s.%s (%x): %s (%d)",
-                __FUNCTION__, get_camera_metadata_section_name(tag),
-                get_camera_metadata_tag_name(tag), tag, strerror(-res), res);
+                __FUNCTION__, get_local_camera_metadata_section_name(tag, mBuffer),
+                get_local_camera_metadata_tag_name(tag, mBuffer), tag,
+                strerror(-res), res);
     }
 
     IF_ALOGV() {
@@ -379,18 +392,93 @@ status_t CameraMetadata::erase(uint32_t tag) {
     } else if (res != OK) {
         ALOGE("%s: Error looking for entry %s.%s (%x): %s %d",
                 __FUNCTION__,
-                get_camera_metadata_section_name(tag),
-                get_camera_metadata_tag_name(tag), tag, strerror(-res), res);
+                get_local_camera_metadata_section_name(tag, mBuffer),
+                get_local_camera_metadata_tag_name(tag, mBuffer),
+                tag, strerror(-res), res);
         return res;
     }
     res = delete_camera_metadata_entry(mBuffer, entry.index);
     if (res != OK) {
         ALOGE("%s: Error deleting entry %s.%s (%x): %s %d",
                 __FUNCTION__,
-                get_camera_metadata_section_name(tag),
-                get_camera_metadata_tag_name(tag), tag, strerror(-res), res);
+                get_local_camera_metadata_section_name(tag, mBuffer),
+                get_local_camera_metadata_tag_name(tag, mBuffer),
+                tag, strerror(-res), res);
     }
     return res;
+}
+
+status_t CameraMetadata::removePermissionEntries(metadata_vendor_id_t vendorId,
+        std::vector<int32_t> *tagsRemoved) {
+    uint32_t tagCount = 0;
+    std::vector<uint32_t> tagsToRemove;
+
+    if (tagsRemoved == nullptr) {
+        return BAD_VALUE;
+    }
+
+    sp<VendorTagDescriptor> vTags = VendorTagDescriptor::getGlobalVendorTagDescriptor();
+    if ((nullptr == vTags.get()) || (0 >= vTags->getTagCount())) {
+        sp<VendorTagDescriptorCache> cache =
+            VendorTagDescriptorCache::getGlobalVendorTagCache();
+        if (cache.get()) {
+            cache->getVendorTagDescriptor(vendorId, &vTags);
+        }
+    }
+
+    if ((nullptr != vTags.get()) && (vTags->getTagCount() > 0)) {
+        tagCount = vTags->getTagCount();
+        uint32_t *vendorTags = new uint32_t[tagCount];
+        if (nullptr == vendorTags) {
+            return NO_MEMORY;
+        }
+        vTags->getTagArray(vendorTags);
+
+        tagsToRemove.reserve(tagCount);
+        tagsToRemove.insert(tagsToRemove.begin(), vendorTags, vendorTags + tagCount);
+
+        delete [] vendorTags;
+        tagCount = 0;
+    }
+
+    auto tagsNeedingPermission = get_camera_metadata_permission_needed(&tagCount);
+    if (tagCount > 0) {
+        tagsToRemove.reserve(tagsToRemove.capacity() + tagCount);
+        tagsToRemove.insert(tagsToRemove.end(), tagsNeedingPermission,
+                tagsNeedingPermission + tagCount);
+    }
+
+    tagsRemoved->reserve(tagsToRemove.size());
+    for (const auto &it : tagsToRemove) {
+        if (exists(it)) {
+            auto rc = erase(it);
+            if (NO_ERROR != rc) {
+                ALOGE("%s: Failed to erase tag: %x", __func__, it);
+                return rc;
+            }
+            tagsRemoved->push_back(it);
+        }
+    }
+
+    // Update the available characterstics accordingly
+    if (exists(ANDROID_REQUEST_AVAILABLE_CHARACTERISTICS_KEYS)) {
+        std::vector<uint32_t> currentKeys;
+
+        std::sort(tagsRemoved->begin(), tagsRemoved->end());
+        auto keys = find(ANDROID_REQUEST_AVAILABLE_CHARACTERISTICS_KEYS);
+        currentKeys.reserve(keys.count);
+        currentKeys.insert(currentKeys.end(), keys.data.i32, keys.data.i32 + keys.count);
+        std::sort(currentKeys.begin(), currentKeys.end());
+
+        std::vector<int32_t> newKeys(keys.count);
+        auto end = std::set_difference(currentKeys.begin(), currentKeys.end(), tagsRemoved->begin(),
+                tagsRemoved->end(), newKeys.begin());
+        newKeys.resize(end - newKeys.begin());
+
+        update(ANDROID_REQUEST_AVAILABLE_CHARACTERISTICS_KEYS, newKeys.data(), newKeys.size());
+    }
+
+    return NO_ERROR;
 }
 
 void CameraMetadata::dump(int fd, int verbosity, int indentation) const {
@@ -621,7 +709,7 @@ status_t CameraMetadata::writeToParcel(Parcel& data,
     return res;
 }
 
-status_t CameraMetadata::readFromParcel(Parcel *parcel) {
+status_t CameraMetadata::readFromParcel(const Parcel *parcel) {
 
     ALOGV("%s: parcel = %p", __FUNCTION__, parcel);
 
@@ -680,5 +768,100 @@ void CameraMetadata::swap(CameraMetadata& other) {
     other.mBuffer = thisBuf;
     mBuffer = otherBuf;
 }
+
+status_t CameraMetadata::getTagFromName(const char *name,
+        const VendorTagDescriptor* vTags, uint32_t *tag) {
+
+    if (name == nullptr || tag == nullptr) return BAD_VALUE;
+
+    size_t nameLength = strlen(name);
+
+    const SortedVector<String8> *vendorSections;
+    size_t vendorSectionCount = 0;
+
+    if (vTags != NULL) {
+        vendorSections = vTags->getAllSectionNames();
+        vendorSectionCount = vendorSections->size();
+    }
+
+    // First, find the section by the longest string match
+    const char *section = NULL;
+    size_t sectionIndex = 0;
+    size_t sectionLength = 0;
+    size_t totalSectionCount = ANDROID_SECTION_COUNT + vendorSectionCount;
+    for (size_t i = 0; i < totalSectionCount; ++i) {
+
+        const char *str = (i < ANDROID_SECTION_COUNT) ? camera_metadata_section_names[i] :
+                (*vendorSections)[i - ANDROID_SECTION_COUNT].string();
+
+        ALOGV("%s: Trying to match against section '%s'", __FUNCTION__, str);
+
+        if (strstr(name, str) == name) { // name begins with the section name
+            size_t strLength = strlen(str);
+
+            ALOGV("%s: Name begins with section name", __FUNCTION__);
+
+            // section name is the longest we've found so far
+            if (section == NULL || sectionLength < strLength) {
+                section = str;
+                sectionIndex = i;
+                sectionLength = strLength;
+
+                ALOGV("%s: Found new best section (%s)", __FUNCTION__, section);
+            }
+        }
+    }
+
+    // TODO: Make above get_camera_metadata_section_from_name ?
+
+    if (section == NULL) {
+        return NAME_NOT_FOUND;
+    } else {
+        ALOGV("%s: Found matched section '%s' (%zu)",
+              __FUNCTION__, section, sectionIndex);
+    }
+
+    // Get the tag name component of the name
+    const char *nameTagName = name + sectionLength + 1; // x.y.z -> z
+    if (sectionLength + 1 >= nameLength) {
+        return BAD_VALUE;
+    }
+
+    // Match rest of name against the tag names in that section only
+    uint32_t candidateTag = 0;
+    if (sectionIndex < ANDROID_SECTION_COUNT) {
+        // Match built-in tags (typically android.*)
+        uint32_t tagBegin, tagEnd; // [tagBegin, tagEnd)
+        tagBegin = camera_metadata_section_bounds[sectionIndex][0];
+        tagEnd = camera_metadata_section_bounds[sectionIndex][1];
+
+        for (candidateTag = tagBegin; candidateTag < tagEnd; ++candidateTag) {
+            const char *tagName = get_camera_metadata_tag_name(candidateTag);
+
+            if (strcmp(nameTagName, tagName) == 0) {
+                ALOGV("%s: Found matched tag '%s' (%d)",
+                      __FUNCTION__, tagName, candidateTag);
+                break;
+            }
+        }
+
+        if (candidateTag == tagEnd) {
+            return NAME_NOT_FOUND;
+        }
+    } else if (vTags != NULL) {
+        // Match vendor tags (typically com.*)
+        const String8 sectionName(section);
+        const String8 tagName(nameTagName);
+
+        status_t res = OK;
+        if ((res = vTags->lookupTag(tagName, sectionName, &candidateTag)) != OK) {
+            return NAME_NOT_FOUND;
+        }
+    }
+
+    *tag = candidateTag;
+    return OK;
+}
+
 
 }; // namespace android

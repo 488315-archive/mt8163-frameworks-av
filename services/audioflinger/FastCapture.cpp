@@ -20,6 +20,7 @@
 #define ATRACE_TAG ATRACE_TAG_AUDIO
 
 #include "Configuration.h"
+#include <audio_utils/format.h>
 #include <linux/futex.h>
 #include <sys/syscall.h>
 #include <media/AudioBufferProvider.h>
@@ -27,15 +28,15 @@
 #include <utils/Trace.h>
 #include "FastCapture.h"
 
-#ifdef MTK_AUDIO
-#include <audio_utils/pulse.h>
-#endif
+#if defined(MTK_LATENCY_DETECT_PULSE)
+#include "AudioDetectPulse.h"
+#endif // MTK_LATENCY_DETECT_PULSE
 
 namespace android {
 
 /*static*/ const FastCaptureState FastCapture::sInitial;
 
-FastCapture::FastCapture() : FastThread(),
+FastCapture::FastCapture() : FastThread("cycleC_ms", "loadC_us"),
     mInputSource(NULL), mInputSourceGen(0), mPipeSink(NULL), mPipeSinkGen(0),
     mReadBuffer(NULL), mReadBufferState(-1), mFormat(Format_Invalid), mSampleRate(0),
     // mDummyDumpState
@@ -61,7 +62,7 @@ const FastThreadState *FastCapture::poll()
     return mSQ.poll();
 }
 
-void FastCapture::setLog(NBLog::Writer *logWriter __unused)
+void FastCapture::setNBLogWriter(NBLog::Writer *logWriter __unused)
 {
 }
 
@@ -108,8 +109,10 @@ void FastCapture::onStateChange()
         } else {
             mFormat = mInputSource->format();
             mSampleRate = Format_sampleRate(mFormat);
+#if !LOG_NDEBUG
             unsigned channelCount = Format_channelCount(mFormat);
             ALOG_ASSERT(channelCount >= 1 && channelCount <= FCC_8);
+#endif
         }
         dumpState->mSampleRate = mSampleRate;
         eitherChanged = true;
@@ -135,7 +138,9 @@ void FastCapture::onStateChange()
             // FIXME new may block for unbounded time at internal mutex of the heap
             //       implementation; it would be better to have normal capture thread allocate for
             //       us to avoid blocking here and to prevent possible priority inversion
-            (void)posix_memalign(&mReadBuffer, 32, frameCount * Format_frameSize(mFormat));
+            size_t bufferSize = frameCount * Format_frameSize(mFormat);
+            (void)posix_memalign(&mReadBuffer, 32, bufferSize);
+            memset(mReadBuffer, 0, bufferSize); // if posix_memalign fails, will segv here.
             mPeriodNs = (frameCount * 1000000000LL) / mSampleRate;      // 1.00
             mUnderrunNs = (frameCount * 1750000000LL) / mSampleRate;    // 1.75
             mOverrunNs = (frameCount * 500000000LL) / mSampleRate;      // 0.50
@@ -161,20 +166,37 @@ void FastCapture::onWork()
     const FastCaptureState * const current = (const FastCaptureState *) mCurrent;
     FastCaptureDumpState * const dumpState = (FastCaptureDumpState *) mDumpState;
     const FastCaptureState::Command command = mCommand;
-    const size_t frameCount = current->mFrameCount;
+    size_t frameCount = current->mFrameCount;
+    AudioBufferProvider* fastPatchRecordBufferProvider = current->mFastPatchRecordBufferProvider;
+    AudioBufferProvider::Buffer patchBuffer;
+
+    if (fastPatchRecordBufferProvider != 0) {
+        patchBuffer.frameCount = ~0;
+        status_t status = fastPatchRecordBufferProvider->getNextBuffer(&patchBuffer);
+        if (status != NO_ERROR) {
+            frameCount = 0;
+        } else if (patchBuffer.frameCount < frameCount) {
+            // TODO: Make sure that it doesn't cause any issues if we just get a small available
+            // buffer from the buffer provider.
+            frameCount = patchBuffer.frameCount;
+        }
+    }
 
     if ((command & FastCaptureState::READ) /*&& isWarm*/) {
         ALOG_ASSERT(mInputSource != NULL);
         ALOG_ASSERT(mReadBuffer != NULL);
         dumpState->mReadSequence++;
         ATRACE_BEGIN("read");
-        ssize_t framesRead = mInputSource->read(mReadBuffer, frameCount,
-                AudioBufferProvider::kInvalidPTS);
+        ssize_t framesRead = mInputSource->read(mReadBuffer, frameCount);
         ATRACE_END();
 
-#ifdef MTK_LATENCY_DETECT_PULSE
-        detectPulse(1, 800, 0, (void *)mReadBuffer, frameCount, mFormat.mFormat, Format_channelCount(mFormat), mSampleRate);
-#endif
+#if defined(MTK_LATENCY_DETECT_PULSE)
+        if (AudioDetectPulse::getDetectPulse()) {
+            AudioDetectPulse::doDetectPulse(TAG_FAST_CATTURE, 800, 0, (void *)mReadBuffer,
+                                            frameCount*Format_frameSize(mFormat),
+                                            mFormat.mFormat, Format_channelCount(mFormat), mSampleRate);
+        }
+#endif  // MTK_LATENCY_DETECT_PULSE
 
         dumpState->mReadSequence++;
         if (framesRead >= 0) {
@@ -182,6 +204,7 @@ void FastCapture::onWork()
             mTotalNativeFramesRead += framesRead;
             dumpState->mFramesRead = mTotalNativeFramesRead;
             mReadBufferState = framesRead;
+            patchBuffer.frameCount = framesRead;
         } else {
             dumpState->mReadErrors++;
             mReadBufferState = 0;
@@ -194,17 +217,23 @@ void FastCapture::onWork()
         ALOG_ASSERT(mPipeSink != NULL);
         ALOG_ASSERT(mReadBuffer != NULL);
         if (mReadBufferState < 0) {
-            unsigned channelCount = Format_channelCount(mFormat);
             memset(mReadBuffer, 0, frameCount * Format_frameSize(mFormat));
             mReadBufferState = frameCount;
         }
         if (mReadBufferState > 0) {
             ssize_t framesWritten = mPipeSink->write(mReadBuffer, mReadBufferState);
-            // FIXME This supports at most one fast capture client.
-            //       To handle multiple clients this could be converted to an array,
-            //       or with a lot more work the control block could be shared by all clients.
             audio_track_cblk_t* cblk = current->mCblk;
-            if (cblk != NULL && framesWritten > 0) {
+            if (fastPatchRecordBufferProvider != 0) {
+                // This indicates the fast track is a patch record, update the cblk by
+                // calling releaseBuffer().
+                memcpy_by_audio_format(patchBuffer.raw, current->mFastPatchRecordFormat,
+                        mReadBuffer, mFormat.mFormat, framesWritten * mFormat.mChannelCount);
+                patchBuffer.frameCount = framesWritten;
+                fastPatchRecordBufferProvider->releaseBuffer(&patchBuffer);
+            } else if (cblk != NULL && framesWritten > 0) {
+                // FIXME This supports at most one fast capture client.
+                //       To handle multiple clients this could be converted to an array,
+                //       or with a lot more work the control block could be shared by all clients.
                 int32_t rear = cblk->u.mStreaming.mRear;
                 android_atomic_release_store(framesWritten + rear, &cblk->u.mStreaming.mRear);
                 cblk->mServer += framesWritten;

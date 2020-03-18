@@ -50,7 +50,7 @@ SoftAMRWBEncoder::SoftAMRWBEncoder(
       mBitRate(0),
       mMode(VOAMRWB_MD66),
       mInputSize(0),
-      mInputTimeUs(-1ll),
+      mInputTimeUs(-1LL),
       mSawInputEOS(false),
       mSignalledError(false) {
     initPorts();
@@ -59,7 +59,7 @@ SoftAMRWBEncoder::SoftAMRWBEncoder(
 
 SoftAMRWBEncoder::~SoftAMRWBEncoder() {
     if (mEncoderHandle != NULL) {
-        CHECK_EQ(VO_ERR_NONE, mApiHandle->Uninit(mEncoderHandle));
+        CHECK_EQ((VO_U32)VO_ERR_NONE, mApiHandle->Uninit(mEncoderHandle));
         mEncoderHandle = NULL;
     }
 
@@ -264,10 +264,6 @@ OMX_ERRORTYPE SoftAMRWBEncoder::internalSetParameter(
                 return OMX_ErrorUndefined;
             }
 
-            if (formatParams->nIndex > 0) {
-                return OMX_ErrorNoMore;
-            }
-
             if ((formatParams->nPortIndex == 0
                         && formatParams->eEncoding != OMX_AUDIO_CodingPCM)
                 || (formatParams->nPortIndex == 1
@@ -391,7 +387,7 @@ void SoftAMRWBEncoder::onQueueFilled(OMX_U32 /* portIndex */) {
             // "Time" on the input buffer has in effect advanced by the
             // number of audio frames we just advanced nOffset by.
             inHeader->nTimeStamp +=
-                (copy * 1000000ll / kSampleRate) / sizeof(int16_t);
+                (copy * 1000000LL / kSampleRate) / sizeof(int16_t);
 
             if (inHeader->nFilledLen == 0) {
                 if (inHeader->nFlags & OMX_BUFFERFLAG_EOS) {
@@ -435,7 +431,7 @@ void SoftAMRWBEncoder::onQueueFilled(OMX_U32 /* portIndex */) {
         inputData.Buffer = (unsigned char *) mInputFrame;
         inputData.Length = mInputSize;
 
-        CHECK_EQ(VO_ERR_NONE,
+        CHECK_EQ((VO_U32)VO_ERR_NONE,
                  mApiHandle->SetInputData(mEncoderHandle, &inputData));
 
         VO_CODECBUFFER outputData;

@@ -25,6 +25,7 @@
 #include <gui/CpuConsumer.h>
 
 #include "camera/CameraMetadata.h"
+#include "device3/Camera3StreamBufferListener.h"
 
 namespace android {
 
@@ -35,7 +36,7 @@ class MemoryHeapBase;
 namespace camera2 {
 
 class CaptureSequencer;
-class Parameters;
+struct Parameters;
 
 /***
  * Still image capture output image processing
@@ -54,6 +55,9 @@ class JpegProcessor:
     int getStreamId() const;
 
     void dump(int fd, const Vector<String16>& args) const;
+
+    static size_t findJpegSize(uint8_t* jpegBuffer, size_t maxSize);
+
   private:
     static const nsecs_t kWaitDuration = 10000000; // 10 ms
     wp<CameraDeviceBase> mDevice;
@@ -61,8 +65,9 @@ class JpegProcessor:
     int mId;
 
     mutable Mutex mInputMutex;
-    bool mCaptureAvailable;
-    Condition mCaptureAvailableSignal;
+    bool mCaptureDone;
+    bool mCaptureSuccess;
+    Condition mCaptureDoneSignal;
 
     enum {
         NO_STREAM = -1
@@ -75,8 +80,7 @@ class JpegProcessor:
 
     virtual bool threadLoop();
 
-    status_t processNewCapture();
-    size_t findJpegSize(uint8_t* jpegBuffer, size_t maxSize);
+    status_t processNewCapture(bool captureSuccess);
 
 };
 

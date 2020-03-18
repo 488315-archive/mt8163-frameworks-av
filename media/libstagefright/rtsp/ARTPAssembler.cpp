@@ -1,10 +1,4 @@
 /*
-* Copyright (C) 2014 MediaTek Inc.
-* Modification based on code covered by the mentioned copyright
-* and/or permission notice(s).
-*/
-
-/*
  * Copyright (C) 2010 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -33,41 +27,16 @@ namespace android {
 
 ARTPAssembler::ARTPAssembler()
     : mFirstFailureTimeUs(-1) {
-#ifdef MTK_AOSP_ENHANCEMENT
-    mbFlush = false;
-#endif // #ifdef MTK_AOSP_ENHANCEMENT
-
 }
 
 void ARTPAssembler::onPacketReceived(const sp<ARTPSource> &source) {
-#ifdef MTK_AOSP_ENHANCEMENT
-    if (mbFlush)
-        ALOGW("flush packet from ARTPSource to APacketSource");
-#endif // #ifdef MTK_AOSP_ENHANCEMENT
     AssemblyStatus status;
     for (;;) {
         status = assembleMore(source);
 
-#ifdef MTK_AOSP_ENHANCEMENT
-        if (status == WRONG_SEQUENCE_NUMBER || status == LARGE_SEQUENCE_GAP)
-#else
-        if (status == WRONG_SEQUENCE_NUMBER)
-#endif // #ifdef MTK_AOSP_ENHANCEMENT
-        {
-#ifdef MTK_AOSP_ENHANCEMENT
-            if (mbFlush || status == LARGE_SEQUENCE_GAP) {
-                mFirstFailureTimeUs = -1;
-                packetLost();
-                continue;
-            }
-#endif // #ifdef MTK_AOSP_ENHANCEMENT
+        if (status == WRONG_SEQUENCE_NUMBER) {
             if (mFirstFailureTimeUs >= 0) {
-#ifdef MTK_AOSP_ENHANCEMENT
-                if (ALooper::GetNowUs() - mFirstFailureTimeUs > 100000ll)
-#else
-                if (ALooper::GetNowUs() - mFirstFailureTimeUs > 10000ll)
-#endif
-                {
+                if (ALooper::GetNowUs() - mFirstFailureTimeUs > 10000LL) {
                     mFirstFailureTimeUs = -1;
 
                     // LOG(VERBOSE) << "waited too long for packet.";
@@ -86,10 +55,6 @@ void ARTPAssembler::onPacketReceived(const sp<ARTPSource> &source) {
             }
         }
     }
-#ifdef MTK_AOSP_ENHANCEMENT
-    mbFlush = false;
-#endif
-
 }
 
 // static
@@ -176,14 +141,4 @@ sp<ABuffer> ARTPAssembler::MakeCompoundFromPackets(
     return accessUnit;
 }
 
-#ifdef MTK_AOSP_ENHANCEMENT
-void ARTPAssembler::setFlush(bool flush) {
-    mbFlush = flush;
-}
-
-void ARTPAssembler::updatePacketReceived(const sp<ARTPSource> &source,
-        const sp<ABuffer> &buffer) {
-    evaluateDuration(source, buffer);
-}
-#endif // #ifdef MTK_AOSP_ENHANCEMENT
 }  // namespace android

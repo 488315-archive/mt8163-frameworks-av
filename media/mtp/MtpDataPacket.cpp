@@ -16,18 +16,39 @@
 
 #define LOG_TAG "MtpDataPacket"
 
+#include "MtpDataPacket.h"
+
+#include <algorithm>
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <sys/types.h>
-#include <fcntl.h>
-
 #include <usbhost/usbhost.h>
-
-#include "MtpDataPacket.h"
 #include "MtpStringBuffer.h"
-
-#define MTP_BUFFER_SIZE 16384
+#include "IMtpHandle.h"
 
 namespace android {
+
+namespace {
+// Reads the exact |count| bytes from |fd| to |buf|.
+// Returns |count| if it succeed to read the bytes. Otherwise returns -1. If it reaches EOF, the
+// function regards it as an error.
+ssize_t readExactBytes(int fd, void* buf, size_t count) {
+    if (count > SSIZE_MAX) {
+        return -1;
+    }
+    size_t read_count = 0;
+    while (read_count < count) {
+        int result = read(fd, static_cast<int8_t*>(buf) + read_count, count - read_count);
+        // Assume that EOF is error.
+        if (result <= 0) {
+            return -1;
+        }
+        read_count += result;
+    }
+    return read_count == count ? count : -1;
+}
+}  // namespace
 
 MtpDataPacket::MtpDataPacket()
     :   MtpPacket(MTP_BUFFER_SIZE),   // MAX_USBFS_BUFFER_SIZE
@@ -109,7 +130,7 @@ Int8List* MtpDataPacket::getAInt8() {
             delete result;
             return NULL;
         }
-        result->push(value);
+        result->push_back(value);
     }
     return result;
 }
@@ -125,7 +146,7 @@ UInt8List* MtpDataPacket::getAUInt8() {
             delete result;
             return NULL;
         }
-        result->push(value);
+        result->push_back(value);
     }
     return result;
 }
@@ -141,7 +162,7 @@ Int16List* MtpDataPacket::getAInt16() {
             delete result;
             return NULL;
         }
-        result->push(value);
+        result->push_back(value);
     }
     return result;
 }
@@ -157,7 +178,7 @@ UInt16List* MtpDataPacket::getAUInt16() {
             delete result;
             return NULL;
         }
-        result->push(value);
+        result->push_back(value);
     }
     return result;
 }
@@ -173,7 +194,7 @@ Int32List* MtpDataPacket::getAInt32() {
             delete result;
             return NULL;
         }
-        result->push(value);
+        result->push_back(value);
     }
     return result;
 }
@@ -189,7 +210,7 @@ UInt32List* MtpDataPacket::getAUInt32() {
             delete result;
             return NULL;
         }
-        result->push(value);
+        result->push_back(value);
     }
     return result;
 }
@@ -205,7 +226,7 @@ Int64List* MtpDataPacket::getAInt64() {
             delete result;
             return NULL;
         }
-        result->push(value);
+        result->push_back(value);
     }
     return result;
 }
@@ -221,7 +242,7 @@ UInt64List* MtpDataPacket::getAUInt64() {
             delete result;
             return NULL;
         }
-        result->push(value);
+        result->push_back(value);
     }
     return result;
 }
@@ -419,9 +440,9 @@ void MtpDataPacket::putString(const uint16_t* string) {
         putUInt16(0);
 }
 
-#ifdef MTP_DEVICE 
-int MtpDataPacket::read(int fd) {
-    int ret = ::read(fd, mBuffer, MTP_BUFFER_SIZE);
+#ifdef MTP_DEVICE
+int MtpDataPacket::read(IMtpHandle *h) {
+    int ret = h->read(mBuffer, MTP_BUFFER_SIZE);
     if (ret < MTP_CONTAINER_HEADER_SIZE)
         return -1;
     mPacketSize = ret;
@@ -429,20 +450,20 @@ int MtpDataPacket::read(int fd) {
     return ret;
 }
 
-int MtpDataPacket::write(int fd) {
+int MtpDataPacket::write(IMtpHandle *h) {
     MtpPacket::putUInt32(MTP_CONTAINER_LENGTH_OFFSET, mPacketSize);
     MtpPacket::putUInt16(MTP_CONTAINER_TYPE_OFFSET, MTP_CONTAINER_TYPE_DATA);
-    int ret = ::write(fd, mBuffer, mPacketSize);
+    int ret = h->write(mBuffer, mPacketSize);
     return (ret < 0 ? ret : 0);
 }
 
-int MtpDataPacket::writeData(int fd, void* data, uint32_t length) {
+int MtpDataPacket::writeData(IMtpHandle *h, void* data, uint32_t length) {
     allocate(length + MTP_CONTAINER_HEADER_SIZE);
     memcpy(mBuffer + MTP_CONTAINER_HEADER_SIZE, data, length);
     length += MTP_CONTAINER_HEADER_SIZE;
     MtpPacket::putUInt32(MTP_CONTAINER_LENGTH_OFFSET, length);
     MtpPacket::putUInt16(MTP_CONTAINER_TYPE_OFFSET, MTP_CONTAINER_TYPE_DATA);
-    int ret = ::write(fd, mBuffer, length);
+    int ret = h->write(mBuffer, length);
     return (ret < 0 ? ret : 0);
 }
 
@@ -458,7 +479,7 @@ int MtpDataPacket::read(struct usb_request *request) {
         // look at the length field to see if the data spans multiple packets
         uint32_t totalLength = MtpPacket::getUInt32(MTP_CONTAINER_LENGTH_OFFSET);
         allocate(totalLength);
-        while (totalLength > length) {
+        while (totalLength > static_cast<uint32_t>(length)) {
             request->buffer = mBuffer + length;
             request->buffer_length = totalLength - length;
             int ret = transfer(request);
@@ -500,7 +521,7 @@ int MtpDataPacket::readDataAsync(struct usb_request *req) {
 
 // Wait for result of readDataAsync
 int MtpDataPacket::readDataWait(struct usb_device *device) {
-    struct usb_request *req = usb_request_wait(device);
+    struct usb_request *req = usb_request_wait(device, -1);
     return (req ? req->actual_length : -1);
 }
 
@@ -513,51 +534,119 @@ int MtpDataPacket::readDataHeader(struct usb_request *request) {
     return length;
 }
 
-int MtpDataPacket::writeDataHeader(struct usb_request *request, uint32_t length) {
-    MtpPacket::putUInt32(MTP_CONTAINER_LENGTH_OFFSET, length);
-    MtpPacket::putUInt16(MTP_CONTAINER_TYPE_OFFSET, MTP_CONTAINER_TYPE_DATA);
-    request->buffer = mBuffer;
-    request->buffer_length = MTP_CONTAINER_HEADER_SIZE;
-    int ret = transfer(request);
-    return (ret < 0 ? ret : 0);
-}
+int MtpDataPacket::write(struct usb_request *request, UrbPacketDivisionMode divisionMode) {
+    if (mPacketSize < MTP_CONTAINER_HEADER_SIZE || mPacketSize > MTP_BUFFER_SIZE) {
+        ALOGE("Illegal packet size.");
+        return -1;
+    }
 
-int MtpDataPacket::write(struct usb_request *request) {
     MtpPacket::putUInt32(MTP_CONTAINER_LENGTH_OFFSET, mPacketSize);
     MtpPacket::putUInt16(MTP_CONTAINER_TYPE_OFFSET, MTP_CONTAINER_TYPE_DATA);
 
-    // send header separately from data
-    request->buffer = mBuffer;
-    request->buffer_length = MTP_CONTAINER_HEADER_SIZE;
-    int ret = transfer(request);
-    if (ret == MTP_CONTAINER_HEADER_SIZE) {
-        request->buffer = mBuffer + MTP_CONTAINER_HEADER_SIZE;
-        request->buffer_length = mPacketSize - MTP_CONTAINER_HEADER_SIZE;
-        ret = transfer(request);
+    size_t processedBytes = 0;
+    while (processedBytes < mPacketSize) {
+        const size_t write_size =
+                processedBytes == 0 && divisionMode == FIRST_PACKET_ONLY_HEADER ?
+                        MTP_CONTAINER_HEADER_SIZE : mPacketSize - processedBytes;
+        request->buffer = mBuffer + processedBytes;
+        request->buffer_length = write_size;
+        const int result = transfer(request);
+        if (result < 0) {
+            ALOGE("Failed to write bytes to the device.");
+            return -1;
+        }
+        processedBytes += result;
     }
-    return (ret < 0 ? ret : 0);
+
+    return processedBytes == mPacketSize ? processedBytes : -1;
 }
 
-int MtpDataPacket::write(struct usb_request *request, void* buffer, uint32_t length) {
-    request->buffer = buffer;
-    request->buffer_length = length;
-    int ret = transfer(request);
-    return (ret < 0 ? ret : 0);
+int64_t MtpDataPacket::write(struct usb_request *request,
+                         UrbPacketDivisionMode divisionMode,
+                         int fd,
+                         size_t payloadSize) {
+    // Obtain the greatest multiple of minimum packet size that is not greater than
+    // MTP_BUFFER_SIZE.
+    if (request->max_packet_size <= 0) {
+        ALOGE("Cannot determine bulk transfer size due to illegal max packet size %d.",
+              request->max_packet_size);
+        return -1;
+    }
+    const size_t maxBulkTransferSize =
+            MTP_BUFFER_SIZE - (MTP_BUFFER_SIZE % request->max_packet_size);
+    const size_t containerLength = payloadSize + MTP_CONTAINER_HEADER_SIZE;
+    size_t processedBytes = 0;
+    bool readError = false;
+
+    // Bind the packet with given request.
+    request->buffer = mBuffer;
+    allocate(maxBulkTransferSize);
+
+    while (processedBytes < containerLength) {
+        size_t bulkTransferSize = 0;
+
+        // prepare header.
+        const bool headerSent = processedBytes != 0;
+        if (!headerSent) {
+            MtpPacket::putUInt32(MTP_CONTAINER_LENGTH_OFFSET, containerLength);
+            MtpPacket::putUInt16(MTP_CONTAINER_TYPE_OFFSET, MTP_CONTAINER_TYPE_DATA);
+            bulkTransferSize += MTP_CONTAINER_HEADER_SIZE;
+        }
+
+        // Prepare payload.
+        if (headerSent || divisionMode == FIRST_PACKET_HAS_PAYLOAD) {
+            const size_t processedPayloadBytes =
+                    headerSent ? processedBytes - MTP_CONTAINER_HEADER_SIZE : 0;
+            const size_t maxRead = payloadSize - processedPayloadBytes;
+            const size_t maxWrite = maxBulkTransferSize - bulkTransferSize;
+            const size_t bulkTransferPayloadSize = std::min(maxRead, maxWrite);
+            // prepare payload.
+            if (!readError) {
+                const ssize_t result = readExactBytes(
+                        fd,
+                        mBuffer + bulkTransferSize,
+                        bulkTransferPayloadSize);
+                if (result < 0) {
+                    ALOGE("Found an error while reading data from FD. Send 0 data instead.");
+                    readError = true;
+                }
+            }
+            if (readError) {
+                memset(mBuffer + bulkTransferSize, 0, bulkTransferPayloadSize);
+            }
+            bulkTransferSize += bulkTransferPayloadSize;
+        }
+
+        // Bulk transfer.
+        mPacketSize = bulkTransferSize;
+        request->buffer_length = bulkTransferSize;
+        const int result = transfer(request);
+        if (result != static_cast<ssize_t>(bulkTransferSize)) {
+            // Cannot recover writing error.
+            ALOGE("Found an error while write data to MtpDevice.");
+            return -1;
+        }
+
+        // Update variables.
+        processedBytes += bulkTransferSize;
+    }
+
+    return readError ? -1 : processedBytes;
 }
 
 #endif // MTP_HOST
 
-void* MtpDataPacket::getData(int& outLength) const {
+void* MtpDataPacket::getData(int* outLength) const {
     int length = mPacketSize - MTP_CONTAINER_HEADER_SIZE;
     if (length > 0) {
         void* result = malloc(length);
         if (result) {
             memcpy(result, mBuffer + MTP_CONTAINER_HEADER_SIZE, length);
-            outLength = length;
+            *outLength = length;
             return result;
         }
     }
-    outLength = 0;
+    *outLength = 0;
     return NULL;
 }
 

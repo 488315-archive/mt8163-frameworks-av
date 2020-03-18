@@ -205,6 +205,9 @@ typedef struct
     LVM_Fs_en               SampleRate;             /* Sampling rate */
     LVM_INT16               EffectLevel;            /* Effect level */
     LVM_UINT16              ReverbLevel;            /* Reverb level in % */
+#ifdef SUPPORT_MC
+    LVM_INT32               NrChannels;
+#endif
 } LVCS_Params_t;
 
 
@@ -374,12 +377,17 @@ LVCS_ReturnStatus_en LVCS_Control(LVCS_Handle_t     hInstance,
 /* NOTES:                                                                               */
 /*                                                                                      */
 /****************************************************************************************/
-
+#ifdef BUILD_FLOAT
+LVCS_ReturnStatus_en LVCS_Process(LVCS_Handle_t             hInstance,
+                                  const LVM_FLOAT           *pInData,
+                                  LVM_FLOAT                 *pOutData,
+                                  LVM_UINT16                NumSamples);
+#else
 LVCS_ReturnStatus_en LVCS_Process(LVCS_Handle_t             hInstance,
                                   const LVM_INT16           *pInData,
                                   LVM_INT16                 *pOutData,
                                   LVM_UINT16                NumSamples);
-
+#endif
 
 #ifdef __cplusplus
 }

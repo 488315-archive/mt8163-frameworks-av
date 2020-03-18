@@ -31,6 +31,70 @@
 namespace android {
 namespace resource_policy {
 
+class ClientPriority {
+public:
+    /**
+     * Choosing to set mIsVendorClient through a parameter instead of calling
+     * hardware::IPCThreadState::self()->isServingCall() to protect against the
+     * case where the construction is offloaded to another thread which isn't a
+     * hwbinder thread.
+     */
+    ClientPriority(int32_t score, int32_t state, bool isVendorClient) :
+            mScore(score), mState(state), mIsVendorClient(isVendorClient) { }
+
+    int32_t getScore() const { return mScore; }
+    int32_t getState() const { return mState; }
+
+    void setScore(int32_t score) {
+        // For vendor clients, the score is set once and for all during
+        // construction. Otherwise, it can get reset each time cameraserver
+        // queries ActivityManagerService for oom_adj scores / states .
+        if (!mIsVendorClient) {
+            mScore = score;
+        }
+    }
+
+    void setState(int32_t state) {
+      // For vendor clients, the score is set once and for all during
+      // construction. Otherwise, it can get reset each time cameraserver
+      // queries ActivityManagerService for oom_adj scores / states
+      // (ActivityManagerService returns a vendor process' state as
+      // PROCESS_STATE_NONEXISTENT.
+      if (!mIsVendorClient) {
+          mState = state;
+      }
+    }
+
+    bool operator==(const ClientPriority& rhs) const {
+        return (this->mScore == rhs.mScore) && (this->mState == rhs.mState);
+    }
+
+    bool operator< (const ClientPriority& rhs)  const {
+        if (this->mScore == rhs.mScore) {
+            return this->mState < rhs.mState;
+        } else {
+            return this->mScore < rhs.mScore;
+        }
+    }
+
+    bool operator> (const ClientPriority& rhs) const {
+        return rhs < *this;
+    }
+
+    bool operator<=(const ClientPriority& rhs) const {
+        return !(*this > rhs);
+    }
+
+    bool operator>=(const ClientPriority& rhs) const {
+        return !(*this < rhs);
+    }
+
+private:
+        int32_t mScore;
+        int32_t mState;
+        bool mIsVendorClient = false;
+};
+
 // --------------------------------------------------------------------------------
 
 /**
@@ -45,9 +109,10 @@ template<class KEY, class VALUE>
 class ClientDescriptor final {
 public:
     ClientDescriptor(const KEY& key, const VALUE& value, int32_t cost,
-            const std::set<KEY>& conflictingKeys, int32_t priority, int32_t ownerId);
+            const std::set<KEY>& conflictingKeys, int32_t score, int32_t ownerId, int32_t state,
+            bool isVendorClient);
     ClientDescriptor(KEY&& key, VALUE&& value, int32_t cost, std::set<KEY>&& conflictingKeys,
-            int32_t priority, int32_t ownerId);
+            int32_t score, int32_t ownerId, int32_t state, bool isVendorClient);
 
     ~ClientDescriptor();
 
@@ -69,7 +134,7 @@ public:
     /**
      * Return the priority for this descriptor.
      */
-    int32_t getPriority() const;
+    const ClientPriority &getPriority() const;
 
     /**
      * Return the owner ID for this descriptor.
@@ -89,7 +154,7 @@ public:
     /**
      * Set the proirity for this descriptor.
      */
-    void setPriority(int32_t priority);
+    void setPriority(const ClientPriority& priority);
 
     // This class is ordered by key
     template<class K, class V>
@@ -100,7 +165,7 @@ private:
     VALUE mValue;
     int32_t mCost;
     std::set<KEY> mConflicting;
-    int32_t mPriority;
+    ClientPriority mPriority;
     int32_t mOwnerId;
 }; // class ClientDescriptor
 
@@ -111,16 +176,19 @@ bool operator < (const ClientDescriptor<K, V>& a, const ClientDescriptor<K, V>& 
 
 template<class KEY, class VALUE>
 ClientDescriptor<KEY, VALUE>::ClientDescriptor(const KEY& key, const VALUE& value, int32_t cost,
-        const std::set<KEY>& conflictingKeys, int32_t priority, int32_t ownerId) : mKey{key},
-        mValue{value}, mCost{cost}, mConflicting{conflictingKeys}, mPriority{priority},
+        const std::set<KEY>& conflictingKeys, int32_t score, int32_t ownerId, int32_t state,
+        bool isVendorClient) :
+        mKey{key}, mValue{value}, mCost{cost}, mConflicting{conflictingKeys},
+        mPriority(score, state, isVendorClient),
         mOwnerId{ownerId} {}
 
 template<class KEY, class VALUE>
 ClientDescriptor<KEY, VALUE>::ClientDescriptor(KEY&& key, VALUE&& value, int32_t cost,
-        std::set<KEY>&& conflictingKeys, int32_t priority, int32_t ownerId) :
+        std::set<KEY>&& conflictingKeys, int32_t score, int32_t ownerId, int32_t state,
+        bool isVendorClient) :
         mKey{std::forward<KEY>(key)}, mValue{std::forward<VALUE>(value)}, mCost{cost},
-        mConflicting{std::forward<std::set<KEY>>(conflictingKeys)}, mPriority{priority},
-        mOwnerId{ownerId} {}
+        mConflicting{std::forward<std::set<KEY>>(conflictingKeys)},
+        mPriority(score, state, isVendorClient), mOwnerId{ownerId} {}
 
 template<class KEY, class VALUE>
 ClientDescriptor<KEY, VALUE>::~ClientDescriptor() {}
@@ -141,7 +209,7 @@ int32_t ClientDescriptor<KEY, VALUE>::getCost() const {
 }
 
 template<class KEY, class VALUE>
-int32_t ClientDescriptor<KEY, VALUE>::getPriority() const {
+const ClientPriority& ClientDescriptor<KEY, VALUE>::getPriority() const {
     return mPriority;
 }
 
@@ -165,8 +233,14 @@ std::set<KEY> ClientDescriptor<KEY, VALUE>::getConflicting() const {
 }
 
 template<class KEY, class VALUE>
-void ClientDescriptor<KEY, VALUE>::setPriority(int32_t priority) {
-    mPriority = priority;
+void ClientDescriptor<KEY, VALUE>::setPriority(const ClientPriority& priority) {
+    // We don't use the usual copy constructor here since we want to remember
+    // whether a client is a vendor client or not. This could have been wiped
+    // off in the incoming priority argument since an AIDL thread might have
+    // called hardware::IPCThreadState::self()->isServingCall() after refreshing
+    // priorities for old clients through ProcessInfoService::getProcessStatesScoresFromPids().
+    mPriority.setScore(priority.getScore());
+    mPriority.setState(priority.getState());
 }
 
 // --------------------------------------------------------------------------------
@@ -216,7 +290,7 @@ public:
     static constexpr int32_t DEFAULT_MAX_COST = 100;
 
     ClientManager();
-    ClientManager(int32_t totalCost);
+    explicit ClientManager(int32_t totalCost);
 
     /**
      * Add a given ClientDescriptor to the managed list.  ClientDescriptors for clients that
@@ -231,7 +305,7 @@ public:
      * Given a map containing owner (pid) -> priority mappings, update the priority of each
      * ClientDescriptor with an owner in this mapping.
      */
-    void updatePriorities(const std::map<int32_t,int32_t>& ownerPriorityList);
+    void updatePriorities(const std::map<int32_t,ClientPriority>& ownerPriorityList);
 
     /**
      * Remove all ClientDescriptors.
@@ -383,17 +457,17 @@ ClientManager<KEY, VALUE, LISTENER>::wouldEvictLocked(
 
     const KEY& key = client->getKey();
     int32_t cost = client->getCost();
-    int32_t priority = client->getPriority();
+    ClientPriority priority = client->getPriority();
     int32_t owner = client->getOwnerId();
 
     int64_t totalCost = getCurrentCostLocked() + cost;
 
     // Determine the MRU of the owners tied for having the highest priority
     int32_t highestPriorityOwner = owner;
-    int32_t highestPriority = priority;
+    ClientPriority highestPriority = priority;
     for (const auto& i : mClients) {
-        int32_t curPriority = i->getPriority();
-        if (curPriority >= highestPriority) {
+        ClientPriority curPriority = i->getPriority();
+        if (curPriority <= highestPriority) {
             highestPriority = curPriority;
             highestPriorityOwner = i->getOwnerId();
         }
@@ -408,7 +482,7 @@ ClientManager<KEY, VALUE, LISTENER>::wouldEvictLocked(
     for (const auto& i : mClients) {
         const KEY& curKey = i->getKey();
         int32_t curCost = i->getCost();
-        int32_t curPriority = i->getPriority();
+        ClientPriority curPriority = i->getPriority();
         int32_t curOwner = i->getOwnerId();
 
         bool conflicting = (curKey == key || i->isConflicting(key) ||
@@ -417,13 +491,13 @@ ClientManager<KEY, VALUE, LISTENER>::wouldEvictLocked(
         if (!returnIncompatibleClients) {
             // Find evicted clients
 
-            if (conflicting && curPriority > priority) {
+            if (conflicting && curPriority < priority) {
                 // Pre-existing conflicting client with higher priority exists
                 evictList.clear();
                 evictList.push_back(client);
                 return evictList;
             } else if (conflicting || ((totalCost > mMaxCost && curCost > 0) &&
-                    (curPriority <= priority) &&
+                    (curPriority >= priority) &&
                     !(highestPriorityOwner == owner && owner == curOwner))) {
                 // Add a pre-existing client to the eviction list if:
                 // - We are adding a client with higher priority that conflicts with this one.
@@ -437,7 +511,7 @@ ClientManager<KEY, VALUE, LISTENER>::wouldEvictLocked(
         } else {
             // Find clients preventing the incoming client from being added
 
-            if (curPriority > priority && (conflicting || (totalCost > mMaxCost && curCost > 0))) {
+            if (curPriority < priority && (conflicting || (totalCost > mMaxCost && curCost > 0))) {
                 // Pre-existing conflicting client with higher priority exists
                 evictList.push_back(i);
             }
@@ -524,7 +598,7 @@ std::vector<int32_t> ClientManager<KEY, VALUE, LISTENER>::getAllOwners() const {
 
 template<class KEY, class VALUE, class LISTENER>
 void ClientManager<KEY, VALUE, LISTENER>::updatePriorities(
-        const std::map<int32_t,int32_t>& ownerPriorityList) {
+        const std::map<int32_t,ClientPriority>& ownerPriorityList) {
     Mutex::Autolock lock(mLock);
     for (auto& i : mClients) {
         auto j = ownerPriorityList.find(i->getOwnerId());

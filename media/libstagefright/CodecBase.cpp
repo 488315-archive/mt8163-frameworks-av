@@ -1,11 +1,11 @@
 /*
- * Copyright (C) 2014 The Android Open Source Project
+ * Copyright 2017, The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -17,22 +17,19 @@
 //#define LOG_NDEBUG 0
 #define LOG_TAG "CodecBase"
 
-#include <inttypes.h>
-
+#include <android/hardware/cas/native/1.0/IDescrambler.h>
+#include <media/ICrypto.h>
 #include <media/stagefright/CodecBase.h>
+#include <utils/Log.h>
 
 namespace android {
 
-CodecBase::CodecBase() {
+void BufferChannelBase::setCrypto(const sp<ICrypto> &crypto) {
+    mCrypto = crypto;
 }
 
-CodecBase::~CodecBase() {
+void BufferChannelBase::setDescrambler(const sp<IDescrambler> &descrambler) {
+    mDescrambler = descrambler;
 }
 
-CodecBase::PortDescription::PortDescription() {
-}
-
-CodecBase::PortDescription::~PortDescription() {
-}
-
-}  // namespace android
+} // namespace android

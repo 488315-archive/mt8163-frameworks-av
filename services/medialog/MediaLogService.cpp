@@ -20,65 +20,120 @@
 #include <sys/mman.h>
 #include <utils/Log.h>
 #include <binder/PermissionCache.h>
-#include <media/nbaio/NBLog.h>
-#include <private/android_filesystem_config.h>
+#include <media/nblog/Merger.h>
+#include <media/nblog/NBLog.h>
+#include <mediautils/ServiceUtilities.h>
 #include "MediaLogService.h"
 
 namespace android {
 
+static const char kDeadlockedString[] = "MediaLogService may be deadlocked\n";
+
+// mMerger, mMergeReader, and mMergeThread all point to the same location in memory
+// mMergerShared. This is the local memory FIFO containing data merged from all
+// individual thread FIFOs in shared memory. mMergeThread is used to periodically
+// call NBLog::Merger::merge() to collect the data and write it to the FIFO, and call
+// NBLog::MergeReader::getAndProcessSnapshot to process the merged data.
+MediaLogService::MediaLogService() :
+    BnMediaLogService(),
+    mMergerShared((NBLog::Shared*) malloc(NBLog::Timeline::sharedSize(kMergeBufferSize))),
+    mMerger(mMergerShared, kMergeBufferSize),
+    mMergeReader(mMergerShared, kMergeBufferSize, mMerger),
+    mMergeThread(new NBLog::MergeThread(mMerger, mMergeReader))
+{
+    mMergeThread->run("MergeThread");
+}
+
+MediaLogService::~MediaLogService()
+{
+    mMergeThread->requestExit();
+    mMergeThread->setTimeoutUs(0);
+    mMergeThread->join();
+    free(mMergerShared);
+}
+
 void MediaLogService::registerWriter(const sp<IMemory>& shared, size_t size, const char *name)
 {
-    if (IPCThreadState::self()->getCallingUid() != AID_MEDIA || shared == 0 ||
+    if (!isAudioServerOrMediaServerUid(IPCThreadState::self()->getCallingUid()) || shared == 0 ||
             size < kMinSize || size > kMaxSize || name == NULL ||
             shared->size() < NBLog::Timeline::sharedSize(size)) {
         return;
     }
-    sp<NBLog::Reader> reader(new NBLog::Reader(size, shared));
-    NamedReader namedReader(reader, name);
+    sp<NBLog::Reader> reader(new NBLog::Reader(shared, size, name)); // Reader handled by merger
+    sp<NBLog::DumpReader> dumpReader(new NBLog::DumpReader(shared, size, name)); // for dumpsys
     Mutex::Autolock _l(mLock);
-    mNamedReaders.add(namedReader);
+    mDumpReaders.add(dumpReader);
+    mMerger.addReader(reader);
 }
 
 void MediaLogService::unregisterWriter(const sp<IMemory>& shared)
 {
-    if (IPCThreadState::self()->getCallingUid() != AID_MEDIA || shared == 0) {
+    if (!isAudioServerOrMediaServerUid(IPCThreadState::self()->getCallingUid()) || shared == 0) {
         return;
     }
     Mutex::Autolock _l(mLock);
-    for (size_t i = 0; i < mNamedReaders.size(); ) {
-        if (mNamedReaders[i].reader()->isIMemory(shared)) {
-            mNamedReaders.removeAt(i);
+    for (size_t i = 0; i < mDumpReaders.size(); ) {
+        if (mDumpReaders[i]->isIMemory(shared)) {
+            mDumpReaders.removeAt(i);
+            // TODO mMerger.removeReaders(shared)
         } else {
             i++;
         }
     }
 }
 
+bool MediaLogService::dumpTryLock(Mutex& mutex)
+{
+    bool locked = false;
+    for (int i = 0; i < kDumpLockRetries; ++i) {
+        if (mutex.tryLock() == NO_ERROR) {
+            locked = true;
+            break;
+        }
+        usleep(kDumpLockSleepUs);
+    }
+    return locked;
+}
+
 status_t MediaLogService::dump(int fd, const Vector<String16>& args __unused)
 {
-    // FIXME merge with similar but not identical code at services/audioflinger/ServiceUtilities.cpp
-    static const String16 sDump("android.permission.DUMP");
-    if (!(IPCThreadState::self()->getCallingUid() == AID_MEDIA ||
-            PermissionCache::checkCallingPermission(sDump))) {
+    if (!(isAudioServerOrMediaServerUid(IPCThreadState::self()->getCallingUid())
+            || dumpAllowed())) {
         dprintf(fd, "Permission Denial: can't dump media.log from pid=%d, uid=%d\n",
                 IPCThreadState::self()->getCallingPid(),
                 IPCThreadState::self()->getCallingUid());
         return NO_ERROR;
     }
 
-    Vector<NamedReader> namedReaders;
-    {
-        Mutex::Autolock _l(mLock);
-        namedReaders = mNamedReaders;
-    }
-    for (size_t i = 0; i < namedReaders.size(); i++) {
-        const NamedReader& namedReader = namedReaders[i];
-        if (fd >= 0) {
-            dprintf(fd, "\n%s:\n", namedReader.name());
+    if (args.size() > 0) {
+        const String8 arg0(args[0]);
+        if (!strcmp(arg0.string(), "-r")) {
+            // needed because mReaders is protected by mLock
+            bool locked = dumpTryLock(mLock);
+
+            // failed to lock - MediaLogService is probably deadlocked
+            if (!locked) {
+                String8 result(kDeadlockedString);
+                if (fd >= 0) {
+                    write(fd, result.string(), result.size());
+                } else {
+                    ALOGW("%s:", result.string());
+                }
+                return NO_ERROR;
+            }
+
+            for (const auto &dumpReader : mDumpReaders) {
+                if (fd >= 0) {
+                    dprintf(fd, "\n%s:\n", dumpReader->name().c_str());
+                    dumpReader->dump(fd, 0 /*indent*/);
+                } else {
+                    ALOGI("%s:", dumpReader->name().c_str());
+                }
+            }
+            mLock.unlock();
         } else {
-            ALOGI("%s:", namedReader.name());
+            mMergeReader.dump(fd, args);
         }
-        namedReader.reader()->dump(fd, 0 /*indent*/);
     }
     return NO_ERROR;
 }
@@ -87,6 +142,10 @@ status_t MediaLogService::onTransact(uint32_t code, const Parcel& data, Parcel* 
         uint32_t flags)
 {
     return BnMediaLogService::onTransact(code, data, reply, flags);
+}
+
+void MediaLogService::requestMergeWakeup() {
+    mMergeThread->wakeup();
 }
 
 }   // namespace android

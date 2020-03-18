@@ -26,7 +26,7 @@
 #include "mpeg2ts/AnotherPacketSource.h"
 
 #include <cutils/properties.h>
-#include <media/IMediaHTTPService.h>
+#include <media/MediaHTTPService.h>
 #include <media/stagefright/foundation/ABuffer.h>
 #include <media/stagefright/foundation/ADebug.h>
 #include <media/stagefright/foundation/AMessage.h>
@@ -44,15 +44,14 @@ namespace android {
 
 // static
 // Bandwidth Switch Mark Defaults
-const int64_t LiveSession::kUpSwitchMarkUs = 15000000ll;
-const int64_t LiveSession::kDownSwitchMarkUs = 20000000ll;
-const int64_t LiveSession::kUpSwitchMarginUs = 5000000ll;
-const int64_t LiveSession::kResumeThresholdUs = 100000ll;
+const int64_t LiveSession::kUpSwitchMarkUs = 15000000LL;
+const int64_t LiveSession::kDownSwitchMarkUs = 20000000LL;
+const int64_t LiveSession::kUpSwitchMarginUs = 5000000LL;
+const int64_t LiveSession::kResumeThresholdUs = 100000LL;
 
-// Buffer Prepare/Ready/Underflow Marks
-const int64_t LiveSession::kReadyMarkUs = 5000000ll;
-const int64_t LiveSession::kPrepareMarkUs = 1500000ll;
-const int64_t LiveSession::kUnderflowMarkUs = 1000000ll;
+//TODO: redefine this mark to a fair value
+// default buffer underflow mark
+static const int kUnderflowMarkMs = 1000;  // 1 second
 
 struct LiveSession::BandwidthEstimator : public RefBase {
     BandwidthEstimator();
@@ -67,9 +66,9 @@ private:
     // Bandwidth estimation parameters
     static const int32_t kShortTermBandwidthItems = 3;
     static const int32_t kMinBandwidthHistoryItems = 20;
-    static const int64_t kMinBandwidthHistoryWindowUs = 5000000ll; // 5 sec
-    static const int64_t kMaxBandwidthHistoryWindowUs = 30000000ll; // 30 sec
-    static const int64_t kMaxBandwidthHistoryAgeUs = 60000000ll; // 60 sec
+    static const int64_t kMinBandwidthHistoryWindowUs = 5000000LL; // 5 sec
+    static const int64_t kMaxBandwidthHistoryWindowUs = 30000000LL; // 30 sec
+    static const int64_t kMaxBandwidthHistoryAgeUs = 60000000LL; // 60 sec
 
     struct BandwidthEntry {
         int64_t mTimestampUs;
@@ -178,7 +177,7 @@ bool LiveSession::BandwidthEstimator::estimateBandwidth(
         *shortTermBps = mShortTermEstimate;
     }
 
-    int32_t minEstimate = -1, maxEstimate = -1;
+    int64_t minEstimate = -1, maxEstimate = -1;
     List<int32_t>::iterator it;
     for (it = mPrevEstimates.begin(); it != mPrevEstimates.end(); it++) {
         int32_t estimate = *it;
@@ -275,7 +274,7 @@ ATSParser::SourceType LiveSession::getSourceTypeForStream(StreamType type) {
 
 LiveSession::LiveSession(
         const sp<AMessage> &notify, uint32_t flags,
-        const sp<IMediaHTTPService> &httpService)
+        const sp<MediaHTTPService> &httpService)
     : mNotify(notify),
       mFlags(flags),
       mHTTPService(httpService),
@@ -285,7 +284,7 @@ LiveSession::LiveSession(
       mPrevBufferPercentage(-1),
       mCurBandwidthIndex(-1),
       mOrigBandwidthIndex(-1),
-      mLastBandwidthBps(-1ll),
+      mLastBandwidthBps(-1LL),
       mLastBandwidthStable(false),
       mBandwidthEstimator(new BandwidthEstimator()),
       mMaxWidth(720),
@@ -295,8 +294,8 @@ LiveSession::LiveSession(
       mSwapMask(0),
       mSwitchGeneration(0),
       mSubtitleGeneration(0),
-      mLastDequeuedTimeUs(0ll),
-      mRealTimeBaseUs(0ll),
+      mLastDequeuedTimeUs(0LL),
+      mRealTimeBaseUs(0LL),
       mReconfigurationInProgress(false),
       mSwitchInProgress(false),
       mUpSwitchMark(kUpSwitchMarkUs),
@@ -432,9 +431,8 @@ status_t LiveSession::dequeueAccessUnit(
             }
 
             strm.mLastDequeuedTimeUs = timeUs;
-#ifndef MTK_AOSP_ENHANCEMENT
             timeUs = calculateMediaTimeUs(firstTimeUs, timeUs, discontinuitySeq);
-#endif
+
             ALOGV("[%s] dequeueAccessUnit: time %lld us, original %lld us",
                     streamStr, (long long)timeUs, (long long)originalTimeUs);
             (*accessUnit)->meta()->setInt64("timeUs",  timeUs);
@@ -447,7 +445,7 @@ status_t LiveSession::dequeueAccessUnit(
                return -EAGAIN;
             };
             (*accessUnit)->meta()->setInt32(
-                    "trackIndex", mPlaylist->getSelectedIndex());
+                    "track-index", mPlaylist->getSelectedIndex());
             (*accessUnit)->meta()->setInt64("baseUs", mRealTimeBaseUs);
         } else if (stream == STREAMTYPE_METADATA) {
             HLSTime mdTime((*accessUnit)->meta());
@@ -468,32 +466,39 @@ status_t LiveSession::dequeueAccessUnit(
     return err;
 }
 
-status_t LiveSession::getStreamFormat(StreamType stream, sp<AMessage> *format) {
+status_t LiveSession::getStreamFormatMeta(StreamType stream, sp<MetaData> *meta) {
     if (!(mStreamMask & stream)) {
         return UNKNOWN_ERROR;
     }
 
     sp<AnotherPacketSource> packetSource = mPacketSources.valueFor(stream);
 
-    sp<MetaData> meta = packetSource->getFormat();
+    *meta = packetSource->getFormat();
 
-    if (meta == NULL) {
-        return -EAGAIN;
+    if (*meta == NULL) {
+        return -EWOULDBLOCK;
     }
 
     if (stream == STREAMTYPE_AUDIO) {
         // set AAC input buffer size to 32K bytes (256kbps x 1sec)
-        meta->setInt32(kKeyMaxInputSize, 32 * 1024);
+        (*meta)->setInt32(kKeyMaxInputSize, 32 * 1024);
     } else if (stream == STREAMTYPE_VIDEO) {
-        meta->setInt32(kKeyMaxWidth, mMaxWidth);
-        meta->setInt32(kKeyMaxHeight, mMaxHeight);
+        (*meta)->setInt32(kKeyMaxWidth, mMaxWidth);
+        (*meta)->setInt32(kKeyMaxHeight, mMaxHeight);
     }
 
-    return convertMetaDataToMessage(meta, format);
+    return OK;
 }
 
 sp<HTTPDownloader> LiveSession::getHTTPDownloader() {
     return new HTTPDownloader(mHTTPService, mExtraHeaders);
+}
+
+void LiveSession::setBufferingSettings(
+        const BufferingSettings &buffering) {
+    sp<AMessage> msg = new AMessage(kWhatSetBufferingSettings, this);
+    writeToAMessage(msg, buffering);
+    msg->post();
 }
 
 void LiveSession::connectAsync(
@@ -519,9 +524,10 @@ status_t LiveSession::disconnect() {
     return err;
 }
 
-status_t LiveSession::seekTo(int64_t timeUs) {
+status_t LiveSession::seekTo(int64_t timeUs, MediaPlayerSeekMode mode) {
     sp<AMessage> msg = new AMessage(kWhatSeek, this);
     msg->setInt64("timeUs", timeUs);
+    msg->setInt32("mode", mode);
 
     sp<AMessage> response;
     status_t err = msg->postAndAwaitResponse(&response);
@@ -620,6 +626,12 @@ bool LiveSession::checkSwitchProgress(
 
 void LiveSession::onMessageReceived(const sp<AMessage> &msg) {
     switch (msg->what()) {
+        case kWhatSetBufferingSettings:
+        {
+            readFromAMessage(msg, &mBufferingSettings);
+            break;
+        }
+
         case kWhatConnect:
         {
             onConnect(msg);
@@ -691,7 +703,7 @@ void LiveSession::onMessageReceived(const sp<AMessage> &msg) {
                     }
 
                     if (mContinuation != NULL) {
-                        CHECK_GT(mContinuationCounter, 0);
+                        CHECK_GT(mContinuationCounter, 0u);
                         if (--mContinuationCounter == 0) {
                             mContinuation->post();
                         }
@@ -830,7 +842,10 @@ void LiveSession::onMessageReceived(const sp<AMessage> &msg) {
                     // If switching up, require a cushion bigger than kUnderflowMark
                     // to avoid buffering immediately after the switch.
                     // (If we don't have that cushion we'd rather cancel and try again.)
-                    int64_t delayUs = switchUp ? (kUnderflowMarkUs + 1000000ll) : 0;
+                    int64_t delayUs =
+                        switchUp ?
+                            (kUnderflowMarkMs * 1000LL + 1000000LL)
+                            : 0;
                     bool needResumeUntil = false;
                     sp<AMessage> stopParams = msg;
                     if (checkSwitchProgress(stopParams, delayUs, &needResumeUntil)) {
@@ -888,17 +903,9 @@ void LiveSession::onMessageReceived(const sp<AMessage> &msg) {
                 case PlaylistFetcher::kWhatMetadataDetected:
                 {
                     if (!mHasMetadata) {
-#ifdef MTK_AOSP_ENHANCEMENT
-                        sp<ABuffer> metaBuffer;
-                        ALOGD("kWhatMetadataDetected");
-                        CHECK(msg->findBuffer("buffer", &metaBuffer));
-#endif
                         mHasMetadata = true;
                         sp<AMessage> notify = mNotify->dup();
                         notify->setInt32("what", kWhatMetadataDetected);
-#ifdef MTK_AOSP_ENHANCEMENT
-                        notify->setBuffer("buffer", metaBuffer);
-#endif
                         notify->post();
                     }
                     break;
@@ -947,7 +954,7 @@ void LiveSession::onMessageReceived(const sp<AMessage> &msg) {
 
 // static
 bool LiveSession::isBandwidthValid(const BandwidthItem &item) {
-    static const int64_t kBlacklistWindowUs = 300 * 1000000ll;
+    static const int64_t kBlacklistWindowUs = 300 * 1000000LL;
     return item.mLastFailureUs < 0
             || ALooper::GetNowUs() - item.mLastFailureUs > kBlacklistWindowUs;
 }
@@ -1007,7 +1014,8 @@ void LiveSession::onConnect(const sp<AMessage> &msg) {
         mFetcherLooper = new ALooper();
 
         mFetcherLooper->setName("Fetcher");
-        mFetcherLooper->start(false, false);
+        mFetcherLooper->start(false, /* runOnCallingThread */
+                              true  /* canCallJava */);
     }
 
     // create fetcher to fetch the master playlist
@@ -1052,7 +1060,7 @@ void LiveSession::onMasterPlaylistFetched(const sp<AMessage> &msg) {
             BandwidthItem item;
 
             item.mPlaylistIndex = i;
-            item.mLastFailureUs = -1ll;
+            item.mLastFailureUs = -1LL;
 
             sp<AMessage> meta;
             AString uri;
@@ -1106,7 +1114,7 @@ void LiveSession::onMasterPlaylistFetched(const sp<AMessage> &msg) {
 
     mPlaylist->pickRandomMediaItems();
     changeConfiguration(
-            0ll /* timeUs */, initialBandwidthIndex, false /* pickTrack */);
+            0LL /* timeUs */, initialBandwidthIndex, false /* pickTrack */);
 }
 
 void LiveSession::finishDisconnect() {
@@ -1167,7 +1175,7 @@ sp<PlaylistFetcher> LiveSession::addFetcher(const char *uri) {
     FetcherInfo info;
     info.mFetcher = new PlaylistFetcher(
             notify, this, uri, mCurBandwidthIndex, mSubtitleGeneration);
-    info.mDurationUs = -1ll;
+    info.mDurationUs = -1LL;
     info.mToBeRemoved = false;
     info.mToBeResumed = false;
     mFetcherLooper->registerHandler(info.mFetcher);
@@ -1184,7 +1192,7 @@ static double uniformRand() {
 #endif
 
 bool LiveSession::UriIsSameAsIndex(const AString &uri, int32_t i, bool newUri) {
-    ALOGI("[timed_id3] i %d UriIsSameAsIndex newUri %s, %s", i,
+    ALOGV("[timed_id3] i %d UriIsSameAsIndex newUri %s, %s", i,
             newUri ? "true" : "false",
             newUri ? mStreams[i].mNewUri.c_str() : mStreams[i].mUri.c_str());
     return i >= 0
@@ -1226,7 +1234,7 @@ bool LiveSession::resumeFetcher(
         const AString &uri, uint32_t streamMask, int64_t timeUs, bool newUri) {
     ssize_t index = mFetcherInfos.indexOfKey(uri);
     if (index < 0) {
-        ALOGE("did not find fetcher for uri: %s", uri.c_str());
+        ALOGE("did not find fetcher for uri: %s", uriDebugString(uri).c_str());
         return false;
     }
 
@@ -1376,7 +1384,7 @@ size_t LiveSession::getBandwidthIndex(int32_t bandwidthBps) {
         while (index > lowestBandwidth) {
             // be conservative (70%) to avoid overestimating and immediately
             // switching down again.
-            size_t adjustedBandwidthBps = bandwidthBps * 7 / 10;
+            size_t adjustedBandwidthBps = bandwidthBps * .7f;
             const BandwidthItem &item = mBandwidthItems[index];
             if (item.mBandwidth <= adjustedBandwidthBps
                     && isBandwidthValid(item)) {
@@ -1450,12 +1458,15 @@ HLSTime LiveSession::latestMediaSegmentStartTime() const {
 
 void LiveSession::onSeek(const sp<AMessage> &msg) {
     int64_t timeUs;
+    int32_t mode;
     CHECK(msg->findInt64("timeUs", &timeUs));
-    changeConfiguration(timeUs);
+    CHECK(msg->findInt32("mode", &mode));
+    // TODO: add "mode" to changeConfiguration.
+    changeConfiguration(timeUs/* , (MediaPlayerSeekMode)mode */);
 }
 
 status_t LiveSession::getDuration(int64_t *durationUs) const {
-    int64_t maxDurationUs = -1ll;
+    int64_t maxDurationUs = -1LL;
     for (size_t i = 0; i < mFetcherInfos.size(); ++i) {
         int64_t fetcherDurationUs = mFetcherInfos.valueAt(i).mDurationUs;
 
@@ -1529,13 +1540,8 @@ ssize_t LiveSession::getSelectedTrack(media_track_type type) const {
 
 void LiveSession::changeConfiguration(
         int64_t timeUs, ssize_t bandwidthIndex, bool pickTrack) {
-#ifdef MTK_AOSP_ENHANCEMENT
-    ALOGD("changeConfiguration: timeUs=%lld us, bwIndex=%zd, pickTrack=%d",
-          (long long)timeUs, bandwidthIndex, pickTrack);
-#else
     ALOGV("changeConfiguration: timeUs=%lld us, bwIndex=%zd, pickTrack=%d",
           (long long)timeUs, bandwidthIndex, pickTrack);
-#endif
 
     cancelBandwidthSwitch();
 
@@ -1549,7 +1555,7 @@ void LiveSession::changeConfiguration(
                     mOrigBandwidthIndex, mCurBandwidthIndex);
         }
     }
-    CHECK_LT(mCurBandwidthIndex, mBandwidthItems.size());
+    CHECK_LT((size_t)mCurBandwidthIndex, mBandwidthItems.size());
     const BandwidthItem &item = mBandwidthItems.itemAt(mCurBandwidthIndex);
 
     uint32_t streamMask = 0; // streams that should be fetched by the new fetcher
@@ -1586,7 +1592,7 @@ void LiveSession::changeConfiguration(
         // Delay fetcher removal if not picking tracks, AND old fetcher
         // has stream mask that overlaps new variant. (Okay to discard
         // old fetcher now, if completely no overlap.)
-        if (discardFetcher && timeUs < 0ll && !pickTrack
+        if (discardFetcher && timeUs < 0LL && !pickTrack
                 && (fetcher->getStreamTypeMask() & streamMask)) {
             discardFetcher = false;
             delayRemoval = true;
@@ -1598,7 +1604,7 @@ void LiveSession::changeConfiguration(
         } else {
             float threshold = 0.0f; // default to pause after current block (47Kbytes)
             bool disconnect = false;
-            if (timeUs >= 0ll) {
+            if (timeUs >= 0LL) {
                 // seeking, no need to finish fetching
                 disconnect = true;
             } else if (delayRemoval) {
@@ -1607,21 +1613,14 @@ void LiveSession::changeConfiguration(
                         mOrigBandwidthIndex, mCurBandwidthIndex);
             }
 
-#ifdef MTK_AOSP_ENHANCEMENT
-            ALOGD("pausing fetcher-%d, threshold=%.2f",
-                    fetcher->getFetcherID(), threshold);
-            fetcher->pauseAsync(threshold, disconnect);
-#else
             ALOGV("pausing fetcher-%d, threshold=%.2f",
                     fetcher->getFetcherID(), threshold);
             fetcher->pauseAsync(threshold, disconnect);
-#endif
-
         }
     }
 
     sp<AMessage> msg;
-    if (timeUs < 0ll) {
+    if (timeUs < 0LL) {
         // skip onChangeConfiguration2 (decoder destruction) if not seeking.
         msg = new AMessage(kWhatChangeConfiguration3, this);
     } else {
@@ -1655,9 +1654,9 @@ void LiveSession::onChangeConfiguration(const sp<AMessage> &msg) {
     if (!mReconfigurationInProgress) {
         int32_t pickTrack = 0;
         msg->findInt32("pickTrack", &pickTrack);
-        changeConfiguration(-1ll /* timeUs */, -1, pickTrack);
+        changeConfiguration(-1LL /* timeUs */, -1, pickTrack);
     } else {
-        msg->post(1000000ll); // retry in 1 sec
+        msg->post(1000000LL); // retry in 1 sec
     }
 }
 
@@ -1789,7 +1788,7 @@ void LiveSession::onChangeConfiguration3(const sp<AMessage> &msg) {
     CHECK(msg->findInt64("timeUs", &timeUs));
     CHECK(msg->findInt32("pickTrack", &pickTrack));
 
-    if (timeUs < 0ll) {
+    if (timeUs < 0LL) {
         if (!pickTrack) {
             // mSwapMask contains streams that are in both old and new variant,
             // (in mNewStreamMask & mStreamMask) but with different URIs
@@ -1806,18 +1805,10 @@ void LiveSession::onChangeConfiguration3(const sp<AMessage> &msg) {
         mRealTimeBaseUs = ALooper::GetNowUs() - timeUs;
     }
 
-#ifdef MTK_AOSP_ENHANCEMENT
-    ALOGD("onChangeConfiguration3: timeUs=%lld, switching=%d, pickTrack=%d, "
-            "mStreamMask=0x%x, mNewStreamMask=0x%x, mSwapMask=0x%x",
-            (long long)timeUs, switching, pickTrack,
-            mStreamMask, mNewStreamMask, mSwapMask);
-#else
     ALOGV("onChangeConfiguration3: timeUs=%lld, switching=%d, pickTrack=%d, "
             "mStreamMask=0x%x, mNewStreamMask=0x%x, mSwapMask=0x%x",
             (long long)timeUs, switching, pickTrack,
             mStreamMask, mNewStreamMask, mSwapMask);
-#endif
-
 
     for (size_t i = 0; i < kMaxStreams; ++i) {
         if (streamMask & indexToType(i)) {
@@ -1832,12 +1823,7 @@ void LiveSession::onChangeConfiguration3(const sp<AMessage> &msg) {
     // Of all existing fetchers:
     // * Resume fetchers that are still needed and assign them original packet sources.
     // * Mark otherwise unneeded fetchers for removal.
-#ifdef MTK_AOSP_ENHANCEMENT
-    ALOGD("resuming fetchers for mask 0x%08x", resumeMask);
-#else
     ALOGV("resuming fetchers for mask 0x%08x", resumeMask);
-#endif
-
     for (size_t i = 0; i < mFetcherInfos.size(); ++i) {
         const AString &uri = mFetcherInfos.keyAt(i);
         if (!resumeFetcher(uri, resumeMask, timeUs)) {
@@ -1911,12 +1897,8 @@ void LiveSession::onChangeConfiguration3(const sp<AMessage> &msg) {
                         if (j == kSubtitleIndex) {
                             break;
                         }
-#ifdef MTK_AOSP_ENHANCEMENT
-                        ALOGD("stream[%zu]: queue format change", j);
-#else
-                        ALOGV("stream[%zu]: queue format change", j);
-#endif
 
+                        ALOGV("stream[%zu]: queue format change", j);
                         sources[j]->queueDiscontinuity(
                                 ATSParser::DISCONTINUITY_FORMAT_ONLY, NULL, true);
                     } else {
@@ -1936,15 +1918,6 @@ void LiveSession::onChangeConfiguration3(const sp<AMessage> &msg) {
                 streamMask &= ~indexToType(j);
             }
         }
-#ifdef MTK_AOSP_ENHANCEMENT
-        ALOGD("[fetcher-%d] startAsync: startTimeUs %lld mLastSeekTimeUs %lld "
-                "segmentStartTimeUs %lld seekMode %d",
-                fetcher->getFetcherID(),
-                (long long)startTime.mTimeUs,
-                (long long)mLastSeekTimeUs,
-                (long long)startTime.getSegmentTimeUs(),
-                seekMode);
-#else
 
         ALOGV("[fetcher-%d] startAsync: startTimeUs %lld mLastSeekTimeUs %lld "
                 "segmentStartTimeUs %lld seekMode %d",
@@ -1953,7 +1926,6 @@ void LiveSession::onChangeConfiguration3(const sp<AMessage> &msg) {
                 (long long)mLastSeekTimeUs,
                 (long long)startTime.getSegmentTimeUs(),
                 seekMode);
-#endif
 
         // Set the target segment start time to the middle point of the
         // segment where the last sample was.
@@ -1987,13 +1959,8 @@ void LiveSession::onChangeConfiguration3(const sp<AMessage> &msg) {
         }
     }
 
-#ifdef MTK_AOSP_ENHANCEMENT
-    ALOGD("onChangeConfiguration3: mSwitchInProgress %d, mStreamMask 0x%x",
-            mSwitchInProgress, mStreamMask);
-#else
     ALOGV("onChangeConfiguration3: mSwitchInProgress %d, mStreamMask 0x%x",
             mSwitchInProgress, mStreamMask);
-#endif
 
     if (mDisconnectReplyID != NULL) {
         finishDisconnect();
@@ -2001,11 +1968,7 @@ void LiveSession::onChangeConfiguration3(const sp<AMessage> &msg) {
 }
 
 void LiveSession::swapPacketSource(StreamType stream) {
-#ifdef MTK_AOSP_ENHANCEMENT
-    ALOGD("[%s] swapPacketSource", getNameForStream(stream));
-#else
     ALOGV("[%s] swapPacketSource", getNameForStream(stream));
-#endif
 
     // transfer packets from source2 to source
     sp<AnotherPacketSource> &aps = mPacketSources.editValueFor(stream);
@@ -2042,7 +2005,7 @@ void LiveSession::tryToFinishBandwidthSwitch(const AString &oldUri) {
 
             if ((mNewStreamMask & stream) && mStreams[idx].mNewUri.empty()) {
                 ALOGW("swapping stream type %d %s to empty stream",
-                        stream, mStreams[idx].mUri.c_str());
+                        stream, uriDebugString(mStreams[idx].mUri).c_str());
             }
             mStreams[idx].mUri = mStreams[idx].mNewUri;
             mStreams[idx].mNewUri.clear();
@@ -2070,7 +2033,7 @@ void LiveSession::tryToFinishBandwidthSwitch(const AString &oldUri) {
         CHECK(idx >= 0);
         if (mStreams[idx].mNewUri.empty()) {
             ALOGW("swapping extra stream type %d %s to empty stream",
-                    stream, mStreams[idx].mUri.c_str());
+                    stream, uriDebugString(mStreams[idx].mUri).c_str());
         }
         mStreams[idx].mUri = mStreams[idx].mNewUri;
         mStreams[idx].mNewUri.clear();
@@ -2099,7 +2062,7 @@ void LiveSession::tryToFinishBandwidthSwitch(const AString &oldUri) {
 void LiveSession::schedulePollBuffering() {
     sp<AMessage> msg = new AMessage(kWhatPollBuffering, this);
     msg->setInt32("generation", mPollBufferingGeneration);
-    msg->post(1000000ll);
+    msg->post(1000000LL);
 }
 
 void LiveSession::cancelPollBuffering() {
@@ -2113,17 +2076,10 @@ void LiveSession::restartPollBuffering() {
 }
 
 void LiveSession::onPollBuffering() {
-#ifdef MTK_AOSP_ENHANCEMENT
-    ALOGD("onPollBuffering: mSwitchInProgress %d, mReconfigurationInProgress %d, "
-            "mInPreparationPhase %d, mCurBandwidthIndex %zd, mStreamMask 0x%x",
-        mSwitchInProgress, mReconfigurationInProgress,
-        mInPreparationPhase, mCurBandwidthIndex, mStreamMask);
-#else
     ALOGV("onPollBuffering: mSwitchInProgress %d, mReconfigurationInProgress %d, "
             "mInPreparationPhase %d, mCurBandwidthIndex %zd, mStreamMask 0x%x",
         mSwitchInProgress, mReconfigurationInProgress,
         mInPreparationPhase, mCurBandwidthIndex, mStreamMask);
-#endif
 
     bool underflow, ready, down, up;
     if (checkBuffering(underflow, ready, down, up)) {
@@ -2182,7 +2138,7 @@ void LiveSession::cancelBandwidthSwitch(bool resume) {
             ALOGV("stopping newUri = %s", newUri.c_str());
             ssize_t index = mFetcherInfos.indexOfKey(newUri);
             if (index < 0) {
-                ALOGE("did not find fetcher for newUri: %s", newUri.c_str());
+                ALOGE("did not find fetcher for newUri: %s", uriDebugString(newUri).c_str());
                 continue;
             }
             FetcherInfo &info = mFetcherInfos.editValueAt(index);
@@ -2232,15 +2188,9 @@ bool LiveSession::checkBuffering(
         status_t finalResult;
         int64_t bufferedDurationUs =
                 mPacketSources[i]->getBufferedDurationUs(&finalResult);
-#ifdef MTK_AOSP_ENHANCEMENT
-        ALOGD("[%s] buffered %lld us",
-                getNameForStream(mPacketSources.keyAt(i)),
-                (long long)bufferedDurationUs);
-#else
         ALOGV("[%s] buffered %lld us",
                 getNameForStream(mPacketSources.keyAt(i)),
                 (long long)bufferedDurationUs);
-#endif
         if (durationUs >= 0) {
             int32_t percent;
             if (mPacketSources[i]->isFinished(0 /* duration */)) {
@@ -2255,13 +2205,16 @@ bool LiveSession::checkBuffering(
         }
 
         ++activeCount;
-        int64_t readyMark = mInPreparationPhase ? kPrepareMarkUs : kReadyMarkUs;
-        if (bufferedDurationUs > readyMark
+        int64_t readyMarkUs =
+            (mInPreparationPhase ?
+                mBufferingSettings.mInitialMarkMs :
+                mBufferingSettings.mResumePlaybackMarkMs) * 1000LL;
+        if (bufferedDurationUs > readyMarkUs
                 || mPacketSources[i]->isFinished(0)) {
             ++readyCount;
         }
         if (!mPacketSources[i]->isFinished(0)) {
-            if (bufferedDurationUs < kUnderflowMarkUs) {
+            if (bufferedDurationUs < kUnderflowMarkMs * 1000LL) {
                 ++underflowCount;
             }
             if (bufferedDurationUs > mUpSwitchMark) {
@@ -2347,7 +2300,7 @@ bool LiveSession::tryBandwidthFallback() {
         ssize_t lowestValid = getLowestValidBandwidthIndex();
         if (mCurBandwidthIndex > lowestValid) {
             cancelBandwidthSwitch();
-            changeConfiguration(-1ll, lowestValid);
+            changeConfiguration(-1LL, lowestValid);
             return true;
         }
     }
@@ -2376,25 +2329,13 @@ bool LiveSession::switchBandwidthIfNeeded(bool bufferHigh, bool bufferLow) {
     bool isStable;
     if (mBandwidthEstimator->estimateBandwidth(
             &bandwidthBps, &isStable, &shortTermBps)) {
-#ifdef MTK_AOSP_ENHANCEMENT
-        ALOGD("bandwidth estimated at %.2f kbps, "
-                "stable %d, shortTermBps %.2f kbps",
-                bandwidthBps / 1024.0f, isStable, shortTermBps / 1024.0f);
-        mLastBandwidthBps = bandwidthBps;
-        mLastBandwidthStable = isStable;
-#else
         ALOGV("bandwidth estimated at %.2f kbps, "
                 "stable %d, shortTermBps %.2f kbps",
                 bandwidthBps / 1024.0f, isStable, shortTermBps / 1024.0f);
-#endif
         mLastBandwidthBps = bandwidthBps;
         mLastBandwidthStable = isStable;
     } else {
-#ifdef MTK_AOSP_ENHANCEMENT
-        ALOGD("no bandwidth estimate.");
-#else
         ALOGV("no bandwidth estimate.");
-#endif
         return false;
     }
 
@@ -2429,7 +2370,7 @@ bool LiveSession::switchBandwidthIfNeeded(bool bufferHigh, bool bufferLow) {
             // if not yet prepared, just restart again with new bw index.
             // this is faster and playback experience is cleaner.
             changeConfiguration(
-                    mInPreparationPhase ? 0 : -1ll, bandwidthIndex);
+                    mInPreparationPhase ? 0 : -1LL, bandwidthIndex);
             return true;
         }
     }

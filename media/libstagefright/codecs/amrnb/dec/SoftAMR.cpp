@@ -1,9 +1,4 @@
 /*
-* Copyright (C) 2014 MediaTek Inc.
-* Modification based on code covered by the mentioned copyright
-* and/or permission notice(s).
-*/
-/*
  * Copyright (C) 2011 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -56,7 +51,6 @@ SoftAMR::SoftAMR(
       mNumSamplesOutput(0),
       mSignalledError(false),
       mOutputPortSettingsChange(NONE) {
-
     if (!strcmp(name, "OMX.google.amrwb.decoder")) {
         mMode = MODE_WIDE;
     } else {
@@ -149,6 +143,30 @@ status_t SoftAMR::initDecoder() {
 OMX_ERRORTYPE SoftAMR::internalGetParameter(
         OMX_INDEXTYPE index, OMX_PTR params) {
     switch (index) {
+        case OMX_IndexParamAudioPortFormat:
+        {
+            OMX_AUDIO_PARAM_PORTFORMATTYPE *formatParams =
+                (OMX_AUDIO_PARAM_PORTFORMATTYPE *)params;
+
+            if (!isValidOMXParam(formatParams)) {
+                return OMX_ErrorBadParameter;
+            }
+
+            if (formatParams->nPortIndex > 1) {
+                return OMX_ErrorUndefined;
+            }
+
+            if (formatParams->nIndex > 0) {
+                return OMX_ErrorNoMore;
+            }
+
+            formatParams->eEncoding =
+                (formatParams->nPortIndex == 0)
+                    ? OMX_AUDIO_CodingAMR : OMX_AUDIO_CodingPCM;
+
+            return OMX_ErrorNone;
+        }
+
         case OMX_IndexParamAudioAmr:
         {
             OMX_AUDIO_PARAM_AMRTYPE *amrParams =
@@ -242,6 +260,29 @@ OMX_ERRORTYPE SoftAMR::internalSetParameter(
             return OMX_ErrorNone;
         }
 
+        case OMX_IndexParamAudioPortFormat:
+        {
+            const OMX_AUDIO_PARAM_PORTFORMATTYPE *formatParams =
+                (const OMX_AUDIO_PARAM_PORTFORMATTYPE *)params;
+
+            if (!isValidOMXParam(formatParams)) {
+                return OMX_ErrorBadParameter;
+            }
+
+            if (formatParams->nPortIndex > 1) {
+                return OMX_ErrorUndefined;
+            }
+
+            if ((formatParams->nPortIndex == 0
+                        && formatParams->eEncoding != OMX_AUDIO_CodingAMR)
+                || (formatParams->nPortIndex == 1
+                        && formatParams->eEncoding != OMX_AUDIO_CodingPCM)) {
+                return OMX_ErrorUndefined;
+            }
+
+            return OMX_ErrorNone;
+        }
+
         case OMX_IndexParamAudioAmr:
         {
             const OMX_AUDIO_PARAM_AMRTYPE *aacParams =
@@ -309,19 +350,13 @@ void SoftAMR::onQueueFilled(OMX_U32 /* portIndex */) {
     }
 
     while (!inQueue.empty() && !outQueue.empty()) {
-
-
         BufferInfo *inInfo = *inQueue.begin();
         OMX_BUFFERHEADERTYPE *inHeader = inInfo->mHeader;
 
         BufferInfo *outInfo = *outQueue.begin();
         OMX_BUFFERHEADERTYPE *outHeader = outInfo->mHeader;
 
-#ifdef MTK_AOSP_ENHANCEMENT
-        outHeader->nTimeStamp = 0;//for short amr file springback
-#endif
-
-        if (inHeader->nFlags & OMX_BUFFERFLAG_EOS) {
+        if ((inHeader->nFlags & OMX_BUFFERFLAG_EOS) && inHeader->nFilledLen == 0) {
             inQueue.erase(inQueue.begin());
             inInfo->mOwnedByUs = false;
             notifyEmptyBufferDone(inHeader);
@@ -354,7 +389,7 @@ void SoftAMR::onQueueFilled(OMX_U32 /* portIndex */) {
             if (outHeader->nAllocLen < kNumSamplesPerFrameNB * sizeof(int16_t)) {
                 ALOGE("b/27662364: NB expected output buffer %zu bytes vs %u",
                        kNumSamplesPerFrameNB * sizeof(int16_t), outHeader->nAllocLen);
-                //android_errorWriteLog(0x534e4554, "27662364");
+                android_errorWriteLog(0x534e4554, "27662364");
                 notify(OMX_EventError, OMX_ErrorOverflow, 0, NULL);
                 mSignalledError = true;
                 return;
@@ -401,7 +436,7 @@ void SoftAMR::onQueueFilled(OMX_U32 /* portIndex */) {
             if (outHeader->nAllocLen < kNumSamplesPerFrameWB * sizeof(int16_t)) {
                 ALOGE("b/27662364: WB expected output buffer %zu bytes vs %u",
                        kNumSamplesPerFrameWB * sizeof(int16_t), outHeader->nAllocLen);
-                //android_errorWriteLog(0x534e4554, "27662364");
+                android_errorWriteLog(0x534e4554, "27662364");
                 notify(OMX_EventError, OMX_ErrorOverflow, 0, NULL);
                 mSignalledError = true;
                 return;
@@ -470,7 +505,7 @@ void SoftAMR::onQueueFilled(OMX_U32 /* portIndex */) {
 
             outHeader->nTimeStamp =
                 mAnchorTimeUs
-                    + (mNumSamplesOutput * 1000000ll) / kSampleRateNB;
+                    + (mNumSamplesOutput * 1000000LL) / kSampleRateNB;
 
             mNumSamplesOutput += kNumSamplesPerFrameNB;
         } else {
@@ -478,12 +513,12 @@ void SoftAMR::onQueueFilled(OMX_U32 /* portIndex */) {
 
             outHeader->nTimeStamp =
                 mAnchorTimeUs
-                    + (mNumSamplesOutput * 1000000ll) / kSampleRateWB;
+                    + (mNumSamplesOutput * 1000000LL) / kSampleRateWB;
 
             mNumSamplesOutput += kNumSamplesPerFrameWB;
         }
 
-        if (inHeader->nFilledLen == 0) {
+        if (inHeader->nFilledLen == 0 && (inHeader->nFlags & OMX_BUFFERFLAG_EOS) == 0) {
             inInfo->mOwnedByUs = false;
             inQueue.erase(inQueue.begin());
             inInfo = NULL;

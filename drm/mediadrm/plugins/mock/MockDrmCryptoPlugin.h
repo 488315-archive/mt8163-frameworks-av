@@ -16,8 +16,8 @@
 
 #include <utils/Mutex.h>
 
-#include "drm/DrmAPI.h"
-#include "hardware/CryptoAPI.h"
+#include "media/drm/DrmAPI.h"
+#include "media/hardware/CryptoAPI.h"
 
 extern "C" {
       android::DrmFactory *createDrmFactory();
@@ -33,7 +33,8 @@ namespace android {
 
         bool isCryptoSchemeSupported(const uint8_t uuid[16]);
         bool isContentTypeSupported(const String8 &mimeType);
-        status_t createDrmPlugin(const uint8_t uuid[16], DrmPlugin **plugin);
+        status_t createDrmPlugin(const uint8_t uuid[16],
+                                 DrmPlugin **plugin);
     };
 
     class MockCryptoFactory : public CryptoFactory {
@@ -85,8 +86,6 @@ namespace android {
         status_t provideProvisionResponse(Vector<uint8_t> const &response,
                                           Vector<uint8_t> &certificate,
                                           Vector<uint8_t> &wrappedKey);
-
-        status_t unprovisionDevice();
 
         status_t getSecureStops(List<Vector<uint8_t> > &secureStops);
         status_t getSecureStop(Vector<uint8_t> const &ssid, Vector<uint8_t> &secureStop);
@@ -140,7 +139,7 @@ namespace android {
     private:
         String8 vectorToString(Vector<uint8_t> const &vector) const;
         String8 arrayToString(uint8_t const *array, size_t len) const;
-        String8 stringMapToString(KeyedVector<String8, String8> map) const;
+        String8 stringMapToString(const KeyedVector<String8, String8>& map) const;
 
         SortedVector<Vector<uint8_t> > mSessions;
         SortedVector<Vector<uint8_t> > mKeySets;
@@ -159,9 +158,12 @@ namespace android {
 
         bool requiresSecureDecoderComponent(const char *mime) const;
 
+        static constexpr size_t DECRYPT_KEY_SIZE = 16;
+
         ssize_t decrypt(bool secure,
-            const uint8_t key[16], const uint8_t iv[16],
-            Mode mode, const void *srcPtr,
+            const uint8_t key[DECRYPT_KEY_SIZE],
+            const uint8_t iv[DECRYPT_KEY_SIZE], Mode mode,
+            const Pattern &pattern, const void *srcPtr,
             const SubSample *subSamples, size_t numSubSamples,
             void *dstPtr, AString *errorDetailMsg);
     private:

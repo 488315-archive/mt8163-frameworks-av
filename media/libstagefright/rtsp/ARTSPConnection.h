@@ -1,10 +1,4 @@
 /*
-* Copyright (C) 2014 MediaTek Inc.
-* Modification based on code covered by the mentioned copyright
-* and/or permission notice(s).
-*/
-
-/*
  * Copyright (C) 2010 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -26,9 +20,6 @@
 
 #include <media/stagefright/foundation/AHandler.h>
 #include <media/stagefright/foundation/AString.h>
-#ifdef MTK_AOSP_ENHANCEMENT
-#include <arpa/inet.h>
-#endif // #ifdef MTK_AOSP_ENHANCEMENT
 
 namespace android {
 
@@ -42,7 +33,7 @@ struct ARTSPResponse : public RefBase {
 };
 
 struct ARTSPConnection : public AHandler {
-    ARTSPConnection(bool uidValid = false, uid_t uid = 0);
+    explicit ARTSPConnection(bool uidValid = false, uid_t uid = 0);
 
     void connect(const char *url, const sp<AMessage> &reply);
     void disconnect(const sp<AMessage> &reply);
@@ -73,10 +64,6 @@ private:
         kWhatSendRequest        = 'sreq',
         kWhatReceiveResponse    = 'rres',
         kWhatObserveBinaryData  = 'obin',
-#ifdef MTK_AOSP_ENHANCEMENT
-        kWhatTimeout            = 'time',
-        kWhatInjectPacket       = 'injt',
-#endif // #ifdef MTK_AOSP_ENHANCEMENT
     };
 
     enum AuthType {
@@ -87,11 +74,7 @@ private:
 
     static const int64_t kSelectTimeoutUs;
 
-#ifdef MTK_AOSP_ENHANCEMENT
-    static const int64_t kRequestTimeout;
-#else
     static const AString sUserAgent;
-#endif // #ifdef MTK_AOSP_ENHANCEMENT
 
     bool mUIDValid;
     uid_t mUID;
@@ -140,42 +123,6 @@ private:
             const char *from, unsigned long *x);
 
     DISALLOW_EVIL_CONSTRUCTORS(ARTSPConnection);
-
-#ifdef MTK_AOSP_ENHANCEMENT
-public:
-    struct sockaddr_in getRemote() const { return mRemote; }
-    // caller should check proxy arguments
-    void setProxy(AString& host, int port) {
-        mProxyHost = host;
-        mProxyPort = port;
-    }
-    void injectPacket(const sp<ABuffer> &buffer);
-    void stopTCPTrying();
-    void exit();
-
-private:
-    AString mRealm;
-    struct sockaddr_in mRemote;
-    AString mProxyHost;
-    int mProxyPort;
-    bool mKeepTCPTrying;
-    bool mForceQuitTCP;
-    AString mUserAgent;
-    bool mExited;
-
-
-    void init();
-    void setSocketFlag(const sp<AMessage> &msg);
-    bool isConnTimeout(const sp<AMessage> &msg);
-    void postTimeoutMsg(sp<AMessage> msg, int32_t cseq);
-    void getRealm(AString value);
-
-
-    static void MakeUserAgent(AString *userAgent);
-    void onTimeout(const sp<AMessage> &msg);
-    void onInjectPacket(const sp<AMessage>& msg);
-#endif // #ifdef MTK_AOSP_ENHANCEMENT
-
 };
 
 }  // namespace android

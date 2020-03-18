@@ -48,7 +48,7 @@ class JpegCompressor: private Thread, public virtual RefBase {
 
     // Start compressing COMPRESSED format buffers; JpegCompressor takes
     // ownership of the Buffers vector.
-    status_t start(Vector<CpuConsumer::LockedBuffer*> buffers,
+    status_t start(const Vector<CpuConsumer::LockedBuffer*>& buffers,
             nsecs_t captureTime);
 
     status_t cancel();
@@ -71,7 +71,6 @@ class JpegCompressor: private Thread, public virtual RefBase {
     Vector<CpuConsumer::LockedBuffer*> mBuffers;
     CpuConsumer::LockedBuffer *mJpegBuffer;
     CpuConsumer::LockedBuffer *mAuxBuffer;
-    bool mFoundJpeg, mFoundAux;
 
     jpeg_compress_struct mCInfo;
 

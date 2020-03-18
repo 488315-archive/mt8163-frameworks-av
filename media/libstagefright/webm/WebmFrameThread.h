@@ -20,8 +20,8 @@
 #include "WebmFrame.h"
 #include "LinkedBlockingQueue.h"
 
+#include <media/MediaSource.h>
 #include <media/stagefright/FileSource.h>
-#include <media/stagefright/MediaSource.h>
 
 #include <utils/List.h>
 #include <utils/Errors.h>
@@ -83,6 +83,7 @@ private:
     LinkedBlockingQueue<const sp<WebmFrame> >& mVideoFrames;
     LinkedBlockingQueue<const sp<WebmFrame> >& mAudioFrames;
     List<sp<WebmElement> >& mCues;
+    uint64_t mStartOffsetTimecode;
 
     volatile bool mDone;
 

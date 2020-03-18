@@ -18,7 +18,7 @@
 
 #define SOFT_VORBIS_H_
 
-#include "SimpleSoftOMXComponent.h"
+#include <media/stagefright/omx/SimpleSoftOMXComponent.h>
 
 struct vorbis_dsp_state;
 struct vorbis_info;
@@ -61,6 +61,7 @@ private:
     int32_t mNumFramesLeftOnPage;
     bool mSawInputEos;
     bool mSignalledOutputEos;
+    bool mSignalledError;
 
     enum {
         NONE,
@@ -71,12 +72,9 @@ private:
     void initPorts();
     status_t initDecoder();
     bool isConfigured() const;
+    void handleEOS();
 
     DISALLOW_EVIL_CONSTRUCTORS(SoftVorbis);
-
-#ifdef MTK_AOSP_ENHANCEMENT
-    int64_t mLastTimeStamp;
-#endif
 };
 
 }  // namespace android

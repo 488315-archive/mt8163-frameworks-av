@@ -22,16 +22,13 @@
 #include "mp4enc_api.h"
 #include "OMX_Video.h"
 
-#include <HardwareAPI.h>
-#include <MetadataBufferType.h>
+#include <media/hardware/HardwareAPI.h>
+#include <media/hardware/MetadataBufferType.h>
 #include <media/stagefright/foundation/ADebug.h>
 #include <media/stagefright/foundation/AUtils.h>
 #include <media/stagefright/MediaDefs.h>
 #include <media/stagefright/MediaErrors.h>
 #include <media/stagefright/MetaData.h>
-#include <media/stagefright/Utils.h>
-#include <ui/Rect.h>
-#include <ui/GraphicBufferMapper.h>
 
 #include "SoftMPEG4Encoder.h"
 
@@ -76,7 +73,7 @@ SoftMPEG4Encoder::SoftMPEG4Encoder(
             176 /* width */, 144 /* height */,
             callbacks, appData, component),
       mEncodeMode(COMBINE_MODE_WITH_ERR_RES),
-      mIDRFrameRefreshIntervalInSec(1),
+      mKeyFrameInterval(30),
       mNumInputFrames(-1),
       mStarted(false),
       mSawInputEOS(false),
@@ -99,6 +96,7 @@ SoftMPEG4Encoder::SoftMPEG4Encoder(
 
 SoftMPEG4Encoder::~SoftMPEG4Encoder() {
     ALOGV("Destruct SoftMPEG4Encoder");
+    onReset();
     releaseEncoder();
     List<BufferInfo *> &outQueue = getPortQueue(1);
     List<BufferInfo *> &inQueue = getPortQueue(0);
@@ -163,14 +161,7 @@ OMX_ERRORTYPE SoftMPEG4Encoder::initEncParams() {
     }
 
     // Set IDR frame refresh interval
-    if (mIDRFrameRefreshIntervalInSec < 0) {
-        mEncParams->intraPeriod = -1;
-    } else if (mIDRFrameRefreshIntervalInSec == 0) {
-        mEncParams->intraPeriod = 1;  // All I frames
-    } else {
-        mEncParams->intraPeriod =
-            (mIDRFrameRefreshIntervalInSec * mFramerate) >> 16;
-    }
+    mEncParams->intraPeriod = mKeyFrameInterval;
 
     mEncParams->numIntraMB = 0;
     mEncParams->sceneDetect = PV_ON;
@@ -208,22 +199,15 @@ OMX_ERRORTYPE SoftMPEG4Encoder::initEncoder() {
 }
 
 OMX_ERRORTYPE SoftMPEG4Encoder::releaseEncoder() {
-    if (!mStarted) {
-        return OMX_ErrorNone;
+    if (mEncParams) {
+        delete mEncParams;
+        mEncParams = NULL;
     }
 
-    PVCleanUpVideoEncoder(mHandle);
-
-    free(mInputFrameData);
-    mInputFrameData = NULL;
-
-    delete mEncParams;
-    mEncParams = NULL;
-
-    delete mHandle;
-    mHandle = NULL;
-
-    mStarted = false;
+    if (mHandle) {
+        delete mHandle;
+        mHandle = NULL;
+    }
 
     return OMX_ErrorNone;
 }
@@ -382,6 +366,8 @@ OMX_ERRORTYPE SoftMPEG4Encoder::internalSetParameter(
                 return OMX_ErrorUndefined;
             }
 
+            mKeyFrameInterval = int32_t(mpeg4type->nPFrames + 1);
+
             return OMX_ErrorNone;
         }
 
@@ -448,6 +434,14 @@ void SoftMPEG4Encoder::onQueueFilled(OMX_U32 /* portIndex */) {
         }
 
         if (inHeader->nFilledLen > 0) {
+            OMX_ERRORTYPE error = validateInputBuffer(inHeader);
+            if (error != OMX_ErrorNone) {
+                ALOGE("b/69065651");
+                android_errorWriteLog(0x534e4554, "69065651");
+                mSignalledError = true;
+                notify(OMX_EventError, error, 0, 0);
+                return;
+            }
             const uint8_t *inputData = NULL;
             if (mInputDataIsMeta) {
                 inputData =
@@ -517,6 +511,19 @@ void SoftMPEG4Encoder::onQueueFilled(OMX_U32 /* portIndex */) {
         outInfo->mOwnedByUs = false;
         notifyFillBufferDone(outHeader);
     }
+}
+
+void SoftMPEG4Encoder::onReset() {
+    if (!mStarted) {
+        return;
+    }
+
+    PVCleanUpVideoEncoder(mHandle);
+
+    free(mInputFrameData);
+    mInputFrameData = NULL;
+
+    mStarted = false;
 }
 
 }  // namespace android

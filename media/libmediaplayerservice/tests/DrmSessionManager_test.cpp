@@ -20,11 +20,11 @@
 
 #include <gtest/gtest.h>
 
-#include "Drm.h"
-#include "DrmSessionClientInterface.h"
-#include "DrmSessionManager.h"
 #include <media/stagefright/foundation/ADebug.h>
 #include <media/stagefright/ProcessInfoInterface.h>
+#include <mediadrm/DrmHal.h>
+#include <mediadrm/DrmSessionClientInterface.h>
+#include <mediadrm/DrmSessionManager.h>
 
 namespace android {
 
@@ -36,6 +36,10 @@ struct FakeProcessInfo : public ProcessInfoInterface {
         // For testing, use pid as priority.
         // Lower the value higher the priority.
         *priority = pid;
+        return true;
+    }
+
+    virtual bool isValidPid(int /* pid */) {
         return true;
     }
 

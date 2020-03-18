@@ -17,8 +17,12 @@
 #ifndef _MTP_PACKET_H
 #define _MTP_PACKET_H
 
+#include <android-base/macros.h>
+
+#include "MtpDebug.h"
 #include "MtpTypes.h"
 
+struct usb_device;
 struct usb_request;
 
 namespace android {
@@ -35,7 +39,7 @@ protected:
     size_t              mPacketSize;
 
 public:
-                        MtpPacket(int bufferSize);
+    explicit            MtpPacket(int bufferSize);
     virtual             ~MtpPacket();
 
     // sets packet size to the default container size and sets buffer to zero
@@ -65,6 +69,8 @@ protected:
     uint32_t            getUInt32(int offset) const;
     void                putUInt16(int offset, uint16_t value);
     void                putUInt32(int offset, uint32_t value);
+
+    DISALLOW_COPY_AND_ASSIGN(MtpPacket);
 };
 
 }; // namespace android

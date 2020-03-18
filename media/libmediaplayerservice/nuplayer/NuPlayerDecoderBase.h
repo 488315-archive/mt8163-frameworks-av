@@ -27,25 +27,32 @@ namespace android {
 struct ABuffer;
 struct MediaCodec;
 class MediaBuffer;
+class MediaCodecBuffer;
 class Surface;
 
 struct NuPlayer::DecoderBase : public AHandler {
-    DecoderBase(const sp<AMessage> &notify);
+    explicit DecoderBase(const sp<AMessage> &notify);
 
     void configure(const sp<AMessage> &format);
     void init();
     void setParameters(const sp<AMessage> &params);
 
+    // Synchronous call to ensure decoder will not request or send out data.
+    void pause();
+
     void setRenderer(const sp<Renderer> &renderer);
     virtual status_t setVideoSurface(const sp<Surface> &) { return INVALID_OPERATION; }
 
-    status_t getInputBuffers(Vector<sp<ABuffer> > *dstBuffers) const;
     void signalFlush();
     void signalResume(bool notifyComplete);
     void initiateShutdown();
 
-    virtual sp<AMessage> getStats() const {
+    virtual sp<AMessage> getStats() {
         return mStats;
+    }
+
+    virtual status_t releaseCrypto() {
+        return INVALID_OPERATION;
     }
 
     enum {
@@ -62,12 +69,13 @@ protected:
 
     virtual ~DecoderBase();
 
+    void stopLooper();
+
     virtual void onMessageReceived(const sp<AMessage> &msg);
 
     virtual void onConfigure(const sp<AMessage> &format) = 0;
     virtual void onSetParameters(const sp<AMessage> &params) = 0;
     virtual void onSetRenderer(const sp<Renderer> &renderer) = 0;
-    virtual void onGetInputBuffers(Vector<sp<ABuffer> > *dstBuffers) = 0;
     virtual void onResume(bool notifyComplete) = 0;
     virtual void onFlush() = 0;
     virtual void onShutdown(bool notifyComplete) = 0;
@@ -78,14 +86,16 @@ protected:
 
     sp<AMessage> mNotify;
     int32_t mBufferGeneration;
+    bool mPaused;
     sp<AMessage> mStats;
+    Mutex mStatsLock;
 
 private:
     enum {
         kWhatConfigure           = 'conf',
         kWhatSetParameters       = 'setP',
         kWhatSetRenderer         = 'setR',
-        kWhatGetInputBuffers     = 'gInB',
+        kWhatPause               = 'paus',
         kWhatRequestInputBuffers = 'reqB',
         kWhatFlush               = 'flus',
         kWhatShutdown            = 'shuD',

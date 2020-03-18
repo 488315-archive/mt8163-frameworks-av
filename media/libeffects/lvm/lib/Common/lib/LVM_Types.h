@@ -73,10 +73,10 @@ extern "C" {
 #define LVM_MEM_EXTERNAL        8                   /* External (slow) access memory */
 
 /* Platform specific */
-#define LVM_PERSISTENT          LVM_MEM_PARTITION0+LVM_MEM_PERSISTENT+LVM_MEM_INTERNAL
-#define LVM_PERSISTENT_DATA     LVM_MEM_PARTITION1+LVM_MEM_PERSISTENT+LVM_MEM_INTERNAL
-#define LVM_PERSISTENT_COEF     LVM_MEM_PARTITION2+LVM_MEM_PERSISTENT+LVM_MEM_INTERNAL
-#define LVM_SCRATCH             LVM_MEM_PARTITION3+LVM_MEM_SCRATCH+LVM_MEM_INTERNAL
+#define LVM_PERSISTENT          (LVM_MEM_PARTITION0+LVM_MEM_PERSISTENT+LVM_MEM_INTERNAL)
+#define LVM_PERSISTENT_DATA     (LVM_MEM_PARTITION1+LVM_MEM_PERSISTENT+LVM_MEM_INTERNAL)
+#define LVM_PERSISTENT_COEF     (LVM_MEM_PARTITION2+LVM_MEM_PERSISTENT+LVM_MEM_INTERNAL)
+#define LVM_SCRATCH             (LVM_MEM_PARTITION3+LVM_MEM_SCRATCH+LVM_MEM_INTERNAL)
 
 /****************************************************************************************/
 /*                                                                                      */
@@ -94,7 +94,40 @@ typedef     uint16_t            LVM_UINT16;         /* Unsigned 16-bit word */
 
 typedef     int32_t             LVM_INT32;          /* Signed 32-bit word */
 typedef     uint32_t            LVM_UINT32;         /* Unsigned 32-bit word */
+typedef     int64_t             LVM_INT64;          /* Signed 64-bit word */
 
+#ifdef BUILD_FLOAT
+
+#define LVM_MAXFLOAT            1.f
+
+typedef     float               LVM_FLOAT;          /* single precision floating point */
+
+// If NATIVE_FLOAT_BUFFER is defined, we expose effects as floating point format;
+// otherwise we expose as integer 16 bit and translate to float for the effect libraries.
+// Hence, NATIVE_FLOAT_BUFFER should only be enabled under BUILD_FLOAT compilation.
+
+#define NATIVE_FLOAT_BUFFER
+
+#endif // BUILD_FLOAT
+
+// Select whether we expose int16_t or float buffers.
+#ifdef NATIVE_FLOAT_BUFFER
+
+#define    EFFECT_BUFFER_FORMAT AUDIO_FORMAT_PCM_FLOAT
+typedef     float               effect_buffer_t;
+
+#else // NATIVE_FLOAT_BUFFER
+
+#define    EFFECT_BUFFER_FORMAT AUDIO_FORMAT_PCM_16_BIT
+typedef     int16_t             effect_buffer_t;
+
+#endif // NATIVE_FLOAT_BUFFER
+
+#ifdef SUPPORT_MC
+#define LVM_MAX_CHANNELS 8 // FCC_8
+#else
+#define LVM_MAX_CHANNELS 2 // FCC_2
+#endif
 
 /****************************************************************************************/
 /*                                                                                      */
@@ -117,6 +150,9 @@ typedef enum
     LVM_STEREO          = 0,
     LVM_MONOINSTEREO    = 1,
     LVM_MONO            = 2,
+#ifdef SUPPORT_MC
+    LVM_MULTICHANNEL    = 3,
+#endif
     LVM_SOURCE_DUMMY    = LVM_MAXENUM
 } LVM_Format_en;
 
@@ -133,6 +169,12 @@ typedef enum
     LVM_FS_32000 = 6,
     LVM_FS_44100 = 7,
     LVM_FS_48000 = 8,
+#ifdef HIGHER_FS
+    LVM_FS_88200 = 9,
+    LVM_FS_96000 = 10,
+    LVM_FS_176400 = 11,
+    LVM_FS_192000 = 12,
+#endif
     LVM_FS_INVALID = LVM_MAXENUM-1,
     LVM_FS_DUMMY = LVM_MAXENUM
 } LVM_Fs_en;

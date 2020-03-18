@@ -25,6 +25,7 @@ struct usb_request;
 
 namespace android {
 
+class IMtpHandle;
 class MtpStringBuffer;
 
 class MtpDataPacket : public MtpPacket {
@@ -93,14 +94,13 @@ public:
     inline void         putEmptyString() { putUInt8(0); }
     inline void         putEmptyArray() { putUInt32(0); }
 
-
 #ifdef MTP_DEVICE
-    // fill our buffer with data from the given file descriptor
-    int                 read(int fd);
+    // fill our buffer with data from the given usb handle
+    int                 read(IMtpHandle *h);
 
-    // write our data to the given file descriptor
-    int                 write(int fd);
-    int                 writeData(int fd, void* data, uint32_t length);
+    // write our data to the given usb handle
+    int                 write(IMtpHandle *h);
+    int                 writeData(IMtpHandle *h, void* data, uint32_t length);
 #endif
 
 #ifdef MTP_HOST
@@ -110,14 +110,21 @@ public:
     int                 readDataWait(struct usb_device *device);
     int                 readDataHeader(struct usb_request *ep);
 
-    int                 writeDataHeader(struct usb_request *ep, uint32_t length);
-    int                 write(struct usb_request *ep);
-    int                 write(struct usb_request *ep, void* buffer, uint32_t length);
+    // Write a whole data packet with payload to the end point given by a request. |divisionMode|
+    // specifies whether to divide header and payload. See |UrbPacketDivisionMode| for meanings of
+    // each value. Return the number of bytes (including header size) sent to the device on success.
+    // Otherwise -1.
+    int                 write(struct usb_request *request, UrbPacketDivisionMode divisionMode);
+    // Similar to previous write method but it reads the payload from |fd|. If |size| is larger than
+    // MTP_BUFFER_SIZE, the data will be sent by multiple bulk transfer requests.
+    // Return type (int64_t) is used to handle the case that the size can be larger than 2GB.
+    int64_t             write(struct usb_request *request, UrbPacketDivisionMode divisionMode,
+                              int fd, size_t size);
 #endif
 
     inline bool         hasData() const { return mPacketSize > MTP_CONTAINER_HEADER_SIZE; }
     inline uint32_t     getContainerLength() const { return MtpPacket::getUInt32(MTP_CONTAINER_LENGTH_OFFSET); }
-    void*               getData(int& outLength) const;
+    void*               getData(int* outLength) const;
 };
 
 }; // namespace android

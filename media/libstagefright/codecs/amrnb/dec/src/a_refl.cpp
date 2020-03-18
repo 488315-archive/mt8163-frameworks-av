@@ -59,6 +59,9 @@ terms listed above has been obtained from the copyright holder.
 /*----------------------------------------------------------------------------
 ; INCLUDES
 ----------------------------------------------------------------------------*/
+#define LOG_TAG "a_refl"
+#include <log/log.h>
+
 #include "a_refl.h"
 #include "typedef.h"
 #include "cnst.h"
@@ -291,7 +294,8 @@ void A_Refl(
                 {
                     refl[i] = 0;
                 }
-                break;
+                ALOGE("b/23609206");
+                return;
             }
 
             bState[j] = extract_l(L_temp);

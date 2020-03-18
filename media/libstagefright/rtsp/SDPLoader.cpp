@@ -1,9 +1,4 @@
 /*
-* Copyright (C) 2014 MediaTek Inc.
-* Modification based on code covered by the mentioned copyright
-* and/or permission notice(s).
-*/
-/*
  * Copyright (C) 2012 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -27,9 +22,9 @@
 
 #include "ASessionDescription.h"
 
-#include <media/IMediaHTTPConnection.h>
-#include <media/IMediaHTTPService.h>
-#include <media/stagefright/MediaHTTP.h>
+#include <media/MediaHTTPConnection.h>
+#include <media/MediaHTTPService.h>
+#include <media/stagefright/ClearMediaHTTP.h>
 #include <media/stagefright/foundation/ABuffer.h>
 #include <media/stagefright/foundation/ADebug.h>
 #include <media/stagefright/Utils.h>
@@ -41,12 +36,12 @@ namespace android {
 SDPLoader::SDPLoader(
         const sp<AMessage> &notify,
         uint32_t flags,
-        const sp<IMediaHTTPService> &httpService)
+        const sp<MediaHTTPService> &httpService)
     : mNotify(notify),
       mFlags(flags),
       mNetLooper(new ALooper),
       mCancelled(false),
-      mHTTPDataSource(new MediaHTTP(httpService->makeHTTPConnection())) {
+      mHTTPDataSource(new ClearMediaHTTP(httpService->makeHTTPConnection())) {
     mNetLooper->setName("sdp net");
     mNetLooper->start(false /* runOnCallingThread */,
                       false /* canCallJava */,
@@ -102,13 +97,6 @@ void SDPLoader::onLoad(const sp<AMessage> &msg) {
 
         if (err != OK) {
             ALOGE("connect() returned %d", err);
-#ifdef MTK_AOSP_ENHANCEMENT
-            if (err == ERROR_IO) {
-                err = ERROR_CANNOT_CONNECT;
-                ALOGE("reset err id from %d to %d for connect retry", ERROR_IO, ERROR_CANNOT_CONNECT);
-            }
-#endif
-
         }
     }
 

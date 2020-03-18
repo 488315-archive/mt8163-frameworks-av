@@ -19,17 +19,15 @@
 
 #include <gui/BufferItem.h>
 #include <gui/ConsumerBase.h>
+#include <gui/BufferQueue.h>
 
-#include <ui/GraphicBuffer.h>
-
-#include <utils/String8.h>
-#include <utils/Vector.h>
-#include <utils/threads.h>
 #include <utils/List.h>
 
 #define ANDROID_GRAPHICS_RINGBUFFERCONSUMER_JNI_ID "mRingBufferConsumer"
 
 namespace android {
+
+class String8;
 
 /**
  * The RingBufferConsumer maintains a ring buffer of BufferItem objects,
@@ -62,7 +60,7 @@ class RingBufferConsumer : public ConsumerBase,
     // the consumer usage flags passed to the graphics allocator. The
     // bufferCount parameter specifies how many buffers can be pinned for user
     // access at the same time.
-    RingBufferConsumer(const sp<IGraphicBufferConsumer>& consumer, uint32_t consumerUsage,
+    RingBufferConsumer(const sp<IGraphicBufferConsumer>& consumer, uint64_t consumerUsage,
             int bufferCount);
 
     virtual ~RingBufferConsumer();
@@ -82,7 +80,7 @@ class RingBufferConsumer : public ConsumerBase,
 
     // setConsumerUsage allows the BufferQueue consumer usage to be
     // set at a later time after construction.
-    status_t setConsumerUsage(uint32_t usage);
+    status_t setConsumerUsage(uint64_t usage);
 
     // Buffer info, minus the graphics buffer/slot itself.
     struct BufferInfo {
@@ -133,7 +131,7 @@ class RingBufferConsumer : public ConsumerBase,
         }
 
         bool isEmpty() {
-            return mBufferItem.mBuf == BufferQueue::INVALID_BUFFER_SLOT;
+            return mBufferItem.mSlot == BufferQueue::INVALID_BUFFER_SLOT;
         }
 
         BufferItem& getBufferItem() { return mBufferItem; }
@@ -189,4 +187,4 @@ class RingBufferConsumer : public ConsumerBase,
 
 } // namespace android
 
-#endif // ANDROID_GUI_CPUCONSUMER_H
+#endif // ANDROID_GUI_RINGBUFFERCONSUMER_H

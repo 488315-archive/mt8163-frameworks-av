@@ -21,15 +21,18 @@
 #include <binder/ProcessState.h>
 #include <cutils/properties.h> // for property_get
 
+#include <media/DataSource.h>
 #include <media/IMediaHTTPService.h>
 #include <media/IStreamSource.h>
 #include <media/mediaplayer.h>
+#include <media/MediaSource.h>
 #include <media/stagefright/foundation/ADebug.h>
 #include <media/stagefright/foundation/AMessage.h>
-#include <media/stagefright/DataSource.h>
+#include <media/stagefright/DataSourceFactory.h>
+#include <media/stagefright/InterfaceUtils.h>
 #include <media/stagefright/MPEG2TSWriter.h>
 #include <media/stagefright/MediaExtractor.h>
-#include <media/stagefright/MediaSource.h>
+#include <media/stagefright/MediaExtractorFactory.h>
 #include <media/stagefright/MetaData.h>
 
 #include <binder/IServiceManager.h>
@@ -45,7 +48,7 @@ using namespace android;
 
 struct MyStreamSource : public BnStreamSource {
     // Object assumes ownership of fd.
-    MyStreamSource(int fd);
+    explicit MyStreamSource(int fd);
 
     virtual void setListener(const sp<IStreamListener> &listener);
     virtual void setBuffers(const Vector<sp<IMemory> > &buffers);
@@ -125,7 +128,7 @@ void MyStreamSource::onBufferAvailable(size_t index) {
 ////////////////////////////////////////////////////////////////////////////////
 
 struct MyConvertingStreamSource : public BnStreamSource {
-    MyConvertingStreamSource(const char *filename);
+    explicit MyConvertingStreamSource(const char *filename);
 
     virtual void setListener(const sp<IStreamListener> &listener);
     virtual void setBuffers(const Vector<sp<IMemory> > &buffers);
@@ -161,17 +164,18 @@ MyConvertingStreamSource::MyConvertingStreamSource(const char *filename)
     : mCurrentBufferIndex(-1),
       mCurrentBufferOffset(0) {
     sp<DataSource> dataSource =
-        DataSource::CreateFromURI(NULL /* httpService */, filename);
+        DataSourceFactory::CreateFromURI(NULL /* httpService */, filename);
 
     CHECK(dataSource != NULL);
 
-    sp<MediaExtractor> extractor = MediaExtractor::Create(dataSource);
+    sp<IMediaExtractor> extractor = MediaExtractorFactory::Create(dataSource);
     CHECK(extractor != NULL);
 
     mWriter = new MPEG2TSWriter(
             this, &MyConvertingStreamSource::WriteDataWrapper);
 
-    for (size_t i = 0; i < extractor->countTracks(); ++i) {
+    size_t numTracks = extractor->countTracks();
+    for (size_t i = 0; i < numTracks; ++i) {
         const sp<MetaData> &meta = extractor->getTrackMetaData(i);
 
         const char *mime;
@@ -181,7 +185,12 @@ MyConvertingStreamSource::MyConvertingStreamSource(const char *filename)
             continue;
         }
 
-        CHECK_EQ(mWriter->addSource(extractor->getTrack(i)), (status_t)OK);
+        sp<MediaSource> track = CreateMediaSourceFromIMediaSource(extractor->getTrack(i));
+        if (track == nullptr) {
+            fprintf(stderr, "skip NULL track %zu, total tracks %zu\n", i, numTracks);
+            continue;
+        }
+        CHECK_EQ(mWriter->addSource(track), (status_t)OK);
     }
 
     CHECK_EQ(mWriter->start(), (status_t)OK);
@@ -301,8 +310,6 @@ private:
 int main(int argc, char **argv) {
     android::ProcessState::self()->startThreadPool();
 
-    DataSource::RegisterDefaultSniffers();
-
     if (argc != 2) {
         fprintf(stderr, "Usage: %s filename\n", argv[0]);
         return 1;
@@ -311,10 +318,12 @@ int main(int argc, char **argv) {
     sp<SurfaceComposerClient> composerClient = new SurfaceComposerClient;
     CHECK_EQ(composerClient->initCheck(), (status_t)OK);
 
-    sp<IBinder> display(SurfaceComposerClient::getBuiltInDisplay(
-            ISurfaceComposer::eDisplayIdMain));
+    const sp<IBinder> display = SurfaceComposerClient::getInternalDisplayToken();
+    CHECK(display != nullptr);
+
     DisplayInfo info;
-    SurfaceComposerClient::getDisplayInfo(display, &info);
+    CHECK_EQ(SurfaceComposerClient::getDisplayInfo(display, &info), NO_ERROR);
+
     ssize_t displayWidth = info.w;
     ssize_t displayHeight = info.h;
 
@@ -331,10 +340,10 @@ int main(int argc, char **argv) {
     CHECK(control != NULL);
     CHECK(control->isValid());
 
-    SurfaceComposerClient::openGlobalTransaction();
-    CHECK_EQ(control->setLayer(INT_MAX), (status_t)OK);
-    CHECK_EQ(control->show(), (status_t)OK);
-    SurfaceComposerClient::closeGlobalTransaction();
+    SurfaceComposerClient::Transaction{}
+            .setLayer(control, INT_MAX)
+            .show(control)
+            .apply();
 
     sp<Surface> surface = control->getSurface();
     CHECK(surface != NULL);
@@ -349,9 +358,7 @@ int main(int argc, char **argv) {
 
     sp<IStreamSource> source;
 
-    char prop[PROPERTY_VALUE_MAX];
-    bool usemp4 = property_get("media.stagefright.use-mp4source", prop, NULL) &&
-            (!strcmp(prop, "1") || !strcasecmp(prop, "true"));
+    bool usemp4 = property_get_bool("media.stagefright.use-mp4source", false);
 
     size_t len = strlen(argv[1]);
     if ((!usemp4 && len >= 3 && !strcasecmp(".ts", &argv[1][len - 3])) ||

@@ -1,9 +1,4 @@
 /*
-* Copyright (C) 2014 MediaTek Inc.
-* Modification based on code covered by the mentioned copyright
-* and/or permission notice(s).
-*/
-/*
  * Copyright (C) 2011 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,9 +18,10 @@
 
 #define HTTP_BASE_H_
 
+#include <media/DataSource.h>
 #include <media/stagefright/foundation/ABase.h>
-#include <media/stagefright/DataSource.h>
 #include <media/stagefright/MediaErrors.h>
+#include <utils/List.h>
 #include <utils/threads.h>
 
 namespace android {
@@ -55,14 +51,13 @@ struct HTTPBase : public DataSource {
 
     virtual void setBandwidthHistorySize(size_t numHistoryItems);
 
-    static void RegisterSocketUserTag(int sockfd, uid_t uid, uint32_t kTag);
-    static void UnRegisterSocketUserTag(int sockfd);
-
-    static void RegisterSocketUserMark(int sockfd, uid_t uid);
-    static void UnRegisterSocketUserMark(int sockfd);
+    virtual String8 toString() {
+        return mName;
+    }
 
 protected:
     virtual void addBandwidthMeasurement(size_t numBytes, int64_t delayUs);
+    String8 mName;
 
 private:
     struct BandwidthEntry {
@@ -88,11 +83,6 @@ private:
     int32_t mBandWidthCollectFreqMs;
 
     DISALLOW_EVIL_CONSTRUCTORS(HTTPBase);
-#ifdef MTK_AOSP_ENHANCEMENT
-
-public:
-    virtual bool estimateBandwidth(int32_t countdepth, int32_t *bandwidth_bps);
-#endif
 };
 
 }  // namespace android

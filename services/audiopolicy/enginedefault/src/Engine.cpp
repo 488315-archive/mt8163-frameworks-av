@@ -16,10 +16,6 @@
 
 #define LOG_TAG "APM::AudioPolicyEngine"
 //#define LOG_NDEBUG 0
-#ifdef MTK_AUDIO
-#define LOG_NDEBUG 0
-#define VERY_VERBOSE_LOGGING
-#endif
 
 //#define VERY_VERBOSE_LOGGING
 #ifdef VERY_VERBOSE_LOGGING
@@ -29,147 +25,60 @@
 #endif
 
 #include "Engine.h"
-#include "Gains.h"
+#include <android-base/macros.h>
 #include <AudioPolicyManagerObserver.h>
 #include <AudioPort.h>
 #include <IOProfile.h>
+#include <AudioIODescriptorInterface.h>
 #include <policy.h>
 #include <utils/String8.h>
 #include <utils/Log.h>
+#if defined(MTK_AUDIO)
+#include <media/AudioUtilmtk.h>
+#endif // MTK_AUDIO
+
+#if defined(MTK_AUDIO_DEBUG)
+#if defined(CONFIG_MT_ENG_BUILD)
+static int log_enable = 1;
+#else
+static int log_enable = __android_log_is_loggable(ANDROID_LOG_DEBUG, LOG_TAG, ANDROID_LOG_INFO);
+#endif
+#endif
 
 namespace android
 {
 namespace audio_policy
 {
 
+struct legacy_strategy_map { const char *name; legacy_strategy id; };
+static const std::vector<legacy_strategy_map> gLegacyStrategy = {
+    { "STRATEGY_NONE", STRATEGY_NONE },
+    { "STRATEGY_MEDIA", STRATEGY_MEDIA },
+    { "STRATEGY_PHONE", STRATEGY_PHONE },
+    { "STRATEGY_SONIFICATION", STRATEGY_SONIFICATION },
+    { "STRATEGY_SONIFICATION_RESPECTFUL", STRATEGY_SONIFICATION_RESPECTFUL },
+    { "STRATEGY_DTMF", STRATEGY_DTMF },
+    { "STRATEGY_ENFORCED_AUDIBLE", STRATEGY_ENFORCED_AUDIBLE },
+    { "STRATEGY_TRANSMITTED_THROUGH_SPEAKER", STRATEGY_TRANSMITTED_THROUGH_SPEAKER },
+    { "STRATEGY_ACCESSIBILITY", STRATEGY_ACCESSIBILITY },
+    { "STRATEGY_REROUTING", STRATEGY_REROUTING },
+    { "STRATEGY_PATCH", STRATEGY_REROUTING }, // boiler to manage stream patch volume
+};
+
 Engine::Engine()
-    : mManagerInterface(this),
-      mPhoneState(AUDIO_MODE_NORMAL),
-      mApmObserver(NULL)
 {
-    for (int i = 0; i < AUDIO_POLICY_FORCE_USE_CNT; i++) {
-        mForceUse[i] = AUDIO_POLICY_FORCE_NONE;
+    auto result = EngineBase::loadAudioPolicyEngineConfig();
+    ALOGE_IF(result.nbSkippedElement != 0,
+             "Policy Engine configuration is partially invalid, skipped %zu elements",
+             result.nbSkippedElement);
+
+    for (const auto &strategy : gLegacyStrategy) {
+        mLegacyStrategyMap[getProductStrategyByName(strategy.name)] = strategy.id;
     }
-}
-
-Engine::~Engine()
-{
-}
-
-void Engine::setObserver(AudioPolicyManagerObserver *observer)
-{
-    ALOG_ASSERT(observer != NULL, "Invalid Audio Policy Manager observer");
-    mApmObserver = observer;
-}
-
-status_t Engine::initCheck()
-{
-    return (mApmObserver != NULL) ?  NO_ERROR : NO_INIT;
-}
-
-float Engine::volIndexToDb(Volume::device_category category, audio_stream_type_t streamType,
-                             int indexInUi)
-{
-    const StreamDescriptor &streamDesc = mApmObserver->getStreamDescriptors().valueAt(streamType);
-    return Gains::volIndexToDb(category, streamDesc, indexInUi);
-}
-
-
-status_t Engine::initStreamVolume(audio_stream_type_t stream, int indexMin, int indexMax)
-{
-    ALOGV("initStreamVolume() stream %d, min %d, max %d", stream , indexMin, indexMax);
-    if (indexMin < 0 || indexMin >= indexMax) {
-        ALOGW("initStreamVolume() invalid index limits for stream %d, min %d, max %d",
-              stream , indexMin, indexMax);
-        return BAD_VALUE;
-    }
-    mApmObserver->getStreamDescriptors().setVolumeIndexMin(stream, indexMin);
-    mApmObserver->getStreamDescriptors().setVolumeIndexMax(stream, indexMax);
-    return NO_ERROR;
-}
-
-void Engine::initializeVolumeCurves(bool isSpeakerDrcEnabled)
-{
-    StreamDescriptorCollection &streams = mApmObserver->getStreamDescriptors();
-
-    for (int i = 0; i < AUDIO_STREAM_CNT; i++) {
-        for (int j = 0; j < Volume::DEVICE_CATEGORY_CNT; j++) {
-            streams.setVolumeCurvePoint(static_cast<audio_stream_type_t>(i),
-                                         static_cast<Volume::device_category>(j),
-                                         Gains::sVolumeProfiles[i][j]);
-        }
-    }
-
-    // Check availability of DRC on speaker path: if available, override some of the speaker curves
-    if (isSpeakerDrcEnabled) {
-        streams.setVolumeCurvePoint(AUDIO_STREAM_SYSTEM, Volume::DEVICE_CATEGORY_SPEAKER,
-                Gains::sDefaultSystemVolumeCurveDrc);
-        streams.setVolumeCurvePoint(AUDIO_STREAM_RING, Volume::DEVICE_CATEGORY_SPEAKER,
-                Gains::sSpeakerSonificationVolumeCurveDrc);
-        streams.setVolumeCurvePoint(AUDIO_STREAM_ALARM, Volume::DEVICE_CATEGORY_SPEAKER,
-                Gains::sSpeakerSonificationVolumeCurveDrc);
-        streams.setVolumeCurvePoint(AUDIO_STREAM_NOTIFICATION, Volume::DEVICE_CATEGORY_SPEAKER,
-                Gains::sSpeakerSonificationVolumeCurveDrc);
-        streams.setVolumeCurvePoint(AUDIO_STREAM_MUSIC, Volume::DEVICE_CATEGORY_SPEAKER,
-                Gains::sSpeakerMediaVolumeCurveDrc);
-        streams.setVolumeCurvePoint(AUDIO_STREAM_ACCESSIBILITY, Volume::DEVICE_CATEGORY_SPEAKER,
-                Gains::sSpeakerMediaVolumeCurveDrc);
-    }
-}
-
-
-status_t Engine::setPhoneState(audio_mode_t state)
-{
-    ALOGV("setPhoneState() state %d", state);
-
-    if (state < 0 || state >= AUDIO_MODE_CNT) {
-        ALOGW("setPhoneState() invalid state %d", state);
-        return BAD_VALUE;
-    }
-
-    if (state == mPhoneState ) {
-        ALOGW("setPhoneState() setting same state %d", state);
-        return BAD_VALUE;
-    }
-
-    // store previous phone state for management of sonification strategy below
-    int oldState = mPhoneState;
-    mPhoneState = state;
-    StreamDescriptorCollection &streams = mApmObserver->getStreamDescriptors();
-    // are we entering or starting a call
-    if (!is_state_in_call(oldState) && is_state_in_call(state)) {
-        ALOGV("  Entering call in setPhoneState()");
-        for (int j = 0; j < Volume::DEVICE_CATEGORY_CNT; j++) {
-            streams.setVolumeCurvePoint(AUDIO_STREAM_DTMF, static_cast<Volume::device_category>(j),
-                                         Gains::sVolumeProfiles[AUDIO_STREAM_VOICE_CALL][j]);
-        }
-#ifdef MTK_AUDIO
-        AudioPolicyVendorControl &mAudioPolicyVendorControl = mApmObserver->getAudioPolicyVendorControl();
-        mAudioPolicyVendorControl.setVoiceReplaceDTMFStatus(true);
-#endif
-    } else if (is_state_in_call(oldState) && !is_state_in_call(state)) {
-        ALOGV("  Exiting call in setPhoneState()");
-        for (int j = 0; j < Volume::DEVICE_CATEGORY_CNT; j++) {
-            streams.setVolumeCurvePoint(AUDIO_STREAM_DTMF, static_cast<Volume::device_category>(j),
-                                         Gains::sVolumeProfiles[AUDIO_STREAM_DTMF][j]);
-        }
-#ifdef MTK_AUDIO
-        AudioPolicyVendorControl &mAudioPolicyVendorControl = mApmObserver->getAudioPolicyVendorControl();
-        mAudioPolicyVendorControl.setVoiceReplaceDTMFStatus(false);
-#endif
-    }
-    return NO_ERROR;
 }
 
 status_t Engine::setForceUse(audio_policy_force_use_t usage, audio_policy_forced_cfg_t config)
 {
-#ifdef MTK_AUDIO
-    AudioPolicyVendorControl &mAudioPolicyVendorControl = mApmObserver->getAudioPolicyVendorControl();
-#ifdef MTK_CROSSMOUNT_SUPPORT
-    mAudioPolicyVendorControl.setNeedResetInput(false);
-    mAudioPolicyVendorControl.setStart2CrossMount(false);
-#endif
-#endif
     switch(usage) {
     case AUDIO_POLICY_FORCE_FOR_COMMUNICATION:
         if (config != AUDIO_POLICY_FORCE_SPEAKER && config != AUDIO_POLICY_FORCE_BT_SCO &&
@@ -177,41 +86,23 @@ status_t Engine::setForceUse(audio_policy_force_use_t usage, audio_policy_forced
             ALOGW("setForceUse() invalid config %d for FOR_COMMUNICATION", config);
             return BAD_VALUE;
         }
-        mForceUse[usage] = config;
         break;
     case AUDIO_POLICY_FORCE_FOR_MEDIA:
         if (config != AUDIO_POLICY_FORCE_HEADPHONES && config != AUDIO_POLICY_FORCE_BT_A2DP &&
             config != AUDIO_POLICY_FORCE_WIRED_ACCESSORY &&
             config != AUDIO_POLICY_FORCE_ANALOG_DOCK &&
             config != AUDIO_POLICY_FORCE_DIGITAL_DOCK && config != AUDIO_POLICY_FORCE_NONE &&
-            config != AUDIO_POLICY_FORCE_NO_BT_A2DP && config != AUDIO_POLICY_FORCE_SPEAKER 
-#ifdef MTK_AUDIO
-            && config != AUDIO_POLICY_FORCE_SYSTEM_ENFORCED
-#endif
-            ) {
+            config != AUDIO_POLICY_FORCE_NO_BT_A2DP && config != AUDIO_POLICY_FORCE_SPEAKER ) {
             ALOGW("setForceUse() invalid config %d for FOR_MEDIA", config);
             return BAD_VALUE;
         }
-        mForceUse[usage] = config;
         break;
     case AUDIO_POLICY_FORCE_FOR_RECORD:
         if (config != AUDIO_POLICY_FORCE_BT_SCO && config != AUDIO_POLICY_FORCE_WIRED_ACCESSORY &&
-            config != AUDIO_POLICY_FORCE_NONE
-#ifdef MTK_CROSSMOUNT_SUPPORT
-            && config != AUDIO_POLICY_FORCE_REMOTE_SUBMIX_IN_WITH_FLAGS
-            && config != AUDIO_POLICY_FORCE_REMOTE_SUBMIX_IN
-#endif
-            ) {
+            config != AUDIO_POLICY_FORCE_NONE) {
             ALOGW("setForceUse() invalid config %d for FOR_RECORD", config);
             return BAD_VALUE;
         }
-#ifdef MTK_CROSSMOUNT_SUPPORT
-        if ((mForceUse[usage] == AUDIO_POLICY_FORCE_REMOTE_SUBMIX_IN_WITH_FLAGS && config != AUDIO_POLICY_FORCE_REMOTE_SUBMIX_IN_WITH_FLAGS))
-            mAudioPolicyVendorControl.setNeedResetInput(true);
-        else if ((mForceUse[usage] != AUDIO_POLICY_FORCE_REMOTE_SUBMIX_IN_WITH_FLAGS && config == AUDIO_POLICY_FORCE_REMOTE_SUBMIX_IN_WITH_FLAGS))
-            mAudioPolicyVendorControl.setStart2CrossMount(true);
-#endif
-        mForceUse[usage] = config;
         break;
     case AUDIO_POLICY_FORCE_FOR_DOCK:
         if (config != AUDIO_POLICY_FORCE_NONE && config != AUDIO_POLICY_FORCE_BT_CAR_DOCK &&
@@ -221,166 +112,79 @@ status_t Engine::setForceUse(audio_policy_force_use_t usage, audio_policy_forced
             config != AUDIO_POLICY_FORCE_DIGITAL_DOCK) {
             ALOGW("setForceUse() invalid config %d for FOR_DOCK", config);
         }
-        mForceUse[usage] = config;
         break;
     case AUDIO_POLICY_FORCE_FOR_SYSTEM:
         if (config != AUDIO_POLICY_FORCE_NONE &&
             config != AUDIO_POLICY_FORCE_SYSTEM_ENFORCED) {
             ALOGW("setForceUse() invalid config %d for FOR_SYSTEM", config);
         }
-        mForceUse[usage] = config;
         break;
     case AUDIO_POLICY_FORCE_FOR_HDMI_SYSTEM_AUDIO:
         if (config != AUDIO_POLICY_FORCE_NONE &&
             config != AUDIO_POLICY_FORCE_HDMI_SYSTEM_AUDIO_ENFORCED) {
-            ALOGW("setForceUse() invalid config %d forHDMI_SYSTEM_AUDIO", config);
+            ALOGW("setForceUse() invalid config %d for HDMI_SYSTEM_AUDIO", config);
         }
-        mForceUse[usage] = config;
+        break;
+    case AUDIO_POLICY_FORCE_FOR_ENCODED_SURROUND:
+        if (config != AUDIO_POLICY_FORCE_NONE &&
+                config != AUDIO_POLICY_FORCE_ENCODED_SURROUND_NEVER &&
+                config != AUDIO_POLICY_FORCE_ENCODED_SURROUND_ALWAYS &&
+                config != AUDIO_POLICY_FORCE_ENCODED_SURROUND_MANUAL) {
+            ALOGW("setForceUse() invalid config %d for ENCODED_SURROUND", config);
+            return BAD_VALUE;
+        }
+        break;
+    case AUDIO_POLICY_FORCE_FOR_VIBRATE_RINGING:
+        if (config != AUDIO_POLICY_FORCE_BT_SCO && config != AUDIO_POLICY_FORCE_NONE) {
+            ALOGW("setForceUse() invalid config %d for FOR_VIBRATE_RINGING", config);
+            return BAD_VALUE;
+        }
         break;
     default:
         ALOGW("setForceUse() invalid usage %d", usage);
-        break;
+        break; // TODO return BAD_VALUE?
     }
-    return NO_ERROR;
+    return EngineBase::setForceUse(usage, config);
 }
 
-routing_strategy Engine::getStrategyForStream(audio_stream_type_t stream)
+audio_devices_t Engine::getDeviceForStrategyInt(legacy_strategy strategy,
+                                                DeviceVector availableOutputDevices,
+                                                DeviceVector availableInputDevices,
+                                                const SwAudioOutputCollection &outputs,
+                                                uint32_t outputDeviceTypesToIgnore) const
 {
-    // stream to strategy mapping
-    switch (stream) {
-    case AUDIO_STREAM_VOICE_CALL:
-    case AUDIO_STREAM_BLUETOOTH_SCO:
-        return STRATEGY_PHONE;
-    case AUDIO_STREAM_RING:
-    case AUDIO_STREAM_ALARM:
-        return STRATEGY_SONIFICATION;
-    case AUDIO_STREAM_NOTIFICATION:
-        return STRATEGY_SONIFICATION_RESPECTFUL;
-    case AUDIO_STREAM_DTMF:
-        return STRATEGY_DTMF;
-    default:
-#ifndef MTK_AUDIO
-        ALOGE("unknown stream type %d", stream);
-#endif
-    case AUDIO_STREAM_SYSTEM:
-        // NOTE: SYSTEM stream uses MEDIA strategy because muting music and switching outputs
-        // while key clicks are played produces a poor result
-    case AUDIO_STREAM_MUSIC:
-#ifdef MTK_AUDIO
-    case AUDIO_STREAM_BOOT:
-    case AUDIO_STREAM_VIBSPK:
-#endif
-        return STRATEGY_MEDIA;
-    case AUDIO_STREAM_ENFORCED_AUDIBLE:
-        return STRATEGY_ENFORCED_AUDIBLE;
-    case AUDIO_STREAM_TTS:
-        return STRATEGY_TRANSMITTED_THROUGH_SPEAKER;
-    case AUDIO_STREAM_ACCESSIBILITY:
-        return STRATEGY_ACCESSIBILITY;
-    case AUDIO_STREAM_REROUTING:
-        return STRATEGY_REROUTING;
-    }
-}
-
-routing_strategy Engine::getStrategyForUsage(audio_usage_t usage)
-{
-    const SwAudioOutputCollection &outputs = mApmObserver->getOutputs();
-
-    // usage to strategy mapping
-    switch (usage) {
-    case AUDIO_USAGE_ASSISTANCE_ACCESSIBILITY:
-        if (outputs.isStreamActive(AUDIO_STREAM_RING) ||
-                outputs.isStreamActive(AUDIO_STREAM_ALARM)) {
-            return STRATEGY_SONIFICATION;
-        }
-        if (isInCall()) {
-            return STRATEGY_PHONE;
-        }
-        return STRATEGY_ACCESSIBILITY;
-
-    case AUDIO_USAGE_MEDIA:
-    case AUDIO_USAGE_GAME:
-    case AUDIO_USAGE_ASSISTANCE_NAVIGATION_GUIDANCE:
-    case AUDIO_USAGE_ASSISTANCE_SONIFICATION:
-#ifdef MTK_AUDIO
-    case AUDIO_USAGE_BOOT:
-    case AUDIO_USAGE_VIBSPK:
-#endif
-        return STRATEGY_MEDIA;
-
-    case AUDIO_USAGE_VOICE_COMMUNICATION:
-        return STRATEGY_PHONE;
-
-    case AUDIO_USAGE_VOICE_COMMUNICATION_SIGNALLING:
-        return STRATEGY_DTMF;
-
-    case AUDIO_USAGE_ALARM:
-    case AUDIO_USAGE_NOTIFICATION_TELEPHONY_RINGTONE:
-        return STRATEGY_SONIFICATION;
-
-    case AUDIO_USAGE_NOTIFICATION:
-    case AUDIO_USAGE_NOTIFICATION_COMMUNICATION_REQUEST:
-    case AUDIO_USAGE_NOTIFICATION_COMMUNICATION_INSTANT:
-    case AUDIO_USAGE_NOTIFICATION_COMMUNICATION_DELAYED:
-    case AUDIO_USAGE_NOTIFICATION_EVENT:
-        return STRATEGY_SONIFICATION_RESPECTFUL;
-
-    case AUDIO_USAGE_UNKNOWN:
-    default:
-        return STRATEGY_MEDIA;
-    }
-}
-
-audio_devices_t Engine::getDeviceForStrategy(routing_strategy strategy, audio_output_flags_t flags) const
-{
-    const DeviceVector &availableOutputDevices = mApmObserver->getAvailableOutputDevices();
-    const DeviceVector &availableInputDevices = mApmObserver->getAvailableInputDevices();
-#ifdef MTK_AUDIO
-    AudioPolicyVendorControl &mAudioPolicyVendorControl = mApmObserver->getAudioPolicyVendorControl();
-#endif
-
-    const SwAudioOutputCollection &outputs = mApmObserver->getOutputs();
-
     uint32_t device = AUDIO_DEVICE_NONE;
-    uint32_t availableOutputDevicesType = availableOutputDevices.types();
-
+    uint32_t availableOutputDevicesType =
+            availableOutputDevices.types() & ~outputDeviceTypesToIgnore;
+    AudioPolicyVendorControl &mAudioPolicyVendorControl = getApmObserver()->getAudioPolicyVendorControl();
     switch (strategy) {
 
     case STRATEGY_TRANSMITTED_THROUGH_SPEAKER:
         device = availableOutputDevicesType & AUDIO_DEVICE_OUT_SPEAKER;
-        if (!device) {
-            ALOGE("getDeviceForStrategy() no device found for "\
-                    "STRATEGY_TRANSMITTED_THROUGH_SPEAKER");
-        }
         break;
 
     case STRATEGY_SONIFICATION_RESPECTFUL:
-        if (isInCall()) {
-            device = getDeviceForStrategy(STRATEGY_SONIFICATION);
-        } else if (outputs.isStreamActiveRemotely(AUDIO_STREAM_MUSIC,
-                SONIFICATION_RESPECTFUL_AFTER_MUSIC_DELAY)) {
-            // while media is playing on a remote device, use the the sonification behavior.
-            // Note that we test this usecase before testing if media is playing because
-            //   the isStreamActive() method only informs about the activity of a stream, not
-            //   if it's for local playback. Note also that we use the same delay between both tests
-            device = getDeviceForStrategy(STRATEGY_SONIFICATION);
-            //user "safe" speaker if available instead of normal speaker to avoid triggering
-            //other acoustic safety mechanisms for notification
-            if ((device & AUDIO_DEVICE_OUT_SPEAKER) &&
-                    (availableOutputDevicesType & AUDIO_DEVICE_OUT_SPEAKER_SAFE)) {
-                device |= AUDIO_DEVICE_OUT_SPEAKER_SAFE;
-                device &= ~AUDIO_DEVICE_OUT_SPEAKER;
-            }
-        } else if (outputs.isStreamActive(AUDIO_STREAM_MUSIC, SONIFICATION_RESPECTFUL_AFTER_MUSIC_DELAY)) {
-            // while media is playing (or has recently played), use the same device
-            device = getDeviceForStrategy(STRATEGY_MEDIA);
+        if (isInCall() || outputs.isActiveLocally(toVolumeSource(AUDIO_STREAM_VOICE_CALL))) {
+            device = getDeviceForStrategyInt(
+                    STRATEGY_SONIFICATION, availableOutputDevices, availableInputDevices, outputs,
+                    outputDeviceTypesToIgnore);
         } else {
-            // when media is not playing anymore, fall back on the sonification behavior
-            device = getDeviceForStrategy(STRATEGY_SONIFICATION);
-            //user "safe" speaker if available instead of normal speaker to avoid triggering
-            //other acoustic safety mechanisms for notification
-            if ((device & AUDIO_DEVICE_OUT_SPEAKER) &&
-                    (availableOutputDevicesType & AUDIO_DEVICE_OUT_SPEAKER_SAFE)) {
+            bool media_active_locally =
+                    outputs.isActiveLocally(toVolumeSource(AUDIO_STREAM_MUSIC),
+                                            SONIFICATION_RESPECTFUL_AFTER_MUSIC_DELAY)
+                    || outputs.isActiveLocally(
+                        toVolumeSource(AUDIO_STREAM_ACCESSIBILITY),
+                        SONIFICATION_RESPECTFUL_AFTER_MUSIC_DELAY);
+            // routing is same as media without the "remote" device
+            device = getDeviceForStrategyInt(STRATEGY_MEDIA,
+                    availableOutputDevices,
+                    availableInputDevices, outputs,
+                    AUDIO_DEVICE_OUT_REMOTE_SUBMIX | outputDeviceTypesToIgnore);
+            // if no media is playing on the device, check for mandatory use of "safe" speaker
+            // when media would have played on speaker, and the safe speaker path is available
+            if (!media_active_locally
+                    && (device & AUDIO_DEVICE_OUT_SPEAKER)
+                    && (availableOutputDevicesType & AUDIO_DEVICE_OUT_SPEAKER_SAFE)) {
                 device |= AUDIO_DEVICE_OUT_SPEAKER_SAFE;
                 device &= ~AUDIO_DEVICE_OUT_SPEAKER;
             }
@@ -390,11 +194,13 @@ audio_devices_t Engine::getDeviceForStrategy(routing_strategy strategy, audio_ou
     case STRATEGY_DTMF:
         if (!isInCall()) {
             // when off call, DTMF strategy follows the same rules as MEDIA strategy
-            device = getDeviceForStrategy(STRATEGY_MEDIA);
+            device = getDeviceForStrategyInt(
+                    STRATEGY_MEDIA, availableOutputDevices, availableInputDevices, outputs,
+                    outputDeviceTypesToIgnore);
             break;
         }
         // when in call, DTMF and PHONE strategies follow the same rules
-        // FALL THROUGH
+        FALLTHROUGH_INTENDED;
 
     case STRATEGY_PHONE:
         // Force use of only devices on primary output if:
@@ -405,25 +211,30 @@ audio_devices_t Engine::getDeviceForStrategy(routing_strategy strategy, audio_ou
             audio_devices_t txDevice = getDeviceForInputSource(AUDIO_SOURCE_VOICE_COMMUNICATION);
             sp<AudioOutputDescriptor> primaryOutput = outputs.getPrimaryOutput();
             audio_devices_t availPrimaryInputDevices =
-                 availableInputDevices.getDevicesFromHwModule(primaryOutput->getModuleHandle());
+                 availableInputDevices.getDeviceTypesFromHwModule(primaryOutput->getModuleHandle());
+
+            // TODO: getPrimaryOutput return only devices from first module in
+            // audio_policy_configuration.xml, hearing aid is not there, but it's
+            // a primary device
+            // FIXME: this is not the right way of solving this problem
             audio_devices_t availPrimaryOutputDevices =
-                    primaryOutput->supportedDevices() & availableOutputDevices.types();
+                (primaryOutput->supportedDevices().types() | AUDIO_DEVICE_OUT_HEARING_AID) &
+                availableOutputDevices.types();
 
             if (((availableInputDevices.types() &
                     AUDIO_DEVICE_IN_TELEPHONY_RX & ~AUDIO_DEVICE_BIT_IN) == 0) ||
-#ifdef MTK_AUDIO
-                     //Device Telephone TX and RX should simultaneously exist, AUDIO_DEVICE_OUT_TELEPHONY_TX not using yet.
+#if defined(MTK_AUDIO)
+                    //Device Telephone TX and RX should simultaneously exist, AUDIO_DEVICE_OUT_TELEPHONY_TX not using yet.
                     ((availableOutputDevices.types() & AUDIO_DEVICE_OUT_TELEPHONY_TX ) == 0) ||
 #endif
                     (((txDevice & availPrimaryInputDevices & ~AUDIO_DEVICE_BIT_IN) != 0) &&
-                         (primaryOutput->getAudioPort()->getModuleVersion() <
-                             AUDIO_DEVICE_API_VERSION_3_0))) {
+                         (primaryOutput->getAudioPort()->getModuleVersionMajor() < 3))) {
                 availableOutputDevicesType = availPrimaryOutputDevices;
             }
         }
-        // for phone strategy, we first consider the forced use and then the available devices by order
-        // of priority
-        switch (mForceUse[AUDIO_POLICY_FORCE_FOR_COMMUNICATION]) {
+        // for phone strategy, we first consider the forced use and then the available devices by
+        // order of priority
+        switch (getForceUse(AUDIO_POLICY_FORCE_FOR_COMMUNICATION)) {
         case AUDIO_POLICY_FORCE_BT_SCO:
             if (!isInCall() || strategy != STRATEGY_DTMF) {
                 device = availableOutputDevicesType & AUDIO_DEVICE_OUT_BLUETOOTH_SCO_CARKIT;
@@ -434,17 +245,15 @@ audio_devices_t Engine::getDeviceForStrategy(routing_strategy strategy, audio_ou
             device = availableOutputDevicesType & AUDIO_DEVICE_OUT_BLUETOOTH_SCO;
             if (device) break;
             // if SCO device is requested but no SCO device is available, fall back to default case
-            // FALL THROUGH
+            FALLTHROUGH_INTENDED;
 
         default:    // FORCE_NONE
+            device = availableOutputDevicesType & AUDIO_DEVICE_OUT_HEARING_AID;
+            if (device) break;
             // when not in a phone call, phone strategy should route STREAM_VOICE_CALL to A2DP
             if (!isInCall() &&
-                    (mForceUse[AUDIO_POLICY_FORCE_FOR_MEDIA] != AUDIO_POLICY_FORCE_NO_BT_A2DP) &&
-                    (outputs.getA2dpOutput() != 0)
-#ifdef MTK_AUDIO
-                    && !mAudioPolicyVendorControl.getA2DPForeceIgnoreStatus()
-#endif
-            ) {
+                    (getForceUse(AUDIO_POLICY_FORCE_FOR_MEDIA) != AUDIO_POLICY_FORCE_NO_BT_A2DP) &&
+                     outputs.isA2dpSupported()) {
                 device = availableOutputDevicesType & AUDIO_DEVICE_OUT_BLUETOOTH_A2DP;
                 if (device) break;
                 device = availableOutputDevicesType & AUDIO_DEVICE_OUT_BLUETOOTH_A2DP_HEADPHONES;
@@ -453,6 +262,16 @@ audio_devices_t Engine::getDeviceForStrategy(routing_strategy strategy, audio_ou
             device = availableOutputDevicesType & AUDIO_DEVICE_OUT_WIRED_HEADPHONE;
             if (device) break;
             device = availableOutputDevicesType & AUDIO_DEVICE_OUT_WIRED_HEADSET;
+            if (device) break;
+            device = availableOutputDevicesType & AUDIO_DEVICE_OUT_LINE;
+            if (device) break;
+            if (FeatureOption::MTK_USB_PHONECALL) {
+                if (mAudioPolicyVendorControl.getStillInCallWithoutEnteringNormal()) {
+                    device = availableOutputDevicesType & AUDIO_DEVICE_OUT_BUS;
+                    if (device) break;
+                }
+            }
+            device = availableOutputDevicesType & AUDIO_DEVICE_OUT_USB_HEADSET;
             if (device) break;
             device = availableOutputDevicesType & AUDIO_DEVICE_OUT_USB_DEVICE;
             if (device) break;
@@ -467,23 +286,14 @@ audio_devices_t Engine::getDeviceForStrategy(routing_strategy strategy, audio_ou
                 if (device) break;
             }
             device = availableOutputDevicesType & AUDIO_DEVICE_OUT_EARPIECE;
-            if (device) break;
-            device = mApmObserver->getDefaultOutputDevice()->type();
-            if (device == AUDIO_DEVICE_NONE) {
-                ALOGE("getDeviceForStrategy() no device found for STRATEGY_PHONE");
-            }
             break;
 
         case AUDIO_POLICY_FORCE_SPEAKER:
             // when not in a phone call, phone strategy should route STREAM_VOICE_CALL to
             // A2DP speaker when forcing to speaker output
             if (!isInCall() &&
-                    (mForceUse[AUDIO_POLICY_FORCE_FOR_MEDIA] != AUDIO_POLICY_FORCE_NO_BT_A2DP) &&
-                    (outputs.getA2dpOutput() != 0)
-#ifdef MTK_AUDIO
-                    && !mAudioPolicyVendorControl.getA2DPForeceIgnoreStatus()
-#endif
-          ) {
+                    (getForceUse(AUDIO_POLICY_FORCE_FOR_MEDIA) != AUDIO_POLICY_FORCE_NO_BT_A2DP) &&
+                     outputs.isA2dpSupported()) {
                 device = availableOutputDevicesType & AUDIO_DEVICE_OUT_BLUETOOTH_A2DP_SPEAKER;
                 if (device) break;
             }
@@ -499,27 +309,22 @@ audio_devices_t Engine::getDeviceForStrategy(routing_strategy strategy, audio_ou
                 device = availableOutputDevicesType & AUDIO_DEVICE_OUT_ANLG_DOCK_HEADSET;
                 if (device) break;
             }
-            device = availableOutputDevicesType & AUDIO_DEVICE_OUT_LINE;
-            if (device) break;
             device = availableOutputDevicesType & AUDIO_DEVICE_OUT_SPEAKER;
-            if (device) break;
-            device = mApmObserver->getDefaultOutputDevice()->type();
-            if (device == AUDIO_DEVICE_NONE) {
-                ALOGE("getDeviceForStrategy() no device found for STRATEGY_PHONE, FORCE_SPEAKER");
-            }
             break;
         }
     break;
 
     case STRATEGY_SONIFICATION:
 
-        // If incall, just select the STRATEGY_PHONE device: The rest of the behavior is handled by
-        // handleIncallSonification().
-        if (isInCall()) {
-            device = getDeviceForStrategy(STRATEGY_PHONE);
+        // If incall, just select the STRATEGY_PHONE device
+        if (isInCall() ||
+                outputs.isActiveLocally(toVolumeSource(AUDIO_STREAM_VOICE_CALL))) {
+            device = getDeviceForStrategyInt(
+                    STRATEGY_PHONE, availableOutputDevices, availableInputDevices, outputs,
+                    outputDeviceTypesToIgnore);
             break;
         }
-        // FALL THROUGH
+        FALLTHROUGH_INTENDED;
 
     case STRATEGY_ENFORCED_AUDIBLE:
         // strategy STRATEGY_ENFORCED_AUDIBLE uses same routing policy as STRATEGY_SONIFICATION
@@ -528,68 +333,104 @@ audio_devices_t Engine::getDeviceForStrategy(routing_strategy strategy, audio_ou
         //   - in countries where not enforced in which case it follows STRATEGY_MEDIA
 
         if ((strategy == STRATEGY_SONIFICATION) ||
-                (mForceUse[AUDIO_POLICY_FORCE_FOR_SYSTEM] == AUDIO_POLICY_FORCE_SYSTEM_ENFORCED)) {
+                (getForceUse(AUDIO_POLICY_FORCE_FOR_SYSTEM) == AUDIO_POLICY_FORCE_SYSTEM_ENFORCED)) {
             device = availableOutputDevicesType & AUDIO_DEVICE_OUT_SPEAKER;
-            if (device == AUDIO_DEVICE_NONE) {
-                ALOGE("getDeviceForStrategy() speaker device not found for STRATEGY_SONIFICATION");
+        }
+
+        // if SCO headset is connected and we are told to use it, play ringtone over
+        // speaker and BT SCO
+        if ((availableOutputDevicesType & AUDIO_DEVICE_OUT_ALL_SCO) != 0) {
+            uint32_t device2 = AUDIO_DEVICE_NONE;
+            device2 = availableOutputDevicesType & AUDIO_DEVICE_OUT_BLUETOOTH_SCO_CARKIT;
+            if (device2 == AUDIO_DEVICE_NONE) {
+                device2 = availableOutputDevicesType & AUDIO_DEVICE_OUT_BLUETOOTH_SCO_HEADSET;
+            }
+            if (device2 == AUDIO_DEVICE_NONE) {
+                device2 = availableOutputDevicesType & AUDIO_DEVICE_OUT_BLUETOOTH_SCO;
+            }
+            // Use ONLY Bluetooth SCO output when ringing in vibration mode
+            if (!((getForceUse(AUDIO_POLICY_FORCE_FOR_SYSTEM) == AUDIO_POLICY_FORCE_SYSTEM_ENFORCED)
+                    && (strategy == STRATEGY_ENFORCED_AUDIBLE))) {
+                if (getForceUse(AUDIO_POLICY_FORCE_FOR_VIBRATE_RINGING)
+                        == AUDIO_POLICY_FORCE_BT_SCO) {
+                    if (device2 != AUDIO_DEVICE_NONE) {
+                        device = device2;
+                        break;
+                    }
+                }
+            }
+            // Use both Bluetooth SCO and phone default output when ringing in normal mode
+            if (getForceUse(AUDIO_POLICY_FORCE_FOR_COMMUNICATION) == AUDIO_POLICY_FORCE_BT_SCO) {
+                if ((strategy == STRATEGY_SONIFICATION) &&
+                        (device & AUDIO_DEVICE_OUT_SPEAKER) &&
+                        (availableOutputDevicesType & AUDIO_DEVICE_OUT_SPEAKER_SAFE)) {
+                    device |= AUDIO_DEVICE_OUT_SPEAKER_SAFE;
+                    device &= ~AUDIO_DEVICE_OUT_SPEAKER;
+                }
+                if (device2 != AUDIO_DEVICE_NONE) {
+                    device |= device2;
+                    break;
+                }
             }
         }
         // The second device used for sonification is the same as the device used by media strategy
-        // FALL THROUGH
+        FALLTHROUGH_INTENDED;
 
-    // FIXME: STRATEGY_ACCESSIBILITY and STRATEGY_REROUTING follow STRATEGY_MEDIA for now
     case STRATEGY_ACCESSIBILITY:
         if (strategy == STRATEGY_ACCESSIBILITY) {
             // do not route accessibility prompts to a digital output currently configured with a
             // compressed format as they would likely not be mixed and dropped.
             for (size_t i = 0; i < outputs.size(); i++) {
                 sp<AudioOutputDescriptor> desc = outputs.valueAt(i);
-                audio_devices_t devices = desc->device() &
+                audio_devices_t devices = desc->devices().types() &
                     (AUDIO_DEVICE_OUT_HDMI | AUDIO_DEVICE_OUT_SPDIF | AUDIO_DEVICE_OUT_HDMI_ARC);
                 if (desc->isActive() && !audio_is_linear_pcm(desc->mFormat) &&
                         devices != AUDIO_DEVICE_NONE) {
                     availableOutputDevicesType = availableOutputDevices.types() & ~devices;
                 }
             }
+            availableOutputDevices =
+                    availableOutputDevices.getDevicesFromTypeMask(availableOutputDevicesType);
+            if (outputs.isActive(toVolumeSource(AUDIO_STREAM_RING)) ||
+                    outputs.isActive(toVolumeSource(AUDIO_STREAM_ALARM))) {
+                return getDeviceForStrategyInt(
+                    STRATEGY_SONIFICATION, availableOutputDevices, availableInputDevices, outputs,
+                    outputDeviceTypesToIgnore);
+            }
+            if (isInCall()) {
+                return getDeviceForStrategyInt(
+                        STRATEGY_PHONE, availableOutputDevices, availableInputDevices, outputs,
+                        outputDeviceTypesToIgnore);
+            }
         }
-        // FALL THROUGH
+        // For other cases, STRATEGY_ACCESSIBILITY behaves like STRATEGY_MEDIA
+        FALLTHROUGH_INTENDED;
 
+    // FIXME: STRATEGY_REROUTING follow STRATEGY_MEDIA for now
     case STRATEGY_REROUTING:
     case STRATEGY_MEDIA: {
-#ifdef MTK_CROSSMOUNT_SUPPORT
-        uint32_t deviceCrossMountMaster = AUDIO_DEVICE_NONE;
-#endif
         uint32_t device2 = AUDIO_DEVICE_NONE;
         if (strategy != STRATEGY_SONIFICATION) {
             // no sonification on remote submix (e.g. WFD)
-            if (availableOutputDevices.getDevice(AUDIO_DEVICE_OUT_REMOTE_SUBMIX, String8("0")) != 0) {
+            if (availableOutputDevices.getDevice(AUDIO_DEVICE_OUT_REMOTE_SUBMIX,
+                                                 String8("0"), AUDIO_FORMAT_DEFAULT) != 0) {
                 device2 = availableOutputDevices.types() & AUDIO_DEVICE_OUT_REMOTE_SUBMIX;
-#ifdef MTK_CROSSMOUNT_SUPPORT
-                if (mForceUse[AUDIO_POLICY_FORCE_FOR_RECORD] == AUDIO_POLICY_FORCE_REMOTE_SUBMIX_IN_WITH_FLAGS && !mAudioPolicyVendorControl.getCrossMountMicAudioMixerEnable()) {
-                    if ((flags & AUDIO_OUTPUT_FLAG_TO_REMOTE_SUBMIX) == 0) {
-                        device2 = AUDIO_DEVICE_NONE;
-                    } else if (mAudioPolicyVendorControl.getCrossMountMicLocalPlayback() && device == AUDIO_DEVICE_NONE) {
-                        deviceCrossMountMaster = device2;
-                        device2 = AUDIO_DEVICE_NONE;
-                    }
-                } else if (mAudioPolicyVendorControl.getCrossMountLocalPlayback() && device == AUDIO_DEVICE_NONE) {
-                    deviceCrossMountMaster = device2;
-                    device2 = AUDIO_DEVICE_NONE;
-                }
-#endif
             }
         }
         if (isInCall() && (strategy == STRATEGY_MEDIA)) {
-            device = getDeviceForStrategy(STRATEGY_PHONE);
+            device = getDeviceForStrategyInt(
+                    STRATEGY_PHONE, availableOutputDevices, availableInputDevices, outputs,
+                    outputDeviceTypesToIgnore);
             break;
         }
+        // FIXME: Find a better solution to prevent routing to BT hearing aid(b/122931261).
         if ((device2 == AUDIO_DEVICE_NONE) &&
-                (mForceUse[AUDIO_POLICY_FORCE_FOR_MEDIA] != AUDIO_POLICY_FORCE_NO_BT_A2DP) &&
-                (outputs.getA2dpOutput() != 0)
-#ifdef MTK_AUDIO
-                && !mAudioPolicyVendorControl.getA2DPForeceIgnoreStatus()
-#endif
-      ) {
+                (getForceUse(AUDIO_POLICY_FORCE_FOR_MEDIA) != AUDIO_POLICY_FORCE_NO_BT_A2DP)) {
+            device2 = availableOutputDevicesType & AUDIO_DEVICE_OUT_HEARING_AID;
+        }
+        if ((device2 == AUDIO_DEVICE_NONE) &&
+                (getForceUse(AUDIO_POLICY_FORCE_FOR_MEDIA) != AUDIO_POLICY_FORCE_NO_BT_A2DP) &&
+                 outputs.isA2dpSupported()) {
             device2 = availableOutputDevicesType & AUDIO_DEVICE_OUT_BLUETOOTH_A2DP;
             if (device2 == AUDIO_DEVICE_NONE) {
                 device2 = availableOutputDevicesType & AUDIO_DEVICE_OUT_BLUETOOTH_A2DP_HEADPHONES;
@@ -599,16 +440,9 @@ audio_devices_t Engine::getDeviceForStrategy(routing_strategy strategy, audio_ou
             }
         }
         if ((device2 == AUDIO_DEVICE_NONE) &&
-            (mForceUse[AUDIO_POLICY_FORCE_FOR_MEDIA] == AUDIO_POLICY_FORCE_SPEAKER)) {
+            (getForceUse(AUDIO_POLICY_FORCE_FOR_MEDIA) == AUDIO_POLICY_FORCE_SPEAKER)) {
             device2 = availableOutputDevicesType & AUDIO_DEVICE_OUT_SPEAKER;
         }
-#ifdef MTK_AUDIO
-        //ALOGD("availableOutputDeviceTypes %x",availableOutputDeviceTypes);
-        //ALOGD("mForceUse[%d] = %x",AUDIO_POLICY_FORCE_FOR_MEDIA,mForceUse[AUDIO_POLICY_FORCE_FOR_MEDIA]);
-        if (device2 == AUDIO_DEVICE_NONE && mAudioPolicyVendorControl.getFMTxStatus() && !(device&AUDIO_DEVICE_OUT_SPEAKER)) {
-            device2 = availableOutputDevicesType & AUDIO_DEVICE_OUT_FM;
-        }
-#endif
         if (device2 == AUDIO_DEVICE_NONE) {
             device2 = availableOutputDevicesType & AUDIO_DEVICE_OUT_WIRED_HEADPHONE;
         }
@@ -619,7 +453,15 @@ audio_devices_t Engine::getDeviceForStrategy(routing_strategy strategy, audio_ou
             device2 = availableOutputDevicesType & AUDIO_DEVICE_OUT_WIRED_HEADSET;
         }
         if (device2 == AUDIO_DEVICE_NONE) {
+            device2 = availableOutputDevicesType & AUDIO_DEVICE_OUT_USB_HEADSET;
+        }
+        if (device2 == AUDIO_DEVICE_NONE) {
             device2 = availableOutputDevicesType & AUDIO_DEVICE_OUT_USB_ACCESSORY;
+        }
+        if (FeatureOption::MTK_USB_PHONECALL) {
+            if (mAudioPolicyVendorControl.getStillInCallWithoutEnteringNormal()) {
+                device2 = availableOutputDevicesType & AUDIO_DEVICE_OUT_BUS;
+            }
         }
         if (device2 == AUDIO_DEVICE_NONE) {
             device2 = availableOutputDevicesType & AUDIO_DEVICE_OUT_USB_DEVICE;
@@ -632,7 +474,7 @@ audio_devices_t Engine::getDeviceForStrategy(routing_strategy strategy, audio_ou
             device2 = availableOutputDevicesType & AUDIO_DEVICE_OUT_AUX_DIGITAL;
         }
         if ((device2 == AUDIO_DEVICE_NONE) &&
-                (mForceUse[AUDIO_POLICY_FORCE_FOR_DOCK] == AUDIO_POLICY_FORCE_ANALOG_DOCK)) {
+                (getForceUse(AUDIO_POLICY_FORCE_FOR_DOCK) == AUDIO_POLICY_FORCE_ANALOG_DOCK)) {
             device2 = availableOutputDevicesType & AUDIO_DEVICE_OUT_ANLG_DOCK_HEADSET;
         }
         if (device2 == AUDIO_DEVICE_NONE) {
@@ -650,21 +492,21 @@ audio_devices_t Engine::getDeviceForStrategy(routing_strategy strategy, audio_ou
         // device is DEVICE_OUT_SPEAKER if we come from case STRATEGY_SONIFICATION or
         // STRATEGY_ENFORCED_AUDIBLE, AUDIO_DEVICE_NONE otherwise
         device |= device2;
-#ifdef MTK_CROSSMOUNT_SUPPORT
-        device |= deviceCrossMountMaster;
-#endif
 
         // If hdmi system audio mode is on, remove speaker out of output list.
         if ((strategy == STRATEGY_MEDIA) &&
-            (mForceUse[AUDIO_POLICY_FORCE_FOR_HDMI_SYSTEM_AUDIO] ==
+            (getForceUse(AUDIO_POLICY_FORCE_FOR_HDMI_SYSTEM_AUDIO) ==
                 AUDIO_POLICY_FORCE_HDMI_SYSTEM_AUDIO_ENFORCED)) {
             device &= ~AUDIO_DEVICE_OUT_SPEAKER;
         }
 
-        if (device) break;
-        device = mApmObserver->getDefaultOutputDevice()->type();
-        if (device == AUDIO_DEVICE_NONE) {
-            ALOGE("getDeviceForStrategy() no device found for STRATEGY_MEDIA");
+        // for STRATEGY_SONIFICATION:
+        // if SPEAKER was selected, and SPEAKER_SAFE is available, use SPEAKER_SAFE instead
+        if ((strategy == STRATEGY_SONIFICATION) &&
+                (device & AUDIO_DEVICE_OUT_SPEAKER) &&
+                (availableOutputDevicesType & AUDIO_DEVICE_OUT_SPEAKER_SAFE)) {
+            device |= AUDIO_DEVICE_OUT_SPEAKER_SAFE;
+            device &= ~AUDIO_DEVICE_OUT_SPEAKER;
         }
         } break;
 
@@ -673,12 +515,23 @@ audio_devices_t Engine::getDeviceForStrategy(routing_strategy strategy, audio_ou
         break;
     }
 
-#ifdef MTK_AUDIO
-#ifdef MTK_CROSSMOUNT_SUPPORT
-    ALOGD("s %d avaDev 0x%x ba2dpo %d dev 0x%x  CM-spk %d CM-mic %d",strategy,availableOutputDevicesType,outputs.getA2dpOutput(),device,mAudioPolicyVendorControl.getCrossMountLocalPlayback(),mAudioPolicyVendorControl.getCrossMountMicLocalPlayback());
+    if (device == AUDIO_DEVICE_NONE) {
+        ALOGV("getDeviceForStrategy() no device found for strategy %d", strategy);
+        device = getApmObserver()->getDefaultOutputDevice()->type();
+        ALOGE_IF(device == AUDIO_DEVICE_NONE,
+                 "getDeviceForStrategy() no default device defined");
+    }
+#if defined(MTK_AUDIO_DEBUG)
+#if defined(CONFIG_MT_ENG_BUILD)
+    routing_strategy printStrategy = STRATEGY_SONIFICATION_RESPECTFUL;
 #else
-    ALOGD("s %d avaDev 0x%x ba2dpo %d dev 0x%x",strategy,availableOutputDevicesType,outputs.getA2dpOutput(),device);
+    routing_strategy printStrategy = STRATEGY_PHONE;
 #endif
+    if (log_enable && strategy <= printStrategy) {
+        ALOGD("s %d avaDev 0x%x ba2dpo %d dev 0x%x sfu [0]:%d [1]:%d [4]:%d", strategy, availableOutputDevicesType,
+            outputs.getA2dpOutput(), device, mForceUse[AUDIO_POLICY_FORCE_FOR_COMMUNICATION], mForceUse[AUDIO_POLICY_FORCE_FOR_MEDIA],
+            mForceUse[AUDIO_POLICY_FORCE_FOR_SYSTEM]);
+    }
 #else
     ALOGVV("getDeviceForStrategy() strategy %d, device %x", strategy, device);
 #endif
@@ -688,41 +541,50 @@ audio_devices_t Engine::getDeviceForStrategy(routing_strategy strategy, audio_ou
 
 audio_devices_t Engine::getDeviceForInputSource(audio_source_t inputSource) const
 {
-    const DeviceVector &availableOutputDevices = mApmObserver->getAvailableOutputDevices();
-    const DeviceVector &availableInputDevices = mApmObserver->getAvailableInputDevices();
-    const SwAudioOutputCollection &outputs = mApmObserver->getOutputs();
-#ifdef MTK_AUDIO
-    AudioPolicyVendorControl &mAudioPolicyVendorControl = mApmObserver->getAudioPolicyVendorControl();
-#endif
+    const DeviceVector availableOutputDevices = getApmObserver()->getAvailableOutputDevices();
+    const DeviceVector availableInputDevices = getApmObserver()->getAvailableInputDevices();
+    const SwAudioOutputCollection &outputs = getApmObserver()->getOutputs();
     audio_devices_t availableDeviceTypes = availableInputDevices.types() & ~AUDIO_DEVICE_BIT_IN;
-
+    sp<AudioOutputDescriptor> primaryOutput = outputs.getPrimaryOutput();
+    audio_devices_t availablePrimaryDeviceTypes = availableInputDevices.getDeviceTypesFromHwModule(
+        primaryOutput->getModuleHandle()) & ~AUDIO_DEVICE_BIT_IN;
+    AudioPolicyVendorControl &mAudioPolicyVendorControl = getApmObserver()->getAudioPolicyVendorControl();
     uint32_t device = AUDIO_DEVICE_NONE;
 
-    switch (inputSource) {
-    case AUDIO_SOURCE_VOICE_UPLINK:
-      if (availableDeviceTypes & AUDIO_DEVICE_IN_VOICE_CALL) {
-          device = AUDIO_DEVICE_IN_VOICE_CALL;
-          break;
-      }
-      break;
+    // when a call is active, force device selection to match source VOICE_COMMUNICATION
+    // for most other input sources to avoid rerouting call TX audio
+    if (isInCall()) {
+        switch (inputSource) {
+        case AUDIO_SOURCE_DEFAULT:
+        case AUDIO_SOURCE_MIC:
+        case AUDIO_SOURCE_VOICE_RECOGNITION:
+        case AUDIO_SOURCE_UNPROCESSED:
+        case AUDIO_SOURCE_HOTWORD:
+        case AUDIO_SOURCE_CAMCORDER:
+        case AUDIO_SOURCE_VOICE_PERFORMANCE:
+            inputSource = AUDIO_SOURCE_VOICE_COMMUNICATION;
+            break;
+        default:
+            break;
+        }
+    }
 
+    switch (inputSource) {
     case AUDIO_SOURCE_DEFAULT:
     case AUDIO_SOURCE_MIC:
-#ifdef MTK_CROSSMOUNT_SUPPORT
-    if ((availableDeviceTypes & AUDIO_DEVICE_IN_REMOTE_SUBMIX) &&
-        (mForceUse[AUDIO_POLICY_FORCE_FOR_RECORD] == AUDIO_POLICY_FORCE_REMOTE_SUBMIX_IN_WITH_FLAGS ||
-        mForceUse[AUDIO_POLICY_FORCE_FOR_RECORD] == AUDIO_POLICY_FORCE_REMOTE_SUBMIX_IN) && !mAudioPolicyVendorControl.getCrossMountMicAudioMixerEnable()) {
-        device = AUDIO_DEVICE_IN_REMOTE_SUBMIX;
-        ALOGD("Get AUDIO_DEVICE_IN_REMOTE_SUBMIX for rec");
-    } else
-#endif
     if (availableDeviceTypes & AUDIO_DEVICE_IN_BLUETOOTH_A2DP) {
         device = AUDIO_DEVICE_IN_BLUETOOTH_A2DP;
-    } else if ((mForceUse[AUDIO_POLICY_FORCE_FOR_RECORD] == AUDIO_POLICY_FORCE_BT_SCO) &&
+    } else if ((getForceUse(AUDIO_POLICY_FORCE_FOR_RECORD) == AUDIO_POLICY_FORCE_BT_SCO) &&
         (availableDeviceTypes & AUDIO_DEVICE_IN_BLUETOOTH_SCO_HEADSET)) {
         device = AUDIO_DEVICE_IN_BLUETOOTH_SCO_HEADSET;
     } else if (availableDeviceTypes & AUDIO_DEVICE_IN_WIRED_HEADSET) {
         device = AUDIO_DEVICE_IN_WIRED_HEADSET;
+    } else if (FeatureOption::MTK_USB_PHONECALL && (availableDeviceTypes & AUDIO_DEVICE_IN_BUS) &&
+                    mAudioPolicyVendorControl.getStillInCallWithoutEnteringNormal() &&
+                    (availableOutputDevices.types() & AUDIO_DEVICE_OUT_BUS) != 0) {
+        device = AUDIO_DEVICE_IN_BUS;
+    } else if (availableDeviceTypes & AUDIO_DEVICE_IN_USB_HEADSET) {
+        device = AUDIO_DEVICE_IN_USB_HEADSET;
     } else if (availableDeviceTypes & AUDIO_DEVICE_IN_USB_DEVICE) {
         device = AUDIO_DEVICE_IN_USB_DEVICE;
     } else if (availableDeviceTypes & AUDIO_DEVICE_IN_BUILTIN_MIC) {
@@ -733,40 +595,29 @@ audio_devices_t Engine::getDeviceForInputSource(audio_source_t inputSource) cons
     case AUDIO_SOURCE_VOICE_COMMUNICATION:
         // Allow only use of devices on primary input if in call and HAL does not support routing
         // to voice call path.
-#ifdef MTK_AUDIO
-        if ((mAudioPolicyVendorControl.isStateInCallOnly(getPhoneState())) &&
-                (availableOutputDevices.types() & AUDIO_DEVICE_OUT_TELEPHONY_TX) == 0)
-#else
         if ((getPhoneState() == AUDIO_MODE_IN_CALL) &&
-                (availableOutputDevices.types() & AUDIO_DEVICE_OUT_TELEPHONY_TX) == 0)
-#endif
-        {
-            sp<AudioOutputDescriptor> primaryOutput = outputs.getPrimaryOutput();
-            availableDeviceTypes =
-                    availableInputDevices.getDevicesFromHwModule(primaryOutput->getModuleHandle())
-                    & ~AUDIO_DEVICE_BIT_IN;
+                (availableOutputDevices.types() & AUDIO_DEVICE_OUT_TELEPHONY_TX) == 0) {
+            availableDeviceTypes = availablePrimaryDeviceTypes;
         }
-#ifdef MTK_CROSSMOUNT_SUPPORT
-        if ((availableDeviceTypes & AUDIO_DEVICE_IN_REMOTE_SUBMIX) &&
-            (mForceUse[AUDIO_POLICY_FORCE_FOR_RECORD] == AUDIO_POLICY_FORCE_REMOTE_SUBMIX_IN_WITH_FLAGS ||
-            mForceUse[AUDIO_POLICY_FORCE_FOR_RECORD] == AUDIO_POLICY_FORCE_REMOTE_SUBMIX_IN) && !mAudioPolicyVendorControl.getCrossMountMicAudioMixerEnable()) {
-            device = AUDIO_DEVICE_IN_REMOTE_SUBMIX;
-            ALOGD("Get AUDIO_DEVICE_IN_REMOTE_SUBMIX for rec");
-            break;
-        }
-#endif
-        switch (mForceUse[AUDIO_POLICY_FORCE_FOR_COMMUNICATION]) {
+
+        switch (getForceUse(AUDIO_POLICY_FORCE_FOR_COMMUNICATION)) {
         case AUDIO_POLICY_FORCE_BT_SCO:
             // if SCO device is requested but no SCO device is available, fall back to default case
             if (availableDeviceTypes & AUDIO_DEVICE_IN_BLUETOOTH_SCO_HEADSET) {
                 device = AUDIO_DEVICE_IN_BLUETOOTH_SCO_HEADSET;
                 break;
             }
-            // FALL THROUGH
+            FALLTHROUGH_INTENDED;
 
         default:    // FORCE_NONE
             if (availableDeviceTypes & AUDIO_DEVICE_IN_WIRED_HEADSET) {
                 device = AUDIO_DEVICE_IN_WIRED_HEADSET;
+            } else if (FeatureOption::MTK_USB_PHONECALL && (availableDeviceTypes & AUDIO_DEVICE_IN_BUS) &&
+                            mAudioPolicyVendorControl.getStillInCallWithoutEnteringNormal() &&
+                            (availableOutputDevices.types() & AUDIO_DEVICE_OUT_BUS) != 0) {
+                device = AUDIO_DEVICE_IN_BUS;
+            } else if (availableDeviceTypes & AUDIO_DEVICE_IN_USB_HEADSET) {
+                device = AUDIO_DEVICE_IN_USB_HEADSET;
             } else if (availableDeviceTypes & AUDIO_DEVICE_IN_USB_DEVICE) {
                 device = AUDIO_DEVICE_IN_USB_DEVICE;
             } else if (availableDeviceTypes & AUDIO_DEVICE_IN_BUILTIN_MIC) {
@@ -785,26 +636,22 @@ audio_devices_t Engine::getDeviceForInputSource(audio_source_t inputSource) cons
         break;
 
     case AUDIO_SOURCE_VOICE_RECOGNITION:
+    case AUDIO_SOURCE_UNPROCESSED:
     case AUDIO_SOURCE_HOTWORD:
-#ifdef MTK_AUDIO
-    case AUDIO_SOURCE_VOICE_UNLOCK:
-    case AUDIO_SOURCE_CUSTOMIZATION1:
-    case AUDIO_SOURCE_CUSTOMIZATION2:
-    case AUDIO_SOURCE_CUSTOMIZATION3:
-#ifdef MTK_CROSSMOUNT_SUPPORT
-        if ((availableDeviceTypes & AUDIO_DEVICE_IN_REMOTE_SUBMIX) &&
-            (mForceUse[AUDIO_POLICY_FORCE_FOR_RECORD] == AUDIO_POLICY_FORCE_REMOTE_SUBMIX_IN_WITH_FLAGS ||
-            mForceUse[AUDIO_POLICY_FORCE_FOR_RECORD] == AUDIO_POLICY_FORCE_REMOTE_SUBMIX_IN) && !mAudioPolicyVendorControl.getCrossMountMicAudioMixerEnable()) {
-            device = AUDIO_DEVICE_IN_REMOTE_SUBMIX;
-            ALOGD("Get AUDIO_DEVICE_IN_REMOTE_SUBMIX for rec");
-        } else
-#endif
-#endif
-        if (mForceUse[AUDIO_POLICY_FORCE_FOR_RECORD] == AUDIO_POLICY_FORCE_BT_SCO &&
+        if (inputSource == AUDIO_SOURCE_HOTWORD) {
+            availableDeviceTypes = availablePrimaryDeviceTypes;
+        }
+        if (getForceUse(AUDIO_POLICY_FORCE_FOR_RECORD) == AUDIO_POLICY_FORCE_BT_SCO &&
                 availableDeviceTypes & AUDIO_DEVICE_IN_BLUETOOTH_SCO_HEADSET) {
             device = AUDIO_DEVICE_IN_BLUETOOTH_SCO_HEADSET;
         } else if (availableDeviceTypes & AUDIO_DEVICE_IN_WIRED_HEADSET) {
             device = AUDIO_DEVICE_IN_WIRED_HEADSET;
+        } else if (FeatureOption::MTK_USB_PHONECALL && (availableDeviceTypes & AUDIO_DEVICE_IN_BUS) &&
+                        mAudioPolicyVendorControl.getStillInCallWithoutEnteringNormal()&&
+                        (availableOutputDevices.types() & AUDIO_DEVICE_OUT_BUS) != 0) {
+            device = AUDIO_DEVICE_IN_BUS;
+        } else if (availableDeviceTypes & AUDIO_DEVICE_IN_USB_HEADSET) {
+            device = AUDIO_DEVICE_IN_USB_HEADSET;
         } else if (availableDeviceTypes & AUDIO_DEVICE_IN_USB_DEVICE) {
             device = AUDIO_DEVICE_IN_USB_DEVICE;
         } else if (availableDeviceTypes & AUDIO_DEVICE_IN_BUILTIN_MIC) {
@@ -812,24 +659,31 @@ audio_devices_t Engine::getDeviceForInputSource(audio_source_t inputSource) cons
         }
         break;
     case AUDIO_SOURCE_CAMCORDER:
-#ifdef MTK_CROSSMOUNT_SUPPORT
-        if ((availableDeviceTypes & AUDIO_DEVICE_IN_REMOTE_SUBMIX) &&
-            (mForceUse[AUDIO_POLICY_FORCE_FOR_RECORD] == AUDIO_POLICY_FORCE_REMOTE_SUBMIX_IN_WITH_FLAGS ||
-            mForceUse[AUDIO_POLICY_FORCE_FOR_RECORD] == AUDIO_POLICY_FORCE_REMOTE_SUBMIX_IN) && !mAudioPolicyVendorControl.getCrossMountMicAudioMixerEnable()) {
-            device = AUDIO_DEVICE_IN_REMOTE_SUBMIX;
-            ALOGD("Get AUDIO_DEVICE_IN_REMOTE_SUBMIX for rec");
-        } else
-#endif
         if (availableDeviceTypes & AUDIO_DEVICE_IN_BACK_MIC) {
             device = AUDIO_DEVICE_IN_BACK_MIC;
         } else if (availableDeviceTypes & AUDIO_DEVICE_IN_BUILTIN_MIC) {
             device = AUDIO_DEVICE_IN_BUILTIN_MIC;
+        } else if (availableDeviceTypes & AUDIO_DEVICE_IN_USB_DEVICE) {
+            // This is specifically for a device without built-in mic
+            device = AUDIO_DEVICE_IN_USB_DEVICE;
         }
         break;
     case AUDIO_SOURCE_VOICE_DOWNLINK:
     case AUDIO_SOURCE_VOICE_CALL:
+    case AUDIO_SOURCE_VOICE_UPLINK:
         if (availableDeviceTypes & AUDIO_DEVICE_IN_VOICE_CALL) {
             device = AUDIO_DEVICE_IN_VOICE_CALL;
+        }
+        break;
+    case AUDIO_SOURCE_VOICE_PERFORMANCE:
+        if (availableDeviceTypes & AUDIO_DEVICE_IN_WIRED_HEADSET) {
+            device = AUDIO_DEVICE_IN_WIRED_HEADSET;
+        } else if (availableDeviceTypes & AUDIO_DEVICE_IN_USB_HEADSET) {
+            device = AUDIO_DEVICE_IN_USB_HEADSET;
+        } else if (availableDeviceTypes & AUDIO_DEVICE_IN_USB_DEVICE) {
+            device = AUDIO_DEVICE_IN_USB_DEVICE;
+        } else if (availableDeviceTypes & AUDIO_DEVICE_IN_BUILTIN_MIC) {
+            device = AUDIO_DEVICE_IN_BUILTIN_MIC;
         }
         break;
     case AUDIO_SOURCE_REMOTE_SUBMIX:
@@ -837,46 +691,145 @@ audio_devices_t Engine::getDeviceForInputSource(audio_source_t inputSource) cons
             device = AUDIO_DEVICE_IN_REMOTE_SUBMIX;
         }
         break;
-     case AUDIO_SOURCE_FM_TUNER:
+    case AUDIO_SOURCE_FM_TUNER:
         if (availableDeviceTypes & AUDIO_DEVICE_IN_FM_TUNER) {
             device = AUDIO_DEVICE_IN_FM_TUNER;
         }
         break;
-#ifdef MTK_AUDIO
-    case AUDIO_SOURCE_MATV :
-        if (availableDeviceTypes & AUDIO_DEVICE_IN_MATV) {
-            device = AUDIO_DEVICE_IN_MATV;
+    case AUDIO_SOURCE_ECHO_REFERENCE:
+        if (availableDeviceTypes & AUDIO_DEVICE_IN_ECHO_REFERENCE) {
+            device = AUDIO_DEVICE_IN_ECHO_REFERENCE;
         }
         break;
     default:
-#ifdef MTK_CROSSMOUNT_SUPPORT
-        if ((availableDeviceTypes & AUDIO_DEVICE_IN_REMOTE_SUBMIX) &&
-            (mForceUse[AUDIO_POLICY_FORCE_FOR_RECORD] == AUDIO_POLICY_FORCE_REMOTE_SUBMIX_IN_WITH_FLAGS ||
-            mForceUse[AUDIO_POLICY_FORCE_FOR_RECORD] == AUDIO_POLICY_FORCE_REMOTE_SUBMIX_IN) && !mAudioPolicyVendorControl.getCrossMountMicAudioMixerEnable()) {
-            device = AUDIO_DEVICE_IN_REMOTE_SUBMIX;
-            ALOGD("Get AUDIO_DEVICE_IN_REMOTE_SUBMIX for rec");
-        } else {
+#if defined(MTK_AUDIO)
+        if (availableDeviceTypes & AUDIO_DEVICE_IN_BUILTIN_MIC) {
             device = AUDIO_DEVICE_IN_BUILTIN_MIC;
         }
-#else
-        device = AUDIO_DEVICE_IN_BUILTIN_MIC;
 #endif
         ALOGW("getDeviceForInputSource() invalid input source %d", inputSource);
         break;
-#else
-    default:
-        ALOGW("getDeviceForInputSource() invalid input source %d", inputSource);
-        break;
-#endif
     }
+    if (device == AUDIO_DEVICE_NONE) {
+        ALOGV("getDeviceForInputSource() no device found for source %d", inputSource);
+        if (availableDeviceTypes & AUDIO_DEVICE_IN_STUB) {
+            device = AUDIO_DEVICE_IN_STUB;
+        }
+        ALOGE_IF(device == AUDIO_DEVICE_NONE,
+                 "getDeviceForInputSource() no default device defined");
+    }
+#if defined(MTK_AUDIO_DEBUG)
+    if (log_enable) {
+        ALOGD("getDeviceForInputSource()input source %d, device %08x sfu [0]:%d [2]:%d", inputSource, device,
+            mForceUse[AUDIO_POLICY_FORCE_FOR_COMMUNICATION], mForceUse[AUDIO_POLICY_FORCE_FOR_RECORD]);
+    }
+#else
     ALOGV("getDeviceForInputSource()input source %d, device %08x", inputSource, device);
+#endif
     return device;
+}
+
+void Engine::updateDeviceSelectionCache()
+{
+    for (const auto &iter : getProductStrategies()) {
+        const auto &strategy = iter.second;
+        auto devices = getDevicesForProductStrategy(strategy->getId());
+        mDevicesForStrategies[strategy->getId()] = devices;
+        strategy->setDeviceTypes(devices.types());
+        strategy->setDeviceAddress(devices.getFirstValidAddress().c_str());
+    }
+}
+
+DeviceVector Engine::getDevicesForProductStrategy(product_strategy_t strategy) const
+{
+    DeviceVector availableOutputDevices = getApmObserver()->getAvailableOutputDevices();
+    DeviceVector availableInputDevices = getApmObserver()->getAvailableInputDevices();
+    const SwAudioOutputCollection &outputs = getApmObserver()->getOutputs();
+
+    auto legacyStrategy = mLegacyStrategyMap.find(strategy) != end(mLegacyStrategyMap) ?
+                mLegacyStrategyMap.at(strategy) : STRATEGY_NONE;
+    audio_devices_t devices = getDeviceForStrategyInt(legacyStrategy,
+                                                      availableOutputDevices,
+                                                      availableInputDevices, outputs,
+                                                      (uint32_t)AUDIO_DEVICE_NONE);
+    return availableOutputDevices.getDevicesFromTypeMask(devices);
+}
+
+DeviceVector Engine::getOutputDevicesForAttributes(const audio_attributes_t &attributes,
+                                                   const sp<DeviceDescriptor> &preferredDevice,
+                                                   bool fromCache) const
+{
+    // First check for explict routing device
+    if (preferredDevice != nullptr) {
+        ALOGV("%s explicit Routing on device %s", __func__, preferredDevice->toString().c_str());
+        return DeviceVector(preferredDevice);
+    }
+    product_strategy_t strategy = getProductStrategyForAttributes(attributes);
+    const DeviceVector availableOutputDevices = getApmObserver()->getAvailableOutputDevices();
+    const SwAudioOutputCollection &outputs = getApmObserver()->getOutputs();
+    //
+    // @TODO: what is the priority of explicit routing? Shall it be considered first as it used to
+    // be by APM?
+    //
+    // Honor explicit routing requests only if all active clients have a preferred route in which
+    // case the last active client route is used
+    sp<DeviceDescriptor> device = findPreferredDevice(outputs, strategy, availableOutputDevices);
+    if (device != nullptr) {
+        return DeviceVector(device);
+    }
+
+    return fromCache? mDevicesForStrategies.at(strategy) : getDevicesForProductStrategy(strategy);
+}
+
+DeviceVector Engine::getOutputDevicesForStream(audio_stream_type_t stream, bool fromCache) const
+{
+    auto attributes = getAttributesForStreamType(stream);
+    return getOutputDevicesForAttributes(attributes, nullptr, fromCache);
+}
+
+sp<DeviceDescriptor> Engine::getInputDeviceForAttributes(const audio_attributes_t &attr,
+                                                         sp<AudioPolicyMix> *mix) const
+{
+    const auto &policyMixes = getApmObserver()->getAudioPolicyMixCollection();
+    const auto availableInputDevices = getApmObserver()->getAvailableInputDevices();
+    const auto &inputs = getApmObserver()->getInputs();
+    std::string address;
+
+    //
+    // Explicit Routing ??? what is the priority of explicit routing? Shall it be considered
+    // first as it used to be by APM?
+    //
+    // Honor explicit routing requests only if all active clients have a preferred route in which
+    // case the last active client route is used
+    sp<DeviceDescriptor> device =
+            findPreferredDevice(inputs, attr.source, availableInputDevices);
+    if (device != nullptr) {
+        return device;
+    }
+
+    device = policyMixes.getDeviceAndMixForInputSource(attr.source, availableInputDevices, mix);
+    if (device != nullptr) {
+        return device;
+    }
+    audio_devices_t deviceType = getDeviceForInputSource(attr.source);
+
+    if (audio_is_remote_submix_device(deviceType)) {
+        address = "0";
+        std::size_t pos;
+        std::string tags { attr.tags };
+        if ((pos = tags.find("addr=")) != std::string::npos) {
+            address = tags.substr(pos + std::strlen("addr="));
+        }
+    }
+    return availableInputDevices.getDevice(deviceType,
+                                           String8(address.c_str()),
+                                           AUDIO_FORMAT_DEFAULT);
 }
 
 template <>
 AudioPolicyManagerInterface *Engine::queryInterface()
 {
-    return &mManagerInterface;
+    return this;
 }
 
 } // namespace audio_policy

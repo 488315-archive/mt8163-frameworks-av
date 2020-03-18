@@ -30,7 +30,7 @@ namespace android {
 class FastThread : public Thread {
 
 public:
-            FastThread();
+            FastThread(const char *cycleMs, const char *loadUs);
     virtual ~FastThread();
 
 private:
@@ -41,7 +41,7 @@ protected:
     // callouts to subclass in same lexical order as they were in original FastMixer.cpp
     // FIXME need comments
     virtual const FastThreadState *poll() = 0;
-    virtual void setLog(NBLog::Writer *logWriter __unused) { }
+    virtual void setNBLogWriter(NBLog::Writer *logWriter __unused) { }
     virtual void onIdle() = 0;
     virtual void onExit() = 0;
     virtual bool isSubClassCommand(FastThreadState::Command command) = 0;
@@ -78,15 +78,17 @@ protected:
     unsigned        mColdGen;       // last observed mColdGen
     bool            mIsWarm;        // true means ready to mix,
                                     // false means wait for warmup before mixing
-    struct timespec mMeasuredWarmupTs;  // how long did it take for warmup to complete
-    uint32_t        mWarmupCycles;  // counter of number of loop cycles during warmup phase
-    uint32_t        mWarmupConsecutiveInRangeCycles;    // number of consecutive cycles in range
-    NBLog::Writer   mDummyLogWriter;
-    NBLog::Writer*  mLogWriter;
-    status_t        mTimestampStatus;
+    struct timespec   mMeasuredWarmupTs;  // how long did it take for warmup to complete
+    uint32_t          mWarmupCycles;  // counter of number of loop cycles during warmup phase
+    uint32_t          mWarmupConsecutiveInRangeCycles;    // number of consecutive cycles in range
+    const sp<NBLog::Writer> mDummyNBLogWriter{new NBLog::Writer()};
+    status_t          mTimestampStatus;
 
     FastThreadState::Command mCommand;
     bool            mAttemptedWrite;
+
+    char            mCycleMs[16];   // cycle_ms + suffix
+    char            mLoadUs[16];    // load_us + suffix
 
 };  // class FastThread
 

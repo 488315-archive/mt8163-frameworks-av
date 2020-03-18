@@ -30,6 +30,8 @@
 #include <camera/CameraParameters2.h>
 #include <camera/CameraMetadata.h>
 
+#include "common/CameraDeviceBase.h"
+
 namespace android {
 namespace camera2 {
 
@@ -115,9 +117,17 @@ struct Parameters {
         int32_t height;
     };
 
+    struct FpsRange {
+        int32_t low;
+        int32_t high;
+    };
+
+    uint8_t aeState; //latest AE state from Hal
     int32_t exposureCompensation;
     bool autoExposureLock;
+    bool autoExposureLockAvailable;
     bool autoWhiteBalanceLock;
+    bool autoWhiteBalanceLockAvailable;
 
     // 3A region types, for use with ANDROID_CONTROL_MAX_REGIONS
     enum region_t {
@@ -130,24 +140,21 @@ struct Parameters {
     Vector<Area> meteringAreas;
 
     int zoom;
+    bool zoomAvailable;
 
-    int videoWidth, videoHeight;
+    int videoWidth, videoHeight, videoFormat;
+    android_dataspace videoDataSpace;
 
     bool recordingHint;
     bool videoStabilization;
-
-    enum lightFxMode_t {
-        LIGHTFX_NONE = 0,
-        LIGHTFX_LOWLIGHT,
-        LIGHTFX_HDR
-    } lightFx;
 
     CameraParameters2 params;
     String8 paramsFlattened;
 
     // These parameters are also part of the camera API-visible state, but not
     // directly listed in Camera.Parameters
-    bool storeMetadataInBuffers;
+    // One of ICamera::VIDEO_BUFFER_MODE_*
+    int32_t videoBufferMode;
     bool playShutterSound;
     bool enableFaceDetect;
 
@@ -165,10 +172,16 @@ struct Parameters {
     bool previewCallbackOneShot;
     bool previewCallbackSurface;
 
-    bool zslMode;
+    bool allowZslMode;
     // Whether the jpeg stream is slower than 30FPS and can slow down preview.
-    // When slowJpegMode is true, zslMode must be false to avoid slowing down preview.
+    // When slowJpegMode is true, allowZslMode must be false to avoid slowing down preview.
     bool slowJpegMode;
+    // Whether ZSL reprocess is supported by the device.
+    bool isZslReprocessPresent;
+    // Whether the device supports enableZsl.
+    bool isDeviceZslSupported;
+    // Whether the device supports geometric distortion correction
+    bool isDistortionCorrectionSupported;
 
     // Overall camera state
     enum State {
@@ -195,6 +208,15 @@ struct Parameters {
     static const CONSTEXPR float ASPECT_RATIO_TOLERANCE = 0.001;
     // Threshold for slow jpeg mode
     static const int64_t kSlowJpegModeThreshold = 33400000LL; // 33.4 ms
+    // Margin for checking FPS
+    static const int32_t FPS_MARGIN = 1;
+    // Max FPS for default parameters
+    static const int32_t MAX_DEFAULT_FPS = 30;
+    // Minimum FPS for a size to be listed in supported preview/video sizes
+    // Set to slightly less than 30.0 to have some tolerance margin
+    static constexpr double MIN_PREVIEW_RECORD_FPS = 29.97;
+    // Maximum frame duration for a size to be listed in supported preview/video sizes
+    static constexpr int64_t MAX_PREVIEW_RECORD_DURATION_NS = 1e9 / MIN_PREVIEW_RECORD_FPS;
 
     // Full static camera info, object owned by someone else, such as
     // Camera2Device.
@@ -221,8 +243,12 @@ struct Parameters {
             }
         };
         DefaultKeyedVector<uint8_t, OverrideModes> sceneModeOverrides;
-        float minFocalLength;
+        bool isExternalCamera;
+        float defaultFocalLength;
         bool useFlexibleYuv;
+        Size maxJpegSize;
+        Size maxZslSize;
+        bool supportsPreferredConfigs;
     } fastInfo;
 
     // Quirks information; these are short-lived flags to enable workarounds for
@@ -242,10 +268,10 @@ struct Parameters {
     ~Parameters();
 
     // Sets up default parameters
-    status_t initialize(const CameraMetadata *info, int deviceVersion);
+    status_t initialize(CameraDeviceBase *device, int deviceVersion);
 
     // Build fast-access device static info from static info
-    status_t buildFastInfo();
+    status_t buildFastInfo(CameraDeviceBase *device);
     // Query for quirks from static info
     status_t buildQuirks();
 
@@ -275,6 +301,11 @@ struct Parameters {
     status_t recoverOverriddenJpegSize();
     // if video snapshot size is currently overridden
     bool isJpegSizeOverridden();
+    // whether zero shutter lag should be used for non-recording operation
+    bool useZeroShutterLag() const;
+
+    // Get default focal length
+    status_t getDefaultFocalLength(CameraDeviceBase *camera);
 
     // Calculate the crop region rectangle, either tightly about the preview
     // resolution, or a region just based on the active array; both take
@@ -302,12 +333,11 @@ struct Parameters {
     static const char* wbModeEnumToString(uint8_t wbMode);
     static int effectModeStringToEnum(const char *effectMode);
     static int abModeStringToEnum(const char *abMode);
-    static int sceneModeStringToEnum(const char *sceneMode);
+    static int sceneModeStringToEnum(const char *sceneMode, uint8_t defaultScene);
     static flashMode_t flashModeStringToEnum(const char *flashMode);
     static const char* flashModeEnumToString(flashMode_t flashMode);
     static focusMode_t focusModeStringToEnum(const char *focusMode);
     static const char* focusModeEnumToString(focusMode_t focusMode);
-    static lightFxMode_t lightFxStringToEnum(const char *lightFxMode);
 
     static status_t parseAreas(const char *areasCStr,
             Vector<Area> *areas);
@@ -330,7 +360,7 @@ struct Parameters {
     static const int kFpsToApiScale = 1000;
 
     // Transform from (-1000,-1000)-(1000,1000) normalized coords from camera
-    // API to HAL2 (0,0)-(activePixelArray.width/height) coordinates
+    // API to HAL3 (0,0)-(activePixelArray.width/height) coordinates
     int normalizedXToArray(int x) const;
     int normalizedYToArray(int y) const;
 
@@ -350,7 +380,7 @@ struct Parameters {
 private:
 
     // Convert from viewfinder crop-region relative array coordinates
-    // to HAL2 sensor array coordinates
+    // to HAL3 sensor array coordinates
     int cropXToArray(int x) const;
     int cropYToArray(int y) const;
 
@@ -366,6 +396,7 @@ private:
     Vector<Size> availablePreviewSizes;
     Vector<Size> availableVideoSizes;
     // Get size list (that are no larger than limit) from static metadata.
+    // This method filtered size with minFrameDuration < MAX_PREVIEW_RECORD_DURATION_NS
     status_t getFilteredSizes(Size limit, Vector<Size> *sizes);
     // Get max size (from the size array) that matches the given aspect ratio.
     Size getMaxSizeForRatio(float ratio, const int32_t* sizeArray, size_t count);
@@ -388,9 +419,21 @@ private:
     // returns an empty Vector if device HAL version does support it
     Vector<StreamConfiguration> getStreamConfigurations();
 
+    // Helper function to extract the suggested stream configurations
+    Vector<StreamConfiguration> getPreferredStreamConfigurations(int32_t usecaseId) const;
+
     // Helper function to get minimum frame duration for a jpeg size
     // return -1 if input jpeg size cannot be found in supported size list
     int64_t getJpegStreamMinFrameDurationNs(Parameters::Size size);
+
+    // Helper function to get minimum frame duration for a size/format combination
+    // return -1 if input size/format combination cannot be found.
+    int64_t getMinFrameDurationNs(Parameters::Size size, int format);
+
+    // Helper function to check if a given fps is supported by all the sizes with
+    // the same format.
+    // return true if the device doesn't support min frame duration metadata tag.
+    bool isFpsSupported(const Vector<Size> &size, int format, int32_t fps);
 
     // Helper function to get non-duplicated available output formats
     SortedVector<int32_t> getAvailableOutputFormats();
@@ -400,7 +443,17 @@ private:
     // The maximum size is defined by comparing width first, when width ties comparing height.
     Size getMaxSize(const Vector<Size>& sizes);
 
+    // Helper function to filter and sort suggested sizes
+    Vector<Parameters::Size> getPreferredFilteredSizes(int32_t usecaseId, int32_t format) const;
+    // Helper function to get the suggested jpeg sizes
+    Vector<Size> getPreferredJpegSizes() const;
+    // Helper function to get the suggested preview sizes
+    Vector<Size> getPreferredPreviewSizes() const;
+    // Helper function to get the suggested video sizes
+    Vector<Size> getPreferredVideoSizes() const;
+
     int mDeviceVersion;
+    uint8_t mDefaultSceneMode;
 };
 
 // This class encapsulates the Parameters class so that it can only be accessed
@@ -414,7 +467,7 @@ class SharedParameters {
     template<typename S, typename P>
     class BaseLock {
       public:
-        BaseLock(S &p):
+        explicit BaseLock(S &p):
                 mParameters(p.mParameters),
                 mSharedParameters(p) {
             mSharedParameters.mLock.lock();

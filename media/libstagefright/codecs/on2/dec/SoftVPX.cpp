@@ -17,6 +17,8 @@
 //#define LOG_NDEBUG 0
 #define LOG_TAG "SoftVPX"
 #include <utils/Log.h>
+#include <utils/misc.h>
+#include "OMX_VideoExt.h"
 
 #include "SoftVPX.h"
 
@@ -25,6 +27,14 @@
 
 
 namespace android {
+
+// Only need to declare the highest supported profile and level here.
+static const CodecProfileLevel kVP9ProfileLevels[] = {
+    { OMX_VIDEO_VP9Profile0, OMX_VIDEO_VP9Level5 },
+    { OMX_VIDEO_VP9Profile2, OMX_VIDEO_VP9Level5 },
+    { OMX_VIDEO_VP9Profile2HDR, OMX_VIDEO_VP9Level5 },
+    { OMX_VIDEO_VP9Profile2HDR10Plus, OMX_VIDEO_VP9Level5 },
+};
 
 SoftVPX::SoftVPX(
         const char *name,
@@ -35,7 +45,8 @@ SoftVPX::SoftVPX(
         OMX_COMPONENTTYPE **component)
     : SoftVideoDecoderOMXComponent(
             name, componentRole, codingType,
-            NULL /* profileLevels */, 0 /* numProfileLevels */,
+            codingType == OMX_VIDEO_CodingVP8 ? NULL : kVP9ProfileLevels,
+            codingType == OMX_VIDEO_CodingVP8 ?  0 : NELEM(kVP9ProfileLevels),
             320 /* width */, 240 /* height */, callbacks, appData, component),
       mMode(codingType == OMX_VIDEO_CodingVP8 ? MODE_VP8 : MODE_VP9),
       mEOSStatus(INPUT_DATA_AVAILABLE),
@@ -70,6 +81,14 @@ static int GetCPUCoreCount() {
     return cpuCoreCount;
 }
 
+bool SoftVPX::supportDescribeHdrStaticInfo() {
+    return true;
+}
+
+bool SoftVPX::supportDescribeHdr10PlusInfo() {
+    return true;
+}
+
 status_t SoftVPX::initDecoder() {
     mCtx = new vpx_codec_ctx_t;
     vpx_codec_err_t vpx_err;
@@ -102,7 +121,6 @@ status_t SoftVPX::destroyDecoder() {
 }
 
 bool SoftVPX::outputBuffers(bool flushDecoder, bool display, bool eos, bool *portWillReset) {
-    List<BufferInfo *> &inQueue = getPortQueue(0);
     List<BufferInfo *> &outQueue = getPortQueue(1);
     BufferInfo *outInfo = NULL;
     OMX_BUFFERHEADERTYPE *outHeader = NULL;
@@ -139,16 +157,27 @@ bool SoftVPX::outputBuffers(bool flushDecoder, bool display, bool eos, bool *por
         uint32_t height = mImg->d_h;
         outInfo = *outQueue.begin();
         outHeader = outInfo->mHeader;
-        CHECK_EQ(mImg->fmt, VPX_IMG_FMT_I420);
-        handlePortSettingsChange(portWillReset, width, height);
+        CHECK(mImg->fmt == VPX_IMG_FMT_I420 || mImg->fmt == VPX_IMG_FMT_I42016);
+        OMX_COLOR_FORMATTYPE outputColorFormat = OMX_COLOR_FormatYUV420Planar;
+        int32_t bpp = 1;
+        if (mImg->fmt == VPX_IMG_FMT_I42016) {
+            outputColorFormat = OMX_COLOR_FormatYUV420Planar16;
+            bpp = 2;
+        }
+        handlePortSettingsChange(portWillReset, width, height, outputColorFormat);
         if (*portWillReset) {
             return true;
         }
 
         outHeader->nOffset = 0;
         outHeader->nFlags = 0;
-        outHeader->nFilledLen = (outputBufferWidth() * outputBufferHeight() * 3) / 2;
-        outHeader->nTimeStamp = *(OMX_TICKS *)mImg->user_priv;
+        outHeader->nFilledLen = (outputBufferWidth() * outputBufferHeight() * bpp * 3) / 2;
+        PrivInfo *privInfo = (PrivInfo *)mImg->user_priv;
+        outHeader->nTimeStamp = privInfo->mTimeStamp;
+        if (privInfo->mHdr10PlusInfo != nullptr) {
+            queueOutputFrameConfig(privInfo->mHdr10PlusInfo);
+        }
+
         if (outputBufferSafe(outHeader)) {
             uint8_t *dst = outHeader->pBuffer;
             const uint8_t *srcY = (const uint8_t *)mImg->planes[VPX_PLANE_Y];
@@ -215,7 +244,6 @@ void SoftVPX::onQueueFilled(OMX_U32 /* portIndex */) {
     List<BufferInfo *> &inQueue = getPortQueue(0);
     List<BufferInfo *> &outQueue = getPortQueue(1);
     bool EOSseen = false;
-    vpx_codec_err_t err;
     bool portWillReset = false;
 
     while ((mEOSStatus == INPUT_EOS_SEEN || !inQueue.empty())
@@ -233,28 +261,60 @@ void SoftVPX::onQueueFilled(OMX_U32 /* portIndex */) {
                     mEOSStatus == INPUT_EOS_SEEN) {
                 return;
             }
+            // Continue as outQueue may be empty now.
+            continue;
         }
 
         BufferInfo *inInfo = *inQueue.begin();
         OMX_BUFFERHEADERTYPE *inHeader = inInfo->mHeader;
-        mTimeStamps[mTimeStampIdx] = inHeader->nTimeStamp;
 
-        BufferInfo *outInfo = *outQueue.begin();
-        OMX_BUFFERHEADERTYPE *outHeader = outInfo->mHeader;
+        // Software VP9 Decoder does not need the Codec Specific Data (CSD)
+        // (specified in http://www.webmproject.org/vp9/profiles/). Ignore it if
+        // it was passed.
+        if (inHeader->nFlags & OMX_BUFFERFLAG_CODECCONFIG) {
+            // Only ignore CSD buffer for VP9.
+            if (mMode == MODE_VP9) {
+                inQueue.erase(inQueue.begin());
+                inInfo->mOwnedByUs = false;
+                notifyEmptyBufferDone(inHeader);
+                continue;
+            } else {
+                // Tolerate the CSD buffer for VP8. This is a workaround
+                // for b/28689536.
+                ALOGW("WARNING: Got CSD buffer for VP8.");
+            }
+        }
+
+        mPrivInfo[mTimeStampIdx].mTimeStamp = inHeader->nTimeStamp;
+
+        if (inInfo->mFrameConfig) {
+            mPrivInfo[mTimeStampIdx].mHdr10PlusInfo = dequeueInputFrameConfig();
+        } else {
+            mPrivInfo[mTimeStampIdx].mHdr10PlusInfo.clear();
+        }
+
         if (inHeader->nFlags & OMX_BUFFERFLAG_EOS) {
             mEOSStatus = INPUT_EOS_SEEN;
             EOSseen = true;
         }
 
-        if (inHeader->nFilledLen > 0 &&
-            vpx_codec_decode((vpx_codec_ctx_t *)mCtx,
-                              inHeader->pBuffer + inHeader->nOffset,
-                              inHeader->nFilledLen,
-                              &mTimeStamps[mTimeStampIdx], 0)) {
-            ALOGE("on2 decoder failed to decode frame.");
-            notify(OMX_EventError, OMX_ErrorUndefined, 0, NULL);
-            return;
+        if (inHeader->nFilledLen > 0) {
+            vpx_codec_err_t err = vpx_codec_decode(
+                    (vpx_codec_ctx_t *)mCtx, inHeader->pBuffer + inHeader->nOffset,
+                    inHeader->nFilledLen, &mPrivInfo[mTimeStampIdx], 0);
+            if (err == VPX_CODEC_OK) {
+                inInfo->mOwnedByUs = false;
+                inQueue.erase(inQueue.begin());
+                inInfo = NULL;
+                notifyEmptyBufferDone(inHeader);
+                inHeader = NULL;
+            } else {
+                ALOGE("on2 decoder failed to decode frame. err: %d", err);
+                notify(OMX_EventError, OMX_ErrorUndefined, 0, NULL);
+                return;
+            }
         }
+
         mTimeStampIdx = (mTimeStampIdx + 1) % kNumBuffers;
 
         if (!outputBuffers(
@@ -266,12 +326,6 @@ void SoftVPX::onQueueFilled(OMX_U32 /* portIndex */) {
         if (portWillReset) {
             return;
         }
-
-        inInfo->mOwnedByUs = false;
-        inQueue.erase(inQueue.begin());
-        inInfo = NULL;
-        notifyEmptyBufferDone(inHeader);
-        inHeader = NULL;
     }
 }
 

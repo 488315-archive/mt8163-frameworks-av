@@ -18,6 +18,7 @@
 #define ANDROID_SERVERS_CAMERA3_OUTPUT_STREAM_INTERFACE_H
 
 #include "Camera3StreamInterface.h"
+#include <utils/KeyedVector.h>
 
 namespace android {
 
@@ -34,6 +35,66 @@ class Camera3OutputStreamInterface : public virtual Camera3StreamInterface {
      * HAL_TRANSFORM_* / NATIVE_WINDOW_TRANSFORM_* constants.
      */
     virtual status_t setTransform(int transform) = 0;
+
+    /**
+     * Return if this output stream is for video encoding.
+     */
+    virtual bool isVideoStream() const = 0;
+
+    /**
+     * Return if the consumer configuration of this stream is deferred.
+     */
+    virtual bool isConsumerConfigurationDeferred(size_t surface_id = 0) const = 0;
+
+    /**
+     * Set the consumer surfaces to the output stream.
+     */
+    virtual status_t setConsumers(const std::vector<sp<Surface>>& consumers) = 0;
+
+    /**
+     * Detach an unused buffer from the stream.
+     *
+     * buffer must be non-null; fenceFd may null, and if it is non-null, but
+     * there is no valid fence associated with the detached buffer, it will be
+     * set to -1.
+     *
+     */
+    virtual status_t detachBuffer(sp<GraphicBuffer>* buffer, int* fenceFd) = 0;
+
+    /**
+     * Query the surface id.
+     */
+    virtual ssize_t getSurfaceId(const sp<Surface> &surface) = 0;
+
+    /**
+     * Query the unique surface IDs of current surfaceIds.
+     * When passing unique surface IDs in returnBuffer(), if the
+     * surfaceId has been removed from the stream, the output corresponding to
+     * the unique surface ID will be ignored and not delivered to client.
+     *
+     * Return INVALID_OPERATION if and only if the stream does not support
+     * surface sharing.
+     */
+    virtual status_t getUniqueSurfaceIds(const std::vector<size_t>& surfaceIds,
+            /*out*/std::vector<size_t>* outUniqueIds) = 0;
+
+    /**
+     * Update the stream output surfaces.
+     */
+    virtual status_t updateStream(const std::vector<sp<Surface>> &outputSurfaces,
+            const std::vector<OutputStreamInfo> &outputInfo,
+            const std::vector<size_t> &removedSurfaceIds,
+            KeyedVector<sp<Surface>, size_t> *outputMap/*out*/) = 0;
+
+    /**
+     * Drop buffers if dropping is true. If dropping is false, do not drop buffers.
+     */
+    virtual status_t dropBuffers(bool /*dropping*/) = 0;
+
+    /**
+     * Query the physical camera id for the output stream.
+     */
+    virtual const String8& getPhysicalCameraId() const = 0;
 };
 
 } // namespace camera3

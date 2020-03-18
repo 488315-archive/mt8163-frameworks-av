@@ -20,11 +20,7 @@
 //#define LOG_NDEBUG 0
 #include <utils/Log.h>
 #include <utils/Timers.h>
-#ifdef MTK_AUDIO
-#include <hardware/audio_effect_mtk.h>
-#else
 #include <hardware/audio_effect.h>
-#endif
 #include <audio_effects/effect_aec.h>
 #include <audio_effects/effect_agc.h>
 #include <audio_effects/effect_ns.h>
@@ -93,6 +89,7 @@ struct preproc_effect_s {
     preproc_session_t *session;     // session the effect is on
     const preproc_ops_t *ops;       // effect ops table
     preproc_fx_handle_t engine;     // handle on webRTC engine
+    uint32_t type;                  // subtype of effect
 #ifdef DUAL_MIC_TEST
     bool aux_channels_on;           // support auxiliary channels
     size_t cur_channel_config;      // current auciliary channel configuration
@@ -182,7 +179,11 @@ static pthread_mutex_t gPcmDumpLock = PTHREAD_MUTEX_INITIALIZER;
 // Automatic Gain Control
 static const effect_descriptor_t sAgcDescriptor = {
         { 0x0a8abfe0, 0x654c, 0x11e0, 0xba26, { 0x00, 0x02, 0xa5, 0xd5, 0xc5, 0x1b } }, // type
+#if defined(MTK_AUDIO_FIX_DEFAULT_DEFECT)
+        { 0x3387eb70, 0x9896, 0x4338, 0x90f5, { 0xb2, 0xde, 0x88, 0x38, 0x64, 0xc9 } }, // uuid
+#else
         { 0xaa8130e0, 0x66fc, 0x11e0, 0xbad0, { 0x00, 0x02, 0xa5, 0xd5, 0xc5, 0x1b } }, // uuid
+#endif
         EFFECT_CONTROL_API_VERSION,
         (EFFECT_FLAG_TYPE_PRE_PROC|EFFECT_FLAG_DEVICE_IND),
         0, //FIXME indicate CPU load
@@ -194,7 +195,11 @@ static const effect_descriptor_t sAgcDescriptor = {
 // Acoustic Echo Cancellation
 static const effect_descriptor_t sAecDescriptor = {
         { 0x7b491460, 0x8d4d, 0x11e0, 0xbd61, { 0x00, 0x02, 0xa5, 0xd5, 0xc5, 0x1b } }, // type
+#if defined(MTK_AUDIO_FIX_DEFAULT_DEFECT)
+        { 0x9f35ed76, 0x0b66, 0x4330, 0x8f79, { 0xe3, 0x9c, 0xa2, 0x66, 0xdc, 0x7c } }, // uuid
+#else
         { 0xbb392ec0, 0x8d4d, 0x11e0, 0xa896, { 0x00, 0x02, 0xa5, 0xd5, 0xc5, 0x1b } }, // uuid
+#endif
         EFFECT_CONTROL_API_VERSION,
         (EFFECT_FLAG_TYPE_PRE_PROC|EFFECT_FLAG_DEVICE_IND),
         0, //FIXME indicate CPU load
@@ -206,7 +211,11 @@ static const effect_descriptor_t sAecDescriptor = {
 // Noise suppression
 static const effect_descriptor_t sNsDescriptor = {
         { 0x58b4b260, 0x8e06, 0x11e0, 0xaa8e, { 0x00, 0x02, 0xa5, 0xd5, 0xc5, 0x1b } }, // type
+#if defined(MTK_AUDIO_FIX_DEFAULT_DEFECT)
+        { 0x300abe9f, 0xdfc5, 0x4340, 0x9c4b, { 0x79, 0xef, 0x1b, 0xe4, 0xe6, 0x51 } }, // uuid
+#else
         { 0xc06c8400, 0x8e06, 0x11e0, 0x9cb6, { 0x00, 0x02, 0xa5, 0xd5, 0xc5, 0x1b } }, // uuid
+#endif
         EFFECT_CONTROL_API_VERSION,
         (EFFECT_FLAG_TYPE_PRE_PROC|EFFECT_FLAG_DEVICE_IND),
         0, //FIXME indicate CPU load
@@ -534,6 +543,7 @@ int AecSetDevice(preproc_effect_t *effect, uint32_t device)
         break;
     case AUDIO_DEVICE_OUT_WIRED_HEADSET:
     case AUDIO_DEVICE_OUT_WIRED_HEADPHONE:
+    case AUDIO_DEVICE_OUT_USB_HEADSET:
     default:
         break;
     }
@@ -563,6 +573,21 @@ int  NsInit (preproc_effect_t *effect)
     ALOGV("NsInit");
     webrtc::NoiseSuppression *ns = static_cast<webrtc::NoiseSuppression *>(effect->engine);
     ns->set_level(kNsDefaultLevel);
+    webrtc::Config config;
+    std::vector<webrtc::Point> geometry;
+    // TODO(aluebs): Make the geometry settable.
+    geometry.push_back(webrtc::Point(-0.03f, 0.f, 0.f));
+    geometry.push_back(webrtc::Point(-0.01f, 0.f, 0.f));
+    geometry.push_back(webrtc::Point(0.01f, 0.f, 0.f));
+    geometry.push_back(webrtc::Point(0.03f, 0.f, 0.f));
+    // The geometry needs to be set with Beamforming enabled.
+    config.Set<webrtc::Beamforming>(
+            new webrtc::Beamforming(true, geometry));
+    effect->session->apm->SetExtraOptions(config);
+    config.Set<webrtc::Beamforming>(
+            new webrtc::Beamforming(false, geometry));
+    effect->session->apm->SetExtraOptions(config);
+    effect->type = NS_TYPE_SINGLE_CHANNEL;
     return 0;
 }
 
@@ -588,11 +613,35 @@ int NsGetParameter(preproc_effect_t  *effect __unused,
     return status;
 }
 
-int NsSetParameter (preproc_effect_t *effect __unused,
-                    void *pParam __unused,
-                    void *pValue __unused)
+int NsSetParameter (preproc_effect_t *effect, void *pParam, void *pValue)
 {
     int status = 0;
+    webrtc::NoiseSuppression *ns = static_cast<webrtc::NoiseSuppression *>(effect->engine);
+    uint32_t param = *(uint32_t *)pParam;
+    uint32_t value = *(uint32_t *)pValue;
+    switch(param) {
+        case NS_PARAM_LEVEL:
+            ns->set_level((webrtc::NoiseSuppression::Level)value);
+            ALOGV("NsSetParameter() level %d", value);
+            break;
+        case NS_PARAM_TYPE:
+        {
+            webrtc::Config config;
+            std::vector<webrtc::Point> geometry;
+            bool is_beamforming_enabled =
+                    value == NS_TYPE_MULTI_CHANNEL && ns->is_enabled();
+            config.Set<webrtc::Beamforming>(
+                    new webrtc::Beamforming(is_beamforming_enabled, geometry));
+            effect->session->apm->SetExtraOptions(config);
+            effect->type = value;
+            ALOGV("NsSetParameter() type %d", value);
+            break;
+        }
+        default:
+            ALOGW("NsSetParameter() unknown param %08x value %08x", param, value);
+            status = -EINVAL;
+    }
+
     return status;
 }
 
@@ -601,6 +650,12 @@ void NsEnable(preproc_effect_t *effect)
     webrtc::NoiseSuppression *ns = static_cast<webrtc::NoiseSuppression *>(effect->engine);
     ALOGV("NsEnable ns %p", ns);
     ns->Enable(true);
+    if (effect->type == NS_TYPE_MULTI_CHANNEL) {
+        webrtc::Config config;
+        std::vector<webrtc::Point> geometry;
+        config.Set<webrtc::Beamforming>(new webrtc::Beamforming(true, geometry));
+        effect->session->apm->SetExtraOptions(config);
+    }
 }
 
 void NsDisable(preproc_effect_t *effect)
@@ -608,6 +663,10 @@ void NsDisable(preproc_effect_t *effect)
     ALOGV("NsDisable");
     webrtc::NoiseSuppression *ns = static_cast<webrtc::NoiseSuppression *>(effect->engine);
     ns->Enable(false);
+    webrtc::Config config;
+    std::vector<webrtc::Point> geometry;
+    config.Set<webrtc::Beamforming>(new webrtc::Beamforming(false, geometry));
+    effect->session->apm->SetExtraOptions(config);
 }
 
 static const preproc_ops_t sNsOps = {
@@ -651,6 +710,7 @@ int Effect_SetState(preproc_effect_t *effect, uint32_t state)
         case PREPROC_EFFECT_STATE_ACTIVE:
             effect->ops->disable(effect);
             Session_SetProcEnabled(effect->session, effect->procId, false);
+            break;
         case PREPROC_EFFECT_STATE_CONFIG:
         case PREPROC_EFFECT_STATE_CREATED:
         case PREPROC_EFFECT_STATE_INIT:
@@ -781,14 +841,17 @@ extern "C" int Session_CreateEffect(preproc_session_t *session,
     ALOGV("Session_CreateEffect procId %d, createdMsk %08x", procId, session->createdMsk);
 
     if (session->createdMsk == 0) {
-        session->apm = webrtc::AudioProcessing::Create(session->io);
+        session->apm = webrtc::AudioProcessing::Create();
         if (session->apm == NULL) {
             ALOGW("Session_CreateEffect could not get apm engine");
             goto error;
         }
-        session->apm->set_sample_rate_hz(kPreprocDefaultSr);
-        session->apm->set_num_channels(kPreProcDefaultCnl, kPreProcDefaultCnl);
-        session->apm->set_num_reverse_channels(kPreProcDefaultCnl);
+        const webrtc::ProcessingConfig processing_config = {
+            {{kPreprocDefaultSr, kPreProcDefaultCnl},
+             {kPreprocDefaultSr, kPreProcDefaultCnl},
+             {kPreprocDefaultSr, kPreProcDefaultCnl},
+             {kPreprocDefaultSr, kPreProcDefaultCnl}}};
+        session->apm->Initialize(processing_config);
         session->procFrame = new webrtc::AudioFrame();
         if (session->procFrame == NULL) {
             ALOGW("Session_CreateEffect could not allocate audio frame");
@@ -805,11 +868,11 @@ extern "C" int Session_CreateEffect(preproc_session_t *session,
         session->samplingRate = kPreprocDefaultSr;
         session->inChannelCount = kPreProcDefaultCnl;
         session->outChannelCount = kPreProcDefaultCnl;
-        session->procFrame->_frequencyInHz = kPreprocDefaultSr;
-        session->procFrame->_audioChannel = kPreProcDefaultCnl;
+        session->procFrame->sample_rate_hz_ = kPreprocDefaultSr;
+        session->procFrame->num_channels_ = kPreProcDefaultCnl;
         session->revChannelCount = kPreProcDefaultCnl;
-        session->revFrame->_frequencyInHz = kPreprocDefaultSr;
-        session->revFrame->_audioChannel = kPreProcDefaultCnl;
+        session->revFrame->sample_rate_hz_ = kPreprocDefaultSr;
+        session->revFrame->num_channels_ = kPreProcDefaultCnl;
         session->enabledMsk = 0;
         session->processedMsk = 0;
         session->revEnabledMsk = 0;
@@ -838,8 +901,8 @@ error:
         session->revFrame = NULL;
         delete session->procFrame;
         session->procFrame = NULL;
-        webrtc::AudioProcessing::Destroy(session->apm);
-        session->apm = NULL;
+        delete session->apm;
+        session->apm = NULL; // NOLINT(clang-analyzer-cplusplus.NewDelete)
     }
     return status;
 }
@@ -850,7 +913,7 @@ int Session_ReleaseEffect(preproc_session_t *session,
     ALOGW_IF(Effect_Release(fx) != 0, " Effect_Release() failed for proc ID %d", fx->procId);
     session->createdMsk &= ~(1<<fx->procId);
     if (session->createdMsk == 0) {
-        webrtc::AudioProcessing::Destroy(session->apm);
+        delete session->apm;
         session->apm = NULL;
         delete session->procFrame;
         session->procFrame = NULL;
@@ -875,7 +938,7 @@ int Session_ReleaseEffect(preproc_session_t *session,
         delete session->revBuf;
         session->revBuf = NULL;
 
-        session->io = 0;
+        session->id = 0;
     }
 
     return 0;
@@ -884,9 +947,8 @@ int Session_ReleaseEffect(preproc_session_t *session,
 
 int Session_SetConfig(preproc_session_t *session, effect_config_t *config)
 {
-    uint32_t sr;
-    uint32_t inCnl = audio_channel_count_from_out_mask(config->inputCfg.channels);
-    uint32_t outCnl = audio_channel_count_from_out_mask(config->outputCfg.channels);
+    uint32_t inCnl = audio_channel_count_from_in_mask(config->inputCfg.channels);
+    uint32_t outCnl = audio_channel_count_from_in_mask(config->outputCfg.channels);
 
     if (config->inputCfg.samplingRate != config->outputCfg.samplingRate ||
         config->inputCfg.format != config->outputCfg.format ||
@@ -898,17 +960,6 @@ int Session_SetConfig(preproc_session_t *session, effect_config_t *config)
          config->inputCfg.samplingRate, config->inputCfg.channels);
     int status;
 
-    // if at least one process is enabled, do not accept configuration changes
-    if (session->enabledMsk) {
-        if (session->samplingRate != config->inputCfg.samplingRate ||
-                session->inChannelCount != inCnl ||
-                session->outChannelCount != outCnl) {
-            return -ENOSYS;
-        } else {
-            return 0;
-        }
-    }
-
     // AEC implementation is limited to 16kHz
     if (config->inputCfg.samplingRate >= 32000 && !(session->createdMsk & (1 << PREPROC_AEC))) {
         session->apmSamplingRate = 32000;
@@ -918,15 +969,13 @@ int Session_SetConfig(preproc_session_t *session, effect_config_t *config)
     } else if (config->inputCfg.samplingRate >= 8000) {
         session->apmSamplingRate = 8000;
     }
-    status = session->apm->set_sample_rate_hz(session->apmSamplingRate);
-    if (status < 0) {
-        return -EINVAL;
-    }
-    status = session->apm->set_num_channels(inCnl, outCnl);
-    if (status < 0) {
-        return -EINVAL;
-    }
-    status = session->apm->set_num_reverse_channels(inCnl);
+
+    const webrtc::ProcessingConfig processing_config = {
+      {{static_cast<int>(session->apmSamplingRate), inCnl},
+       {static_cast<int>(session->apmSamplingRate), outCnl},
+       {static_cast<int>(session->apmSamplingRate), inCnl},
+       {static_cast<int>(session->apmSamplingRate), inCnl}}};
+    status = session->apm->Initialize(processing_config);
     if (status < 0) {
         return -EINVAL;
     }
@@ -941,12 +990,12 @@ int Session_SetConfig(preproc_session_t *session, effect_config_t *config)
     }
     session->inChannelCount = inCnl;
     session->outChannelCount = outCnl;
-    session->procFrame->_audioChannel = inCnl;
-    session->procFrame->_frequencyInHz = session->apmSamplingRate;
+    session->procFrame->num_channels_ = inCnl;
+    session->procFrame->sample_rate_hz_ = session->apmSamplingRate;
 
     session->revChannelCount = inCnl;
-    session->revFrame->_audioChannel = inCnl;
-    session->revFrame->_frequencyInHz = session->apmSamplingRate;
+    session->revFrame->num_channels_ = inCnl;
+    session->revFrame->sample_rate_hz_ = session->apmSamplingRate;
 
     // force process buffer reallocation
     session->inBufSize = 0;
@@ -1042,13 +1091,18 @@ int Session_SetReverseConfig(preproc_session_t *session, effect_config_t *config
         return -EINVAL;
     }
     uint32_t inCnl = audio_channel_count_from_out_mask(config->inputCfg.channels);
-    int status = session->apm->set_num_reverse_channels(inCnl);
+    const webrtc::ProcessingConfig processing_config = {
+       {{static_cast<int>(session->apmSamplingRate), session->inChannelCount},
+        {static_cast<int>(session->apmSamplingRate), session->outChannelCount},
+        {static_cast<int>(session->apmSamplingRate), inCnl},
+        {static_cast<int>(session->apmSamplingRate), inCnl}}};
+    int status = session->apm->Initialize(processing_config);
     if (status < 0) {
         return -EINVAL;
     }
     session->revChannelCount = inCnl;
-    session->revFrame->_audioChannel = inCnl;
-    session->revFrame->_frequencyInHz = session->apmSamplingRate;
+    session->revFrame->num_channels_ = inCnl;
+    session->revFrame->sample_rate_hz_ = session->apmSamplingRate;
     // force process buffer reallocation
     session->revBufSize = 0;
     session->framesRev = 0;
@@ -1112,9 +1166,8 @@ static preproc_session_t sSessions[PREPROC_NUM_SESSIONS];
 preproc_session_t *PreProc_GetSession(int32_t procId, int32_t  sessionId, int32_t  ioId)
 {
     size_t i;
-    int free = -1;
     for (i = 0; i < PREPROC_NUM_SESSIONS; i++) {
-        if (sSessions[i].io == ioId) {
+        if (sSessions[i].id == sessionId) {
             if (sSessions[i].createdMsk & (1 << procId)) {
                 return NULL;
             }
@@ -1122,7 +1175,7 @@ preproc_session_t *PreProc_GetSession(int32_t procId, int32_t  sessionId, int32_
         }
     }
     for (i = 0; i < PREPROC_NUM_SESSIONS; i++) {
-        if (sSessions[i].io == 0) {
+        if (sSessions[i].id == 0) {
             sSessions[i].id = sessionId;
             sSessions[i].io = ioId;
             return &sSessions[i];
@@ -1169,7 +1222,6 @@ int PreProcessingFx_Process(effect_handle_t     self,
                             audio_buffer_t    *outBuffer)
 {
     preproc_effect_t * effect = (preproc_effect_t *)self;
-    int    status = 0;
 
     if (effect == NULL){
         ALOGV("PreProcessingFx_Process() ERROR effect == NULL");
@@ -1218,9 +1270,17 @@ int PreProcessingFx_Process(effect_handle_t     self,
                 fr = inBuffer->frameCount;
             }
             if (session->inBufSize < session->framesIn + fr) {
+                int16_t *buf;
                 session->inBufSize = session->framesIn + fr;
-                session->inBuf = (int16_t *)realloc(session->inBuf,
+                buf = (int16_t *)realloc(session->inBuf,
                                  session->inBufSize * session->inChannelCount * sizeof(int16_t));
+                if (buf == NULL) {
+                    session->framesIn = 0;
+                    free(session->inBuf);
+                    session->inBuf = NULL;
+                    return -ENOMEM;
+                }
+                session->inBuf = buf;
             }
             memcpy(session->inBuf + session->framesIn * session->inChannelCount,
                    inBuffer->s16,
@@ -1246,13 +1306,13 @@ int PreProcessingFx_Process(effect_handle_t     self,
                                             0,
                                             session->inBuf,
                                             &frIn,
-                                            session->procFrame->_payloadData,
+                                            session->procFrame->data_,
                                             &frOut);
             } else {
                 speex_resampler_process_interleaved_int(session->inResampler,
                                                         session->inBuf,
                                                         &frIn,
-                                                        session->procFrame->_payloadData,
+                                                        session->procFrame->data_,
                                                         &frOut);
             }
             memcpy(session->inBuf,
@@ -1264,7 +1324,7 @@ int PreProcessingFx_Process(effect_handle_t     self,
             if (inBuffer->frameCount < fr) {
                 fr = inBuffer->frameCount;
             }
-            memcpy(session->procFrame->_payloadData + session->framesIn * session->inChannelCount,
+            memcpy(session->procFrame->data_ + session->framesIn * session->inChannelCount,
                    inBuffer->s16,
                    fr * session->inChannelCount * sizeof(int16_t));
 
@@ -1284,15 +1344,22 @@ int PreProcessingFx_Process(effect_handle_t     self,
             }
             session->framesIn = 0;
         }
-        session->procFrame->_payloadDataLengthInSamples =
-                session->apmFrameCount * session->inChannelCount;
+        session->procFrame->samples_per_channel_ = session->apmFrameCount;
 
         effect->session->apm->ProcessStream(session->procFrame);
 
         if (session->outBufSize < session->framesOut + session->frameCount) {
+            int16_t *buf;
             session->outBufSize = session->framesOut + session->frameCount;
-            session->outBuf = (int16_t *)realloc(session->outBuf,
-                              session->outBufSize * session->outChannelCount * sizeof(int16_t));
+            buf = (int16_t *)realloc(session->outBuf,
+                             session->outBufSize * session->outChannelCount * sizeof(int16_t));
+            if (buf == NULL) {
+                session->framesOut = 0;
+                free(session->outBuf);
+                session->outBuf = NULL;
+                return -ENOMEM;
+            }
+            session->outBuf = buf;
         }
 
         if (session->outResampler != NULL) {
@@ -1301,13 +1368,13 @@ int PreProcessingFx_Process(effect_handle_t     self,
             if (session->inChannelCount == 1) {
                 speex_resampler_process_int(session->outResampler,
                                     0,
-                                    session->procFrame->_payloadData,
+                                    session->procFrame->data_,
                                     &frIn,
                                     session->outBuf + session->framesOut * session->outChannelCount,
                                     &frOut);
             } else {
                 speex_resampler_process_interleaved_int(session->outResampler,
-                                    session->procFrame->_payloadData,
+                                    session->procFrame->data_,
                                     &frIn,
                                     session->outBuf + session->framesOut * session->outChannelCount,
                                     &frOut);
@@ -1315,7 +1382,7 @@ int PreProcessingFx_Process(effect_handle_t     self,
             session->framesOut += frOut;
         } else {
             memcpy(session->outBuf + session->framesOut * session->outChannelCount,
-                   session->procFrame->_payloadData,
+                   session->procFrame->data_,
                    session->frameCount * session->outChannelCount * sizeof(int16_t));
             session->framesOut += session->frameCount;
         }
@@ -1346,8 +1413,6 @@ int PreProcessingFx_Command(effect_handle_t  self,
                             void                *pReplyData)
 {
     preproc_effect_t * effect = (preproc_effect_t *) self;
-    int retsize;
-    int status;
 
     if (effect == NULL){
         return -EINVAL;
@@ -1721,7 +1786,6 @@ int PreProcessingFx_ProcessReverse(effect_handle_t     self,
                                    audio_buffer_t    *outBuffer __unused)
 {
     preproc_effect_t * effect = (preproc_effect_t *)self;
-    int    status = 0;
 
     if (effect == NULL){
         ALOGW("PreProcessingFx_ProcessReverse() ERROR effect == NULL");
@@ -1748,9 +1812,17 @@ int PreProcessingFx_ProcessReverse(effect_handle_t     self,
                 fr = inBuffer->frameCount;
             }
             if (session->revBufSize < session->framesRev + fr) {
+                int16_t *buf;
                 session->revBufSize = session->framesRev + fr;
-                session->revBuf = (int16_t *)realloc(session->revBuf,
-                                  session->revBufSize * session->inChannelCount * sizeof(int16_t));
+                buf = (int16_t *)realloc(session->revBuf,
+                                 session->revBufSize * session->inChannelCount * sizeof(int16_t));
+                if (buf == NULL) {
+                    session->framesRev = 0;
+                    free(session->revBuf);
+                    session->revBuf = NULL;
+                    return -ENOMEM;
+                }
+                session->revBuf = buf;
             }
             memcpy(session->revBuf + session->framesRev * session->inChannelCount,
                    inBuffer->s16,
@@ -1768,13 +1840,13 @@ int PreProcessingFx_ProcessReverse(effect_handle_t     self,
                                             0,
                                             session->revBuf,
                                             &frIn,
-                                            session->revFrame->_payloadData,
+                                            session->revFrame->data_,
                                             &frOut);
             } else {
                 speex_resampler_process_interleaved_int(session->revResampler,
                                                         session->revBuf,
                                                         &frIn,
-                                                        session->revFrame->_payloadData,
+                                                        session->revFrame->data_,
                                                         &frOut);
             }
             memcpy(session->revBuf,
@@ -1786,7 +1858,7 @@ int PreProcessingFx_ProcessReverse(effect_handle_t     self,
             if (inBuffer->frameCount < fr) {
                 fr = inBuffer->frameCount;
             }
-            memcpy(session->revFrame->_payloadData + session->framesRev * session->inChannelCount,
+            memcpy(session->revFrame->data_ + session->framesRev * session->inChannelCount,
                    inBuffer->s16,
                    fr * session->inChannelCount * sizeof(int16_t));
             session->framesRev += fr;
@@ -1796,8 +1868,7 @@ int PreProcessingFx_ProcessReverse(effect_handle_t     self,
             }
             session->framesRev = 0;
         }
-        session->revFrame->_payloadDataLengthInSamples =
-                session->apmFrameCount * session->inChannelCount;
+        session->revFrame->samples_per_channel_ = session->apmFrameCount;
         effect->session->apm->AnalyzeReverseStream(session->revFrame);
         return 0;
     } else {
@@ -1856,14 +1927,13 @@ int PreProcessingLib_Create(const effect_uuid_t *uuid,
     status = Session_CreateEffect(session, procId, pInterface);
 
     if (status < 0 && session->createdMsk == 0) {
-        session->io = 0;
+        session->id = 0;
     }
     return status;
 }
 
 int PreProcessingLib_Release(effect_handle_t interface)
 {
-    int status;
     ALOGV("EffectRelease start %p", interface);
     if (PreProc_Init() != 0) {
         return sInitStatus;
@@ -1871,7 +1941,7 @@ int PreProcessingLib_Release(effect_handle_t interface)
 
     preproc_effect_t *fx = (preproc_effect_t *)interface;
 
-    if (fx->session->io == 0) {
+    if (fx->session->id == 0) {
         return -EINVAL;
     }
     return Session_ReleaseEffect(fx->session, fx);

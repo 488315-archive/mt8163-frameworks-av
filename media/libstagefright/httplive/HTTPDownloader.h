@@ -28,12 +28,12 @@ namespace android {
 struct ABuffer;
 class DataSource;
 struct HTTPBase;
-struct IMediaHTTPService;
+struct MediaHTTPService;
 struct M3UParser;
 
 struct HTTPDownloader : public RefBase {
     HTTPDownloader(
-            const sp<IMediaHTTPService> &httpService,
+            const sp<MediaHTTPService> &httpService,
             const KeyedVector<String8, String8> &headers);
 
     void reconnect();
@@ -77,9 +77,7 @@ private:
 
     Mutex mLock;
     bool mDisconnecting;
-#ifdef MTK_AOSP_ENHANCEMENT
-    void dumpPlaylist(sp<ABuffer> &buffer);
-#endif
+
     DISALLOW_EVIL_CONSTRUCTORS(HTTPDownloader);
 };
 

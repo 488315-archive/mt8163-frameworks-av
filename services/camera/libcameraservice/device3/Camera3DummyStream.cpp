@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2014 The Android Open Source Project
+ * Copyright (C) 2014-2018 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,9 +26,12 @@ namespace android {
 
 namespace camera3 {
 
+const String8 Camera3DummyStream::DUMMY_ID;
+
 Camera3DummyStream::Camera3DummyStream(int id) :
         Camera3IOStreamBase(id, CAMERA3_STREAM_OUTPUT, DUMMY_WIDTH, DUMMY_HEIGHT,
-                /*maxSize*/0, DUMMY_FORMAT, DUMMY_DATASPACE, DUMMY_ROTATION) {
+                /*maxSize*/0, DUMMY_FORMAT, DUMMY_DATASPACE, DUMMY_ROTATION,
+                DUMMY_ID) {
 
 }
 
@@ -36,28 +39,30 @@ Camera3DummyStream::~Camera3DummyStream() {
 
 }
 
-status_t Camera3DummyStream::getBufferLocked(camera3_stream_buffer *buffer) {
+status_t Camera3DummyStream::getBufferLocked(camera3_stream_buffer *,
+        const std::vector<size_t>&) {
     ATRACE_CALL();
-    ALOGE("%s: Stream %d: Dummy stream cannot produce buffers!", mId);
+    ALOGE("%s: Stream %d: Dummy stream cannot produce buffers!", __FUNCTION__, mId);
     return INVALID_OPERATION;
 }
 
 status_t Camera3DummyStream::returnBufferLocked(
-        const camera3_stream_buffer &buffer,
-        nsecs_t timestamp) {
+        const camera3_stream_buffer &,
+        nsecs_t, const std::vector<size_t>&) {
     ATRACE_CALL();
-    ALOGE("%s: Stream %d: Dummy stream cannot return buffers!", mId);
+    ALOGE("%s: Stream %d: Dummy stream cannot return buffers!", __FUNCTION__, mId);
     return INVALID_OPERATION;
 }
 
 status_t Camera3DummyStream::returnBufferCheckedLocked(
-            const camera3_stream_buffer &buffer,
-            nsecs_t timestamp,
-            bool output,
+            const camera3_stream_buffer &,
+            nsecs_t,
+            bool,
+            const std::vector<size_t>&,
             /*out*/
-            sp<Fence> *releaseFenceOut) {
+            sp<Fence>*) {
     ATRACE_CALL();
-    ALOGE("%s: Stream %d: Dummy stream cannot return buffers!", mId);
+    ALOGE("%s: Stream %d: Dummy stream cannot return buffers!", __FUNCTION__, mId);
     return INVALID_OPERATION;
 }
 
@@ -70,8 +75,15 @@ void Camera3DummyStream::dump(int fd, const Vector<String16> &args) const {
     Camera3IOStreamBase::dump(fd, args);
 }
 
-status_t Camera3DummyStream::setTransform(int transform) {
+status_t Camera3DummyStream::setTransform(int) {
     ATRACE_CALL();
+    // Do nothing
+    return OK;
+}
+
+status_t Camera3DummyStream::detachBuffer(sp<GraphicBuffer>* buffer, int* fenceFd) {
+    (void) buffer;
+    (void) fenceFd;
     // Do nothing
     return OK;
 }
@@ -87,9 +99,39 @@ status_t Camera3DummyStream::disconnectLocked() {
     return OK;
 }
 
-status_t Camera3DummyStream::getEndpointUsage(uint32_t *usage) const {
+status_t Camera3DummyStream::getEndpointUsage(uint64_t *usage) const {
     *usage = DUMMY_USAGE;
     return OK;
+}
+
+bool Camera3DummyStream::isVideoStream() const {
+    return false;
+}
+
+bool Camera3DummyStream::isConsumerConfigurationDeferred(size_t /*surface_id*/) const {
+    return false;
+}
+
+status_t Camera3DummyStream::dropBuffers(bool /*dropping*/) {
+    return OK;
+}
+
+const String8& Camera3DummyStream::getPhysicalCameraId() const {
+    return DUMMY_ID;
+}
+
+status_t Camera3DummyStream::setConsumers(const std::vector<sp<Surface>>& /*consumers*/) {
+    ALOGE("%s: Stream %d: Dummy stream doesn't support set consumer surface!",
+            __FUNCTION__, mId);
+    return INVALID_OPERATION;
+}
+
+status_t Camera3DummyStream::updateStream(const std::vector<sp<Surface>> &/*outputSurfaces*/,
+            const std::vector<OutputStreamInfo> &/*outputInfo*/,
+            const std::vector<size_t> &/*removedSurfaceIds*/,
+            KeyedVector<sp<Surface>, size_t> * /*outputMap*/) {
+    ALOGE("%s: this method is not supported!", __FUNCTION__);
+    return INVALID_OPERATION;
 }
 
 }; // namespace camera3

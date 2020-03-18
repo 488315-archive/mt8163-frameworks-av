@@ -18,13 +18,15 @@
 
 #define SOFT_VPX_H_
 
-#include "SoftVideoDecoderOMXComponent.h"
+#include <media/stagefright/omx/SoftVideoDecoderOMXComponent.h>
 
 #include "vpx/vpx_decoder.h"
 #include "vpx/vpx_codec.h"
 #include "vpx/vp8dx.h"
 
 namespace android {
+
+struct ABuffer;
 
 struct SoftVPX : public SoftVideoDecoderOMXComponent {
     SoftVPX(const char *name,
@@ -40,10 +42,12 @@ protected:
     virtual void onQueueFilled(OMX_U32 portIndex);
     virtual void onPortFlushCompleted(OMX_U32 portIndex);
     virtual void onReset();
+    virtual bool supportDescribeHdrStaticInfo();
+    virtual bool supportDescribeHdr10PlusInfo();
 
 private:
     enum {
-        kNumBuffers = 4
+        kNumBuffers = 10
     };
 
     enum {
@@ -59,7 +63,11 @@ private:
 
     void *mCtx;
     bool mFrameParallelMode;  // Frame parallel is only supported by VP9 decoder.
-    OMX_TICKS mTimeStamps[kNumBuffers];
+    struct PrivInfo {
+        OMX_TICKS mTimeStamp;
+        sp<ABuffer> mHdr10PlusInfo;
+    };
+    PrivInfo mPrivInfo[kNumBuffers];
     uint8_t mTimeStampIdx;
     vpx_image_t *mImg;
 

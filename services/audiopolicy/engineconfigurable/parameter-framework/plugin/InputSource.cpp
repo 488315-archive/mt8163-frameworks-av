@@ -17,37 +17,35 @@
 #include "InputSource.h"
 #include "PolicyMappingKeys.h"
 #include "PolicySubsystem.h"
+#include <media/TypeConverter.h>
 
 using std::string;
 
 InputSource::InputSource(const string &mappingValue,
-                   CInstanceConfigurableElement *instanceConfigurableElement,
-                   const CMappingContext &context)
+                         CInstanceConfigurableElement *instanceConfigurableElement,
+                         const CMappingContext &context, core::log::Logger &logger)
     : CFormattedSubsystemObject(instanceConfigurableElement,
+                                logger,
                                 mappingValue,
                                 MappingKeyAmend1,
                                 (MappingKeyAmendEnd - MappingKeyAmend1 + 1),
                                 context),
       mPolicySubsystem(static_cast<const PolicySubsystem *>(
                            instanceConfigurableElement->getBelongingSubsystem())),
-      mPolicyPluginInterface(mPolicySubsystem->getPolicyPluginInterface()),
-      mApplicableInputDevice(mDefaultApplicableInputDevice)
+      mPolicyPluginInterface(mPolicySubsystem->getPolicyPluginInterface())
 {
-    mId = static_cast<audio_source_t>(context.getItemAsInteger(MappingKeyIdentifier));
-    // Declares the strategy to audio policy engine
-    mPolicyPluginInterface->addInputSource(getFormattedMappingValue(), mId);
-}
+    std::string name(context.getItem(MappingKeyName));
 
-bool InputSource::receiveFromHW(string & /*error*/)
-{
-    blackboardWrite(&mApplicableInputDevice, sizeof(mApplicableInputDevice));
-    return true;
+    if(not android::SourceTypeConverter::fromString(name, mId)) {
+        LOG_ALWAYS_FATAL("Invalid Input Source name: %s, invalid XML structure file", name.c_str());
+    }
+    // Declares the strategy to audio policy engine
+    mPolicyPluginInterface->addInputSource(name, mId);
 }
 
 bool InputSource::sendToHW(string & /*error*/)
 {
     uint32_t applicableInputDevice;
     blackboardRead(&applicableInputDevice, sizeof(applicableInputDevice));
-    mApplicableInputDevice = applicableInputDevice;
-    return mPolicyPluginInterface->setDeviceForInputSource(mId, mApplicableInputDevice);
+    return mPolicyPluginInterface->setDeviceForInputSource(mId, applicableInputDevice);
 }

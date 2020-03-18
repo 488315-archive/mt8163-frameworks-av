@@ -1,9 +1,4 @@
 /*
-* Copyright (C) 2014 MediaTek Inc.
-* Modification based on code covered by the mentioned copyright
-* and/or permission notice(s).
-*/
-/*
  * Copyright (C) 2010 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -33,23 +28,15 @@
 #include <media/stagefright/MediaDefs.h>
 #include <media/stagefright/MetaData.h>
 
-#ifdef MTK_AOSP_ENHANCEMENT
-#include "GenericSource.h"
-#include <ASessionDescription.h>
-//for bitrate-adaptation
-static int kWholeBufSize = 40000000; //40Mbytes
-static int kTargetTime = 2000;  //ms
-static int64_t kRTSPEarlyEndTimeUs = 1000000ll; //3000000ll;  3secs
-//Redefine to avoid overrided by other headers
-// We're going to buffer at least 2 secs worth data on all tracks before
-// starting playback (both at startup and after a seek).
-//static const int64_t kMinDurationUs =   5000000ll;
-static const int64_t kHighWaterMarkUs = 5000000ll;   //5 secs
-//static const int64_t kLowWaterMarkUs =  1000000ll;     //1 secs
-#endif
 namespace android {
 
-const int64_t kNearEOSTimeoutUs = 2000000ll; // 2 secs
+const int64_t kNearEOSTimeoutUs = 2000000LL; // 2 secs
+
+// Default Buffer Underflow/Prepare/StartServer/Overflow Marks
+static const int kUnderflowMarkMs   =  1000;  // 1 second
+static const int kPrepareMarkMs     =  3000;  // 3 seconds
+//static const int kStartServerMarkMs =  5000;
+static const int kOverflowMarkMs    = 10000;  // 10 seconds
 
 NuPlayer::RTSPSource::RTSPSource(
         const sp<AMessage> &notify,
@@ -70,10 +57,14 @@ NuPlayer::RTSPSource::RTSPSource(
       mFinalResult(OK),
       mDisconnectReplyID(0),
       mBuffering(false),
+      mInPreparationPhase(true),
+      mEOSPending(false),
       mSeekGeneration(0),
       mEOSTimeoutAudio(0),
       mEOSTimeoutVideo(0) {
-      if (headers) {
+    mBufferingSettings.mInitialMarkMs = kPrepareMarkMs;
+    mBufferingSettings.mResumePlaybackMarkMs = kOverflowMarkMs;
+    if (headers) {
         mExtraHeaders = *headers;
 
         ssize_t index =
@@ -85,24 +76,34 @@ NuPlayer::RTSPSource::RTSPSource(
             mExtraHeaders.removeItemsAt(index);
         }
     }
-#ifdef MTK_AOSP_ENHANCEMENT
-    init();
-#endif
 }
 
 NuPlayer::RTSPSource::~RTSPSource() {
-#ifdef MTK_AOSP_ENHANCEMENT
-    if (mHandlerLooper != NULL) {
-        mHandlerLooper->stop();
-    }
-#endif
     if (mLooper != NULL) {
         mLooper->unregisterHandler(id());
         mLooper->stop();
     }
 }
 
+status_t NuPlayer::RTSPSource::getBufferingSettings(
+            BufferingSettings* buffering /* nonnull */) {
+    Mutex::Autolock _l(mBufferingSettingsLock);
+    *buffering = mBufferingSettings;
+    return OK;
+}
+
+status_t NuPlayer::RTSPSource::setBufferingSettings(const BufferingSettings& buffering) {
+    Mutex::Autolock _l(mBufferingSettingsLock);
+    mBufferingSettings = buffering;
+    return OK;
+}
+
 void NuPlayer::RTSPSource::prepareAsync() {
+    if (mIsSDP && mHTTPService == NULL) {
+        notifyPrepared(BAD_VALUE);
+        return;
+    }
+
     if (mLooper == NULL) {
         mLooper = new ALooper;
         mLooper->setName("rtsp");
@@ -128,22 +129,15 @@ void NuPlayer::RTSPSource::prepareAsync() {
                 mURL.c_str(), mExtraHeaders.isEmpty() ? NULL : &mExtraHeaders);
     } else {
         mHandler = new MyHandler(mURL.c_str(), notify, mUIDValid, mUID);
-#ifdef MTK_AOSP_ENHANCEMENT
-        prepareMyHandler();
-#else
         mLooper->registerHandler(mHandler);
 
         mHandler->connect();
-#endif
     }
 
-   startBufferingIfNecessary();
+    startBufferingIfNecessary();
 }
 
 void NuPlayer::RTSPSource::start() {
-#ifdef MTK_AOSP_ENHANCEMENT
-    mHandler->resume();
-#endif
 }
 
 void NuPlayer::RTSPSource::stop() {
@@ -154,39 +148,6 @@ void NuPlayer::RTSPSource::stop() {
 
     sp<AMessage> dummy;
     msg->postAndAwaitResponse(&dummy);
-}
-
-void NuPlayer::RTSPSource::pause() {
-#ifdef MTK_AOSP_ENHANCEMENT
-    if (mState == DISCONNECTED) {
-        return;
-    }
-#else
-    int64_t mediaDurationUs = 0;
-    getDuration(&mediaDurationUs);
-    for (size_t index = 0; index < mTracks.size(); index++) {
-        TrackInfo *info = &mTracks.editItemAt(index);
-        sp<AnotherPacketSource> source = info->mSource;
-
-        // Check if EOS or ERROR is received
-        if (source != NULL && source->isFinished(mediaDurationUs)) {
-            return;
-        }
-    }
-#endif
-    mHandler->pause();
-}
-
-void NuPlayer::RTSPSource::resume() {
-#ifdef MTK_AOSP_ENHANCEMENT
-    if (mState == DISCONNECTED) {
-        return;
-    }
-#endif
-
-    if (mHandler != NULL) {
-        mHandler->resume();
-    }
 }
 
 status_t NuPlayer::RTSPSource::feedMoreTSData() {
@@ -201,42 +162,24 @@ sp<MetaData> NuPlayer::RTSPSource::getFormatMeta(bool audio) {
         return NULL;
     }
 
-#ifdef  MTK_AOSP_ENHANCEMENT
-    sp<MetaData> meta = source->getFormat();
-    setMeta(audio, meta);
-    return meta;
-#else
     return source->getFormat();
-#endif
 }
 
 bool NuPlayer::RTSPSource::haveSufficientDataOnAllTracks() {
     // We're going to buffer at least 2 secs worth data on all tracks before
     // starting playback (both at startup and after a seek).
-#ifndef MTK_AOSP_ENHANCEMENT
-    static const int64_t kMinDurationUs = 2000000ll;
-#endif
+
+    static const int64_t kMinDurationUs = 2000000LL;
 
     int64_t mediaDurationUs = 0;
     getDuration(&mediaDurationUs);
     if ((mAudioTrack != NULL && mAudioTrack->isFinished(mediaDurationUs))
             || (mVideoTrack != NULL && mVideoTrack->isFinished(mediaDurationUs))) {
-#ifdef MTK_AOSP_ENHANCEMENT
-        notifyBufRate(mHighWaterMarkUs);
-#endif
         return true;
     }
 
     status_t err;
     int64_t durationUs;
-#ifdef MTK_AOSP_ENHANCEMENT
-    err = generalBufferedDurationUs(&durationUs);
-    if (err == OK) {
-        bool bufferingComplete = (durationUs >= mHighWaterMarkUs);
-        notifyBufRate(bufferingComplete ? mHighWaterMarkUs : durationUs);
-        return bufferingComplete;
-    }
-#else
     if (mAudioTrack != NULL
             && (durationUs = mAudioTrack->getBufferedDurationUs(&err))
                     < kMinDurationUs
@@ -254,7 +197,6 @@ bool NuPlayer::RTSPSource::haveSufficientDataOnAllTracks() {
               durationUs / 1E6);
         return false;
     }
-#endif
 
     return true;
 }
@@ -271,47 +213,31 @@ status_t NuPlayer::RTSPSource::dequeueAccessUnit(
         return -EWOULDBLOCK;
     }
 
-#ifdef MTK_AOSP_ENHANCEMENT
-    // mtk80902: ALPS00447701
-    // error occurs while still receiving data
-    // mtk80902: ALPS01258456
-    // after seek to the end, received accu arrived earlier than EOS
-    if (mQuitRightNow) {
-        ALOGD("%s RTSPSource Quit Right Now", audio?"audio":"video");
-        return ERROR_END_OF_STREAM;
-    }
-#endif
     status_t finalResult;
     if (!source->hasBufferAvailable(&finalResult)) {
         if (finalResult == OK) {
-            int64_t mediaDurationUs = 0;
-            getDuration(&mediaDurationUs);
-            sp<AnotherPacketSource> otherSource = getSource(!audio);
-            status_t otherFinalResult;
 
-            // If other source already signaled EOS, this source should also signal EOS
-            if (otherSource != NULL &&
-                    !otherSource->hasBufferAvailable(&otherFinalResult) &&
-                    otherFinalResult == ERROR_END_OF_STREAM) {
-                source->signalEOS(ERROR_END_OF_STREAM);
+            // If other source already signaled EOS, this source should also return EOS
+            if (sourceReachedEOS(!audio)) {
                 return ERROR_END_OF_STREAM;
             }
 
             // If this source has detected near end, give it some time to retrieve more
-            // data before signaling EOS
+            // data before returning EOS
+            int64_t mediaDurationUs = 0;
+            getDuration(&mediaDurationUs);
             if (source->isFinished(mediaDurationUs)) {
                 int64_t eosTimeout = audio ? mEOSTimeoutAudio : mEOSTimeoutVideo;
                 if (eosTimeout == 0) {
                     setEOSTimeout(audio, ALooper::GetNowUs());
                 } else if ((ALooper::GetNowUs() - eosTimeout) > kNearEOSTimeoutUs) {
                     setEOSTimeout(audio, 0);
-                    source->signalEOS(ERROR_END_OF_STREAM);
                     return ERROR_END_OF_STREAM;
                 }
                 return -EWOULDBLOCK;
             }
 
-            if (!(otherSource != NULL && otherSource->isFinished(mediaDurationUs))) {
+            if (!sourceNearEOS(!audio)) {
                 // We should not enter buffering mode
                 // if any of the sources already have detected EOS.
                 startBufferingIfNecessary();
@@ -347,13 +273,10 @@ void NuPlayer::RTSPSource::setEOSTimeout(bool audio, int64_t timeout) {
 }
 
 status_t NuPlayer::RTSPSource::getDuration(int64_t *durationUs) {
-    *durationUs = 0ll;
+    *durationUs = -1LL;
 
     int64_t audioDurationUs;
     if (mAudioTrack != NULL
-#ifdef MTK_AOSP_ENHANCEMENT
-            && mAudioTrack->getFormat() != NULL
-#endif
             && mAudioTrack->getFormat()->findInt64(
                 kKeyDuration, &audioDurationUs)
             && audioDurationUs > *durationUs) {
@@ -362,9 +285,6 @@ status_t NuPlayer::RTSPSource::getDuration(int64_t *durationUs) {
 
     int64_t videoDurationUs;
     if (mVideoTrack != NULL
-#ifdef MTK_AOSP_ENHANCEMENT
-            && mVideoTrack->getFormat() != NULL
-#endif
             && mVideoTrack->getFormat()->findInt64(
                 kKeyDuration, &videoDurationUs)
             && videoDurationUs > *durationUs) {
@@ -374,13 +294,12 @@ status_t NuPlayer::RTSPSource::getDuration(int64_t *durationUs) {
     return OK;
 }
 
-status_t NuPlayer::RTSPSource::seekTo(int64_t seekTimeUs) {
-#ifdef MTK_AOSP_ENHANCEMENT
-    return mtkSeekTo(seekTimeUs);
-#else
+status_t NuPlayer::RTSPSource::seekTo(int64_t seekTimeUs, MediaPlayerSeekMode mode) {
     sp<AMessage> msg = new AMessage(kWhatPerformSeek, this);
     msg->setInt32("generation", ++mSeekGeneration);
     msg->setInt64("timeUs", seekTimeUs);
+    msg->setInt32("mode", mode);
+
     sp<AMessage> response;
     status_t err = msg->postAndAwaitResponse(&response);
     if (err == OK && response != NULL) {
@@ -388,21 +307,171 @@ status_t NuPlayer::RTSPSource::seekTo(int64_t seekTimeUs) {
     }
 
     return err;
-#endif
 }
 
 void NuPlayer::RTSPSource::performSeek(int64_t seekTimeUs) {
     if (mState != CONNECTED) {
-#ifdef MTK_AOSP_ENHANCEMENT
-        notifyAsyncDone(kWhatSeekDone);
-#else
         finishSeek(INVALID_OPERATION);
-#endif
         return;
     }
 
     mState = SEEKING;
     mHandler->seek(seekTimeUs);
+    mEOSPending = false;
+}
+
+void NuPlayer::RTSPSource::schedulePollBuffering() {
+    sp<AMessage> msg = new AMessage(kWhatPollBuffering, this);
+    msg->post(1000000LL); // 1 second intervals
+}
+
+void NuPlayer::RTSPSource::checkBuffering(
+        bool *prepared, bool *underflow, bool *overflow, bool *startServer, bool *finished) {
+    size_t numTracks = mTracks.size();
+    size_t preparedCount, underflowCount, overflowCount, startCount, finishedCount;
+    preparedCount = underflowCount = overflowCount = startCount = finishedCount = 0;
+
+    size_t count = numTracks;
+    for (size_t i = 0; i < count; ++i) {
+        status_t finalResult;
+        TrackInfo *info = &mTracks.editItemAt(i);
+        sp<AnotherPacketSource> src = info->mSource;
+        if (src == NULL) {
+            --numTracks;
+            continue;
+        }
+        int64_t bufferedDurationUs = src->getBufferedDurationUs(&finalResult);
+
+        int64_t initialMarkUs;
+        int64_t maxRebufferingMarkUs;
+        {
+            Mutex::Autolock _l(mBufferingSettingsLock);
+            initialMarkUs = mBufferingSettings.mInitialMarkMs * 1000LL;
+            // TODO: maxRebufferingMarkUs could be larger than
+            // mBufferingSettings.mResumePlaybackMarkMs * 1000ll.
+            maxRebufferingMarkUs = mBufferingSettings.mResumePlaybackMarkMs * 1000LL;
+        }
+        // isFinished when duration is 0 checks for EOS result only
+        if (bufferedDurationUs > initialMarkUs
+                || src->isFinished(/* duration */ 0)) {
+            ++preparedCount;
+        }
+
+        if (src->isFinished(/* duration */ 0)) {
+            ++overflowCount;
+            ++finishedCount;
+        } else {
+            // TODO: redefine kUnderflowMarkMs to a fair value,
+            if (bufferedDurationUs < kUnderflowMarkMs * 1000) {
+                ++underflowCount;
+            }
+            if (bufferedDurationUs > maxRebufferingMarkUs) {
+                ++overflowCount;
+            }
+            int64_t startServerMarkUs =
+                    (kUnderflowMarkMs * 1000LL + maxRebufferingMarkUs) / 2;
+            if (bufferedDurationUs < startServerMarkUs) {
+                ++startCount;
+            }
+        }
+    }
+
+    *prepared    = (preparedCount == numTracks);
+    *underflow   = (underflowCount > 0);
+    *overflow    = (overflowCount == numTracks);
+    *startServer = (startCount > 0);
+    *finished    = (finishedCount > 0);
+}
+
+void NuPlayer::RTSPSource::onPollBuffering() {
+    bool prepared, underflow, overflow, startServer, finished;
+    checkBuffering(&prepared, &underflow, &overflow, &startServer, &finished);
+
+    if (prepared && mInPreparationPhase) {
+        mInPreparationPhase = false;
+        notifyPrepared();
+    }
+
+    if (!mInPreparationPhase && underflow) {
+        startBufferingIfNecessary();
+    }
+
+    if (haveSufficientDataOnAllTracks()) {
+        stopBufferingIfNecessary();
+    }
+
+    if (overflow && mHandler != NULL) {
+        mHandler->pause();
+    }
+
+    if (startServer && mHandler != NULL) {
+        mHandler->resume();
+    }
+
+    if (finished && mHandler != NULL) {
+        mHandler->cancelAccessUnitTimeoutCheck();
+    }
+
+    schedulePollBuffering();
+}
+
+void NuPlayer::RTSPSource::signalSourceEOS(status_t result) {
+    const bool audio = true;
+    const bool video = false;
+
+    sp<AnotherPacketSource> source = getSource(audio);
+    if (source != NULL) {
+        source->signalEOS(result);
+    }
+
+    source = getSource(video);
+    if (source != NULL) {
+        source->signalEOS(result);
+    }
+}
+
+bool NuPlayer::RTSPSource::sourceReachedEOS(bool audio) {
+    sp<AnotherPacketSource> source = getSource(audio);
+    status_t finalResult;
+    return (source != NULL &&
+            !source->hasBufferAvailable(&finalResult) &&
+            finalResult == ERROR_END_OF_STREAM);
+}
+
+bool NuPlayer::RTSPSource::sourceNearEOS(bool audio) {
+    sp<AnotherPacketSource> source = getSource(audio);
+    int64_t mediaDurationUs = 0;
+    getDuration(&mediaDurationUs);
+    return (source != NULL && source->isFinished(mediaDurationUs));
+}
+
+void NuPlayer::RTSPSource::onSignalEOS(const sp<AMessage> &msg) {
+    int32_t generation;
+    CHECK(msg->findInt32("generation", &generation));
+
+    if (generation != mSeekGeneration) {
+        return;
+    }
+
+    if (mEOSPending) {
+        signalSourceEOS(ERROR_END_OF_STREAM);
+        mEOSPending = false;
+    }
+}
+
+void NuPlayer::RTSPSource::postSourceEOSIfNecessary() {
+    const bool audio = true;
+    const bool video = false;
+    // If a source has detected near end, give it some time to retrieve more
+    // data before signaling EOS
+    if (sourceNearEOS(audio) || sourceNearEOS(video)) {
+        if (!mEOSPending) {
+            sp<AMessage> msg = new AMessage(kWhatSignalEOS, this);
+            msg->setInt32("generation", mSeekGeneration);
+            msg->post(kNearEOSTimeoutUs);
+            mEOSPending = true;
+        }
+    }
 }
 
 void NuPlayer::RTSPSource::onMessageReceived(const sp<AMessage> &msg) {
@@ -416,35 +485,31 @@ void NuPlayer::RTSPSource::onMessageReceived(const sp<AMessage> &msg) {
     } else if (msg->what() == kWhatPerformSeek) {
         int32_t generation;
         CHECK(msg->findInt32("generation", &generation));
+        CHECK(msg->senderAwaitsResponse(&mSeekReplyID));
 
         if (generation != mSeekGeneration) {
             // obsolete.
-#ifdef MTK_AOSP_ENHANCEMENT
-            notifyAsyncDone(kWhatSeekDone);
-#else
             finishSeek(OK);
-#endif
             return;
         }
 
-#ifdef MTK_AOSP_ENHANCEMENT
-        mQuitRightNow = false;
-#else
-        CHECK(msg->senderAwaitsResponse(&mSeekReplyID));
-#endif
         int64_t seekTimeUs;
+        int32_t mode;
         CHECK(msg->findInt64("timeUs", &seekTimeUs));
+        CHECK(msg->findInt32("mode", &mode));
 
-        performSeek(seekTimeUs);
+        // TODO: add "mode" to performSeek.
+        performSeek(seekTimeUs/*, (MediaPlayerSeekMode)mode */);
+        return;
+    } else if (msg->what() == kWhatPollBuffering) {
+        onPollBuffering();
+        return;
+    } else if (msg->what() == kWhatSignalEOS) {
+        onSignalEOS(msg);
         return;
     }
-#ifdef MTK_AOSP_ENHANCEMENT
-    else if (msg->what() == kWhatStopTrack) {
-        onStopTrack(msg);
-        return;
-    }
-#endif
-    CHECK_EQ(msg->what(), (int)kWhatNotify);
+
+    CHECK_EQ(msg->what(), kWhatNotify);
 
     int32_t what;
     CHECK(msg->findInt32("what", &what));
@@ -453,11 +518,9 @@ void NuPlayer::RTSPSource::onMessageReceived(const sp<AMessage> &msg) {
         case MyHandler::kWhatConnected:
         {
             onConnected();
-#ifdef MTK_AOSP_ENHANCEMENT
-            notifyBeginningVideoSizeChanged();
-#else
+
             notifyVideoSizeChanged();
-#endif
+
             uint32_t flags = 0;
 
             if (mHandler->isSeekable()) {
@@ -468,7 +531,7 @@ void NuPlayer::RTSPSource::onMessageReceived(const sp<AMessage> &msg) {
             }
 
             notifyFlagsChanged(flags);
-            notifyPrepared();
+            schedulePollBuffering();
             break;
         }
 
@@ -481,17 +544,8 @@ void NuPlayer::RTSPSource::onMessageReceived(const sp<AMessage> &msg) {
         case MyHandler::kWhatSeekDone:
         {
             mState = CONNECTED;
-
-#ifdef MTK_AOSP_ENHANCEMENT
-            status_t err = OK;
-            msg->findInt32("result", &err);
-            notifyAsyncDone(kWhatSeekDone, err);
-#else
-            if (mSeekReplyID != NULL) {
-                // Unblock seekTo here in case we attempted to seek in a live stream
-                finishSeek(OK);
-            }
-#endif
+            // Unblock seekTo here in case we attempted to seek in a live stream
+            finishSeek(OK);
             break;
         }
 
@@ -512,12 +566,13 @@ void NuPlayer::RTSPSource::onMessageReceived(const sp<AMessage> &msg) {
 
             status_t err = OK;
             msg->findInt32("err", &err);
-            finishSeek(err);
 
             if (err == OK) {
                 int64_t timeUs;
                 CHECK(msg->findInt64("time", &timeUs));
                 mHandler->continueSeekAfterPause(timeUs);
+            } else {
+                finishSeek(err);
             }
             break;
         }
@@ -561,16 +616,10 @@ void NuPlayer::RTSPSource::onMessageReceived(const sp<AMessage> &msg) {
                 }
 
                 if (err != OK) {
-                    sp<AnotherPacketSource> source = getSource(false /* audio */);
-                    if (source != NULL) {
-                        source->signalEOS(err);
-                    }
-
-                    source = getSource(true /* audio */);
-                    if (source != NULL) {
-                        source->signalEOS(err);
-                    }
+                    signalSourceEOS(err);
                 }
+
+                postSourceEOSIfNecessary();
                 break;
             }
 
@@ -591,13 +640,14 @@ void NuPlayer::RTSPSource::onMessageReceived(const sp<AMessage> &msg) {
                 int64_t nptUs =
                     ((double)rtpTime - (double)info->mRTPTime)
                         / info->mTimeScale
-                        * 1000000ll
+                        * 1000000LL
                         + info->mNormalPlaytimeUs;
 
                 accessUnit->meta()->setInt64("timeUs", nptUs);
 
                 source->queueAccessUnit(accessUnit);
             }
+            postSourceEOSIfNecessary();
             break;
         }
 
@@ -607,45 +657,16 @@ void NuPlayer::RTSPSource::onMessageReceived(const sp<AMessage> &msg) {
             CHECK(msg->findInt32("finalResult", &finalResult));
             CHECK_NE(finalResult, (status_t)OK);
 
-#ifdef MTK_AOSP_ENHANCEMENT
-            if (finalResult == ERROR_EOS_QUITNOW) {
-                mQuitRightNow = true;
-                finalResult = ERROR_END_OF_STREAM;
-            } else {
-                mEOSTrackCount++;
-                if (mEOSTrackCount == mTracks.size()) {
-                    mAllTrackEOS = true;
-                }
-            }
-#endif
             if (mTSParser != NULL) {
-                sp<AnotherPacketSource> source = getSource(false /* audio */);
-                if (source != NULL) {
-                    source->signalEOS(finalResult);
-                }
-
-                source = getSource(true /* audio */);
-                if (source != NULL) {
-                    source->signalEOS(finalResult);
-                }
-
-                return;
+                signalSourceEOS(finalResult);
             }
 
             size_t trackIndex;
             CHECK(msg->findSize("trackIndex", &trackIndex));
-#ifdef MTK_AOSP_ENHANCEMENT
-            if (mTracks.size() == 0 || trackIndex >= mTracks.size()) {
-                ALOGW("sth wrong that track index: %d while mTrack's size: %d",
-                        trackIndex, mTracks.size());
-                break;
-            }
-#else
             CHECK_LT(trackIndex, mTracks.size());
-#endif
+
             TrackInfo *info = &mTracks.editItemAt(trackIndex);
             sp<AnotherPacketSource> source = info->mSource;
-
             if (source != NULL) {
                 source->signalEOS(finalResult);
             }
@@ -662,14 +683,10 @@ void NuPlayer::RTSPSource::onMessageReceived(const sp<AMessage> &msg) {
             TrackInfo *info = &mTracks.editItemAt(trackIndex);
             sp<AnotherPacketSource> source = info->mSource;
             if (source != NULL) {
-#ifdef MTK_AOSP_ENHANCEMENT
-                source->queueDiscontinuity(ATSParser::DISCONTINUITY_FLUSH_SOURCE_ONLY, NULL,true);
-#else
                 source->queueDiscontinuity(
                         ATSParser::DISCONTINUITY_TIME,
                         NULL,
                         true /* discard */);
-#endif
             }
 
             break;
@@ -700,33 +717,6 @@ void NuPlayer::RTSPSource::onMessageReceived(const sp<AMessage> &msg) {
             break;
         }
 
-#ifdef MTK_AOSP_ENHANCEMENT
-        case MyHandler::kWhatPreSeekDone:
-        {
-            completeSyncCall(msg);
-            break;
-        }
-        case MyHandler::kWhatPlayDone:
-        {
-            status_t err = OK;
-            msg->findInt32("result", &err);
-            // if err == ERROR_CANNOT_CONNECT, will notify can not connect server after EOS
-            if (err != ERROR_CANNOT_CONNECT) {
-            notifyAsyncDone(kWhatPlayDone, err);
-            }
-            break;
-        }
-        case MyHandler::kWhatPauseDone:
-        {
-            status_t err = OK;
-            msg->findInt32("result", &err);
-            // if err == ERROR_CANNOT_CONNECT, will notify can not connect server after EOS
-            if (err != ERROR_CANNOT_CONNECT) {
-            notifyAsyncDone(kWhatPauseDone, err);
-            }
-            break;
-        }
-#endif
         default:
             TRESPASS();
     }
@@ -758,14 +748,11 @@ void NuPlayer::RTSPSource::onConnected() {
         TrackInfo info;
         info.mTimeScale = timeScale;
         info.mRTPTime = 0;
-        info.mNormalPlaytimeUs = 0ll;
+        info.mNormalPlaytimeUs = 0LL;
         info.mNPTMappingValid = false;
 
         if ((isAudio && mAudioTrack == NULL)
                 || (isVideo && mVideoTrack == NULL)) {
-#ifdef MTK_AOSP_ENHANCEMENT
-            info.mSource = initAnotherPacketSource(i, format, isAudio);
-#else
             sp<AnotherPacketSource> source = new AnotherPacketSource(format);
 
             if (isAudio) {
@@ -775,14 +762,10 @@ void NuPlayer::RTSPSource::onConnected() {
             }
 
             info.mSource = source;
-#endif
         }
 
         mTracks.push(info);
     }
-#ifdef MTK_AOSP_ENHANCEMENT
-    prepareMeta();
-#endif
 
     mState = CONNECTED;
 }
@@ -811,12 +794,7 @@ void NuPlayer::RTSPSource::onSDPLoaded(const sp<AMessage> &msg) {
             sp<AMessage> notify = new AMessage(kWhatNotify, this);
 
             mHandler = new MyHandler(rtspUri.c_str(), notify, mUIDValid, mUID);
-#ifdef MTK_AOSP_ENHANCEMENT
-            setHandler();
-            registerHandlerLooper();
-#else
             mLooper->registerHandler(mHandler);
-#endif
 
             mHandler->loadSDP(desc);
         }
@@ -847,11 +825,7 @@ void NuPlayer::RTSPSource::onDisconnected(const sp<AMessage> &msg) {
     CHECK(msg->findInt32("result", &err));
     CHECK_NE(err, (status_t)OK);
 
-#ifdef MTK_AOSP_ENHANCEMENT
-    mHandlerLooper->unregisterHandler(mHandler->id());
-#else
     mLooper->unregisterHandler(mHandler->id());
-#endif
     mHandler.clear();
 
     if (mState == CONNECTING) {
@@ -894,7 +868,7 @@ void NuPlayer::RTSPSource::startBufferingIfNecessary() {
         mBuffering = true;
 
         sp<AMessage> notify = dupNotify();
-        notify->setInt32("what", kWhatBufferingStart);
+        notify->setInt32("what", kWhatPauseOnBufferingStart);
         notify->post();
     }
 }
@@ -910,7 +884,7 @@ bool NuPlayer::RTSPSource::stopBufferingIfNecessary() {
         mBuffering = false;
 
         sp<AMessage> notify = dupNotify();
-        notify->setInt32("what", kWhatBufferingEnd);
+        notify->setInt32("what", kWhatResumeOnBufferingEnd);
         notify->post();
     }
 
@@ -918,414 +892,13 @@ bool NuPlayer::RTSPSource::stopBufferingIfNecessary() {
 }
 
 void NuPlayer::RTSPSource::finishSeek(status_t err) {
-    CHECK(mSeekReplyID != NULL);
+    if (mSeekReplyID == NULL) {
+        return;
+    }
     sp<AMessage> seekReply = new AMessage;
     seekReply->setInt32("err", err);
     seekReply->postReply(mSeekReplyID);
     mSeekReplyID = NULL;
 }
-
-#ifdef MTK_AOSP_ENHANCEMENT
-NuPlayer::RTSPSource::RTSPSource(
-        const sp<AMessage> &notify,
-        const char *url,
-        const KeyedVector<String8, String8> *headers,
-        bool uidValid,
-        uid_t uid,
-        bool isSDP)
-    : Source(notify),
-      mURL(url),
-      mUIDValid(uidValid),
-      mUID(uid),
-      mFlags(0),
-      mIsSDP(isSDP),
-      mState(DISCONNECTED),
-      mFinalResult(OK),
-      mDisconnectReplyID(0),
-      mBuffering(true),
-      mSeekGeneration(0),
-      mEOSTimeoutAudio(0),
-      mEOSTimeoutVideo(0) {
-      if (headers) {
-        mExtraHeaders = *headers;
-
-        ssize_t index =
-            mExtraHeaders.indexOfKey(String8("x-hide-urls-from-log"));
-
-        if (index >= 0) {
-            mFlags |= kFlagIncognito;
-
-            mExtraHeaders.removeItemsAt(index);
-        }
-    }
-#ifdef MTK_AOSP_ENHANCEMENT
-    init();
-#endif
-}
-
-void NuPlayer::RTSPSource::init() {
-    ALOGD("init+, RTSP uri headers from AP:\n");
-    for (size_t i = 0; i < mExtraHeaders.size(); i ++) {
-        ALOGD("\t\t%s: %s", mExtraHeaders.keyAt(i).string(), mExtraHeaders.valueAt(i).string());
-    }
-
-    mHighWaterMarkUs = kHighWaterMarkUs;
-    mQuitRightNow = false;
-    mSyncCallResult = OK;
-    mSyncCallDone = false;
-    mLastSeekCompletedTimeUs = -1;
-    mSeekPosition = -1;
-    mAllTrackEOS = true;
-    mEOSTrackCount = 0;
-
-    //for bitrate adaptation
-    m_BufQueSize = kWholeBufSize; //Whole Buffer queue size
-    m_TargetTime = kTargetTime;  // target protected time of buffer queue duration for interrupt-free playback
-
-    //parse rtsp buffering size from headers and remove useless headers
-    //porting from AwesomePlayer
-    String8 cacheSize;
-    if (removeSpecificHeaders(String8("MTK-RTSP-CACHE-SIZE"), &mExtraHeaders, &cacheSize)) {
-        mHighWaterMarkUs = atoi(cacheSize.string()) * 1000000ll;
-    }
-    ALOGI("RTSP cache size = %lldus", mHighWaterMarkUs);
-    //removeSpecificHeaders(String8("MTK-HTTP-CACHE-SIZE"), &mExtraHeaders, &cacheSize);
-}
-
-void NuPlayer::RTSPSource::registerHandlerLooper() {
-    // mtk80902: standalone looper for MyHandler
-    if (mHandlerLooper == NULL) {
-        mHandlerLooper = new ALooper;
-        mHandlerLooper->setName("rtsp_handler");
-        mHandlerLooper->start();
-    }
-    mHandlerLooper->registerHandler(mHandler);
-}
-
-void NuPlayer::RTSPSource::setHandler() {
-    // mtk80902: ALPS00450314 - min & max port
-    // pass into MyHandler
-    mHandler->parseHeaders(&mExtraHeaders);
-
-    //for bitrate adaptation
-    //because myhandler need this info during setup, but Anotherpacket source will not be created until connect done
-    //so myhandler can't get this buffer info from anotherpacketsource just like apacketsource
-    //but myhandler should keep the same value with anotherpacketsource, so put the value setting here
-    mHandler->setBufQueSize(m_BufQueSize);
-    mHandler->setTargetTimeUs(m_TargetTime);
-}
-
-void NuPlayer::RTSPSource::setMeta(bool audio, sp<MetaData>& meta) {
-    //avoid codec consume data so fast which will cause double bufferring
-     if (audio) {
-            meta->setInt32(kKeyInputBufferNum, 1);
-            meta->setInt32(kKeyMaxQueueBuffer, 1);
-   }else{
-            meta->setInt32(kKeyRTSPSeekMode, 1);
-            meta->setInt32(kKeyMaxQueueBuffer, 1);
-            meta->setInt32(kKeyInputBufferNum, 4);
-    }
-}
-
-void NuPlayer::RTSPSource::notifyBufRate(int64_t durationUs) {
-    static int kBufferNotifyCounter = 0;
-
-    if (durationUs != mHighWaterMarkUs && ++kBufferNotifyCounter <= 20) {
-        return;
-    }
-
-    // clear counter
-    kBufferNotifyCounter = 0;
-
-    // mtk80902: NuPlayer dequeueAccu loops in 10ms
-    // which is too frequent - here we notify every 0.2S
-    sp<AMessage> notify = dupNotify();
-    notify->setInt32("what", kWhatBufferNotify);
-    int32_t rate = 100.0 * (double)durationUs / mHighWaterMarkUs;
-    notify->setInt32("bufRate", rate);
-    notify->post();
-}
-
-status_t NuPlayer::RTSPSource::generalBufferedDurationUs(int64_t *durationUs) {
-    int64_t videoTrackUs = 0;
-    int64_t audeoTrackUs = 0;
-    *durationUs = -1;
-    status_t err = OK;
-    if (mVideoTrack != NULL) {
-       videoTrackUs = mVideoTrack->getBufferedDurationUs(&err);
-       if (err == OK) {
-           *durationUs = videoTrackUs;
-           ALOGV("video track buffered %.2f secs", videoTrackUs / 1E6);
-       } else {
-           ALOGV("video track buffer status %d", err);
-       }
-    }
-
-    if (mAudioTrack != NULL) {
-        audeoTrackUs = mAudioTrack->getBufferedDurationUs(&err);
-        if (err == OK) {
-            if (audeoTrackUs < *durationUs || *durationUs == -1) {
-                *durationUs = audeoTrackUs;
-            }
-            ALOGV("audio track buffered %.f secs", audeoTrackUs / 1E6);
-        } else {
-           ALOGV("audio track buffer status %d", err);
-        }
-    }
-    return err;
-}
-
-void NuPlayer::RTSPSource::notifyAsyncDone(uint32_t notif, status_t err) {
-    sp<AMessage> notify = dupNotify();
-    notify->setInt32("what", notif);
-    notify->setInt32("result", err);
-    notify->post();
-}
-
-status_t NuPlayer::RTSPSource::preSeekSync(int64_t timeUs) {
-    Mutex::Autolock autoLock(mLock);
-    if (mState != CONNECTED) {
-        ALOGW("live streaming or switching tcp or not connected, seek is invalid.");
-        return INVALID_OPERATION;
-    }
-
-    bool tooEarly =
-        mLastSeekCompletedTimeUs >= 0
-            && ALooper::GetNowUs() < mLastSeekCompletedTimeUs + 500000ll;
-#ifdef MTK_BSP_PACKAGE
-    //cancel  ignore seek --do every seek for bsp package
-    // because ignore seek and notify seek complete will cause progress return back
-    tooEarly = false;
-#endif
-
-     if (tooEarly) {
-         ALOGD("seek %lld not perform, because tooEarly", timeUs);
-         ALOGW("ignore too frequent seeks");
-         return ALREADY_EXISTS;
-     }
-
-     prepareSyncCall();
-     mHandler->preSeek(timeUs);
-     status_t err = finishSyncCall();
-     ALOGI("preSeek end err = %d", err);
-     // mtk80902: ALPS00436651
-     if (err == ALREADY_EXISTS)
-         ALOGW("ignore too frequent seeks");
-     else if (err == INVALID_OPERATION)
-         ALOGW("live streaming or switching TCP or not connected, seek is invalid.");
-
-     return err;
-}
-
-void NuPlayer::RTSPSource::prepareSyncCall() {
-    mSyncCallResult = OK;
-    mSyncCallDone = false;
-}
-
-status_t NuPlayer::RTSPSource::finishSyncCall() {
-    while(mSyncCallDone == false) {
-        mCondition.wait(mLock);
-    }
-    return mSyncCallResult;
-}
-
-void NuPlayer::RTSPSource::completeSyncCall(const sp<AMessage>& msg) {
-    Mutex::Autolock autoLock(mLock);
-    if (!msg->findInt32("result", &mSyncCallResult)) {
-        ALOGW("no result found in completeSyncCall");
-        mSyncCallResult = OK;
-    }
-    mSyncCallDone = true;
-    mCondition.signal();
-}
-
-void  NuPlayer::RTSPSource::setSDP(sp<RefBase>& sdp){
-    msdp = sdp;
-}
-
-void NuPlayer::RTSPSource::setParams(const sp<MetaData>& meta)
-{
-    if (mHandler != NULL)
-        mHandler->setPacketSourceParams(meta);
-}
-
-bool NuPlayer::RTSPSource::removeSpecificHeaders(const String8 MyKey, KeyedVector<String8, String8> *headers, String8 *pMyHeader) {
-    ALOGD("removeSpecificHeaders %s", MyKey.string());
-    *pMyHeader = "";
-    if (headers != NULL) {
-        ssize_t index;
-        if ((index = headers->indexOfKey(MyKey)) >= 0) {
-            *pMyHeader = headers->valueAt(index);
-            headers->removeItemsAt(index);
-               ALOGD("special headers: %s = %s", MyKey.string(), pMyHeader->string());
-            return true;
-        }
-    }
-    return false;
-}
-
-void NuPlayer::RTSPSource::stopTrack(bool audio) {
-    sp<AMessage> msg = new AMessage(kWhatStopTrack, this);
-    msg->setInt32("audio", audio);
-
-    sp<AMessage> dummy;
-    msg->postAndAwaitResponse(&dummy);
-}
-
-void NuPlayer::RTSPSource::prepareMeta() {
-    // mtk80902: ALPS00448589
-    // porting from MtkRTSPController
-    if (mMetaData == NULL)
-        mMetaData = new MetaData;
-    mMetaData->setInt32(kKeyServerTimeout, mHandler->getServerTimeout());
-    AString val;
-    sp<ASessionDescription> desc = mHandler->getSessionDesc();
-    if (desc->findAttribute(0, "s=", &val)) {
-        ALOGI("rtsp s=%s ", val.c_str());
-        mMetaData->setCString(kKeyTitle, val.c_str());
-    }
-    if (desc->findAttribute(0, "i=", &val)) {
-        ALOGI("rtsp i=%s ", val.c_str());
-        mMetaData->setCString(kKeyAuthor, val.c_str());
-    }
-}
-void NuPlayer::RTSPSource::onStopTrack(const sp<AMessage> &msg) {
-    int32_t audio;
-    sp<AReplyToken> replyID;
-    CHECK(msg->senderAwaitsResponse(&replyID));
-
-    if (!msg->findInt32("audio", &audio)) {
-        (new AMessage)->postReply(replyID);
-        return;
-    }
-    if (audio && mAudioTrack != NULL) {
-        for (size_t index = 0; index < mTracks.size(); index++) {
-            TrackInfo *info = &mTracks.editItemAt(index);
-            if (info->mSource == mAudioTrack) {
-                info->mSource.clear();
-                mAudioTrack.clear();
-                break;
-            }
-        }
-    }
-    else if (!audio && mVideoTrack != NULL) {
-        for (size_t index = 0; index < mTracks.size(); index++) {
-            TrackInfo *info = &mTracks.editItemAt(index);
-            if (info->mSource == mVideoTrack) {
-                info->mSource.clear();
-                mVideoTrack.clear();
-                break;
-            }
-        }
-    }
-    (new AMessage)->postReply(replyID);
-}
-
-NuPlayer::Source::DataSourceType NuPlayer::RTSPSource::getDataSourceType() {
-    return NuPlayer::Source::SOURCE_Rtsp;
-}
-
-bool NuPlayer::RTSPSource::notifyCanNotConnectServerIfPossible(int64_t curPositionUs) {
-    if (mQuitRightNow) {
-        ALOGI("Do not notify cannot connect server because mQuitRightNow is true");
-        return false;
-    }
-
-    //network disconnect during playing commond causes can not connect server
-    int64_t durationUs;
-   if (getDuration(&durationUs) == OK) {
-        ALOGI("SeekPosition=%lld, durationUs = %lld mAllTrackEOS = %d",
-               mSeekPosition, durationUs, mAllTrackEOS);
-        if ((mSeekPosition != -1) && (durationUs - mSeekPosition < kRTSPEarlyEndTimeUs) && mAllTrackEOS) {
-           return false;
-       }
-
-        //bool needNotify = false;
-        if (durationUs == 0 || durationUs - curPositionUs > kRTSPEarlyEndTimeUs) {
-            ALOGI("RTSP timeout durationUs = %lld curPositionUs = %lld", durationUs, curPositionUs);
-            notifySourceError(MEDIA_ERROR_CANNOT_CONNECT_TO_SERVER);
-            return true;
-        }
-    }
-
-    return false;
-}
-
-void NuPlayer::RTSPSource::notifySourceError(int32_t err) {
-    sp<AMessage> notify = dupNotify();
-    notify->setInt32("what", kWhatSourceError);
-    notify->setInt32("err", err);
-    notify->post();
-}
-
-void NuPlayer::RTSPSource::prepareMyHandler() {
-    setHandler();
-    // mtk80902: standalone looper for MyHandler
-    registerHandlerLooper();
-    if (msdp != NULL) {
-        ALOGI("prepareAsync, sdp mURL = %s", mURL.c_str());
-        sp<ASessionDescription> sdp = (ASessionDescription*)msdp.get();
-        mHandler->loadSDP(sdp);
-    } else {
-        mHandler->connect();
-    }
-}
-
-status_t NuPlayer::RTSPSource::mtkSeekTo(int64_t seekTimeUs) {
-    sp<AMessage> msg = new AMessage(kWhatPerformSeek, this);
-    status_t err = preSeekSync(seekTimeUs);
-    if (err != OK) {
-        return err; // here would never return EWOULDBLOCK
-    }
-    msg->setInt32("generation", ++mSeekGeneration);
-    msg->setInt64("timeUs", seekTimeUs);
-    msg->post();
-    return -EWOULDBLOCK;
-}
-
-void NuPlayer::RTSPSource::notifyBeginningVideoSizeChanged() {
-    sp<AnotherPacketSource> source = getSource(false);
-    if (source == NULL) {
-        //add by mtk08585: Video is not support.
-        //In this case, notifyVideoSizeChanged will make ap to show audio only GUI
-        notifyVideoSizeChanged(NULL);
-    } else {
-        sp<MetaData> meta = source->getFormat();
-        sp<AMessage> msg = new AMessage;
-        status_t err = convertMetaDataToMessage(meta, &msg);
-        if(err == OK) {
-                ALOGI("convertMetaDataToMessage OK");
-            notifyVideoSizeChanged(msg);
-        }
-    }
-}
-
-sp<AnotherPacketSource> NuPlayer::RTSPSource::initAnotherPacketSource(int32_t index, sp<MetaData> format, bool isAudio) {
-    sp<AnotherPacketSource> source = new AnotherPacketSource(format);
-
-    //for bitrate adaptation, ARTPConnection need get the pointer of AnotherPacketSource
-    //to get the buffer queue info during sendRR
-    mHandler->setAnotherPacketSource(index,source);
-
-    //set bufferQue size and target time to anotherpacketSource
-    //which will be same to the buffer info send to server during setup
-    source->setBufQueSize(m_BufQueSize);
-    source->setTargetTime(m_TargetTime);
-
-    if (mAllTrackEOS == true) {
-        mAllTrackEOS = false;
-    }
-
-    if (isAudio) {
-        mAudioTrack = source;
-    } else {
-        mVideoTrack = source;
-        mVideoTrack->setScanForIDR(true);
-    }
-
-    return source;
-}
-
-#endif
 
 }  // namespace android

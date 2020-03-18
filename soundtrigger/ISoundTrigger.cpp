@@ -32,12 +32,13 @@ enum {
     UNLOAD_SOUND_MODEL,
     START_RECOGNITION,
     STOP_RECOGNITION,
+    GET_MODEL_STATE,
 };
 
 class BpSoundTrigger: public BpInterface<ISoundTrigger>
 {
 public:
-    BpSoundTrigger(const sp<IBinder>& impl)
+    explicit BpSoundTrigger(const sp<IBinder>& impl)
         : BpInterface<ISoundTrigger>(impl)
     {
     }
@@ -60,11 +61,13 @@ public:
         data.writeInterfaceToken(ISoundTrigger::getInterfaceDescriptor());
         data.writeStrongBinder(IInterface::asBinder(modelMemory));
         status_t status = remote()->transact(LOAD_SOUND_MODEL, data, &reply);
-        if (status != NO_ERROR ||
-                (status = (status_t)reply.readInt32()) != NO_ERROR) {
+        if (status != NO_ERROR) {
             return status;
         }
-        reply.read(handle, sizeof(sound_model_handle_t));
+        status = (status_t)reply.readInt32();
+        if (status == NO_ERROR) {
+            reply.read(handle, sizeof(sound_model_handle_t));
+        }
         return status;
     }
 
@@ -74,7 +77,7 @@ public:
         data.writeInterfaceToken(ISoundTrigger::getInterfaceDescriptor());
         data.write(&handle, sizeof(sound_model_handle_t));
         status_t status = remote()->transact(UNLOAD_SOUND_MODEL, data, &reply);
-        if (status != NO_ERROR) {
+        if (status == NO_ERROR) {
             status = (status_t)reply.readInt32();
         }
         return status;
@@ -93,7 +96,7 @@ public:
         }
         data.writeStrongBinder(IInterface::asBinder(dataMemory));
         status_t status = remote()->transact(START_RECOGNITION, data, &reply);
-        if (status != NO_ERROR) {
+        if (status == NO_ERROR) {
             status = (status_t)reply.readInt32();
         }
         return status;
@@ -105,7 +108,19 @@ public:
         data.writeInterfaceToken(ISoundTrigger::getInterfaceDescriptor());
         data.write(&handle, sizeof(sound_model_handle_t));
         status_t status = remote()->transact(STOP_RECOGNITION, data, &reply);
-        if (status != NO_ERROR) {
+        if (status == NO_ERROR) {
+            status = (status_t)reply.readInt32();
+        }
+        return status;
+    }
+
+    virtual status_t getModelState(sound_model_handle_t handle)
+    {
+        Parcel data, reply;
+        data.writeInterfaceToken(ISoundTrigger::getInterfaceDescriptor());
+        data.write(&handle, sizeof(sound_model_handle_t));
+        status_t status = remote()->transact(GET_MODEL_STATE, data, &reply);
+        if (status == NO_ERROR) {
             status = (status_t)reply.readInt32();
         }
         return status;
@@ -166,6 +181,17 @@ status_t BnSoundTrigger::onTransact(
             status_t status = stopRecognition(handle);
             reply->writeInt32(status);
             return NO_ERROR;
+        }
+        case GET_MODEL_STATE: {
+            CHECK_INTERFACE(ISoundTrigger, data, reply);
+            sound_model_handle_t handle;
+            status_t status = UNKNOWN_ERROR;
+            status_t ret = data.read(&handle, sizeof(sound_model_handle_t));
+            if (ret == NO_ERROR) {
+                status = getModelState(handle);
+            }
+            reply->writeInt32(status);
+            return ret;
         }
         default:
             return BBinder::onTransact(code, data, reply, flags);

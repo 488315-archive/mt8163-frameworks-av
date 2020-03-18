@@ -36,6 +36,22 @@
  * Sample rate table for converting between the enumerated type and the actual
  * frequency
  */
+#if defined(BUILD_FLOAT) && defined(HIGHER_FS)
+const LVM_UINT32    LVEQNB_SampleRateTab[] = {8000,                    /* 8kS/s  */
+                                              11025,
+                                              12000,
+                                              16000,
+                                              22050,
+                                              24000,
+                                              32000,
+                                              44100,
+                                              48000,
+                                              88200,
+                                              96000,
+                                              176400,
+                                              192000
+};
+#else
 const LVM_UINT16    LVEQNB_SampleRateTab[] = {8000,                    /* 8kS/s  */
                                               11025,
                                               12000,
@@ -44,8 +60,9 @@ const LVM_UINT16    LVEQNB_SampleRateTab[] = {8000,                    /* 8kS/s 
                                               24000,
                                               32000,
                                               44100,
-                                              48000};                  /* 48kS/s */
-
+                                              48000
+};
+#endif
 
 /************************************************************************************/
 /*                                                                                  */
@@ -56,6 +73,24 @@ const LVM_UINT16    LVEQNB_SampleRateTab[] = {8000,                    /* 8kS/s 
 /*
  * Table for 2 * Pi / Fs
  */
+#ifdef BUILD_FLOAT
+const LVM_FLOAT     LVEQNB_TwoPiOnFsTable[] = {LVEQNB_2PiOn_8000,      /* 8kS/s */
+                                               LVEQNB_2PiOn_11025,
+                                               LVEQNB_2PiOn_12000,
+                                               LVEQNB_2PiOn_16000,
+                                               LVEQNB_2PiOn_22050,
+                                               LVEQNB_2PiOn_24000,
+                                               LVEQNB_2PiOn_32000,
+                                               LVEQNB_2PiOn_44100,
+                                               LVEQNB_2PiOn_48000
+#ifdef HIGHER_FS
+                                              ,LVEQNB_2PiOn_88200
+                                              ,LVEQNB_2PiOn_96000
+                                              ,LVEQNB_2PiOn_176400
+                                              ,LVEQNB_2PiOn_192000
+#endif
+                                               };
+#else
 const LVM_INT16     LVEQNB_TwoPiOnFsTable[] = {LVEQNB_2PiOn_8000,      /* 8kS/s */
                                                LVEQNB_2PiOn_11025,
                                                LVEQNB_2PiOn_12000,
@@ -65,10 +100,44 @@ const LVM_INT16     LVEQNB_TwoPiOnFsTable[] = {LVEQNB_2PiOn_8000,      /* 8kS/s 
                                                LVEQNB_2PiOn_32000,
                                                LVEQNB_2PiOn_44100,
                                                LVEQNB_2PiOn_48000};    /* 48kS/s */
+#endif
 
 /*
  * Gain table
  */
+#ifdef BUILD_FLOAT
+const LVM_FLOAT     LVEQNB_GainTable[] = {LVEQNB_Gain_Neg15_dB,        /* -15dB gain */
+                                          LVEQNB_Gain_Neg14_dB,
+                                          LVEQNB_Gain_Neg13_dB,
+                                          LVEQNB_Gain_Neg12_dB,
+                                          LVEQNB_Gain_Neg11_dB,
+                                          LVEQNB_Gain_Neg10_dB,
+                                          LVEQNB_Gain_Neg9_dB,
+                                          LVEQNB_Gain_Neg8_dB,
+                                          LVEQNB_Gain_Neg7_dB,
+                                          LVEQNB_Gain_Neg6_dB,
+                                          LVEQNB_Gain_Neg5_dB,
+                                          LVEQNB_Gain_Neg4_dB,
+                                          LVEQNB_Gain_Neg3_dB,
+                                          LVEQNB_Gain_Neg2_dB,
+                                          LVEQNB_Gain_Neg1_dB,
+                                          LVEQNB_Gain_0_dB,            /* 0dB gain */
+                                          LVEQNB_Gain_1_dB,
+                                          LVEQNB_Gain_2_dB,
+                                          LVEQNB_Gain_3_dB,
+                                          LVEQNB_Gain_4_dB,
+                                          LVEQNB_Gain_5_dB,
+                                          LVEQNB_Gain_6_dB,
+                                          LVEQNB_Gain_7_dB,
+                                          LVEQNB_Gain_8_dB,
+                                          LVEQNB_Gain_9_dB,
+                                          LVEQNB_Gain_10_dB,
+                                          LVEQNB_Gain_11_dB,
+                                          LVEQNB_Gain_12_dB,
+                                          LVEQNB_Gain_13_dB,
+                                          LVEQNB_Gain_14_dB,
+                                          LVEQNB_Gain_15_dB};          /* +15dB gain */
+#else
 const LVM_INT16     LVEQNB_GainTable[] = {LVEQNB_Gain_Neg15_dB,        /* -15dB gain */
                                           LVEQNB_Gain_Neg14_dB,
                                           LVEQNB_Gain_Neg13_dB,
@@ -101,10 +170,28 @@ const LVM_INT16     LVEQNB_GainTable[] = {LVEQNB_Gain_Neg15_dB,        /* -15dB 
                                           LVEQNB_Gain_14_dB,
                                           LVEQNB_Gain_15_dB};          /* +15dB gain */
 
-
+#endif
 /*
  * D table for 100 / (Gain + 1)
  */
+#ifdef BUILD_FLOAT
+const LVM_FLOAT    LVEQNB_DTable[] = {LVEQNB_100D_Neg15_dB,            /* -15dB gain */
+                                      LVEQNB_100D_Neg14_dB,
+                                      LVEQNB_100D_Neg13_dB,
+                                      LVEQNB_100D_Neg12_dB,
+                                      LVEQNB_100D_Neg11_dB,
+                                      LVEQNB_100D_Neg10_dB,
+                                      LVEQNB_100D_Neg9_dB,
+                                      LVEQNB_100D_Neg8_dB,
+                                      LVEQNB_100D_Neg7_dB,
+                                      LVEQNB_100D_Neg6_dB,
+                                      LVEQNB_100D_Neg5_dB,
+                                      LVEQNB_100D_Neg4_dB,
+                                      LVEQNB_100D_Neg3_dB,
+                                      LVEQNB_100D_Neg2_dB,
+                                      LVEQNB_100D_Neg1_dB,
+                                      LVEQNB_100D_0_dB};               /* 0dB gain */
+#else
 const LVM_INT16    LVEQNB_DTable[] = {LVEQNB_100D_Neg15_dB,            /* -15dB gain */
                                       LVEQNB_100D_Neg14_dB,
                                       LVEQNB_100D_Neg13_dB,
@@ -122,7 +209,7 @@ const LVM_INT16    LVEQNB_DTable[] = {LVEQNB_100D_Neg15_dB,            /* -15dB 
                                       LVEQNB_100D_Neg1_dB,
                                       LVEQNB_100D_0_dB};               /* 0dB gain */
 
-
+#endif
 /************************************************************************************/
 /*                                                                                  */
 /*    Filter polynomial coefficients                                                */
@@ -166,30 +253,4 @@ const LVM_INT16     LVEQNB_DPCosCoef[] = {1,                           /* Shifts
                                           16586,                       /* a2 */
                                           -44};                        /* a3 */
 
-/************************************************************************************/
-/*                                                                                  */
-/*  Bypass mixer time constants (100ms)                                             */
-/*                                                                                  */
-/************************************************************************************/
 
-#define LVEQNB_MIX_TC_Fs8000    32580         /* Floating point value 0.994262695 */
-#define LVEQNB_MIX_TC_Fs11025   32632         /* Floating point value 0.995849609 */
-#define LVEQNB_MIX_TC_Fs12000   32643         /* Floating point value 0.996185303 */
-#define LVEQNB_MIX_TC_Fs16000   32674         /* Floating point value 0.997131348 */
-#define LVEQNB_MIX_TC_Fs22050   32700         /* Floating point value 0.997924805 */
-#define LVEQNB_MIX_TC_Fs24000   32705         /* Floating point value 0.998077393 */
-#define LVEQNB_MIX_TC_Fs32000   32721         /* Floating point value 0.998565674 */
-#define LVEQNB_MIX_TC_Fs44100   32734         /* Floating point value 0.998962402 */
-#define LVEQNB_MIX_TC_Fs48000   32737         /* Floating point value 0.999053955 */
-
-
-const LVM_INT16 LVEQNB_MixerTCTable[] = {
-    LVEQNB_MIX_TC_Fs8000,
-    LVEQNB_MIX_TC_Fs11025,
-    LVEQNB_MIX_TC_Fs12000,
-    LVEQNB_MIX_TC_Fs16000,
-    LVEQNB_MIX_TC_Fs22050,
-    LVEQNB_MIX_TC_Fs24000,
-    LVEQNB_MIX_TC_Fs32000,
-    LVEQNB_MIX_TC_Fs44100,
-    LVEQNB_MIX_TC_Fs48000};

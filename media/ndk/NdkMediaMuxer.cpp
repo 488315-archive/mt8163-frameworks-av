@@ -18,32 +18,23 @@
 #define LOG_TAG "NdkMediaMuxer"
 
 
-#include "NdkMediaMuxer.h"
-#include "NdkMediaCodec.h"
-#include "NdkMediaFormatPriv.h"
+#include <media/NdkMediaMuxer.h>
+#include <media/NdkMediaCodec.h>
+#include <media/NdkMediaErrorPriv.h>
+#include <media/NdkMediaFormatPriv.h>
 
 
 #include <utils/Log.h>
 #include <utils/StrongPointer.h>
 #include <media/stagefright/foundation/ABuffer.h>
 #include <media/stagefright/foundation/AMessage.h>
-#include <media/stagefright/MetaData.h>
 #include <media/stagefright/MediaMuxer.h>
 #include <media/IMediaHTTPService.h>
-#include <android_runtime/AndroidRuntime.h>
 #include <android_util_Binder.h>
 
 #include <jni.h>
 
 using namespace android;
-
-static media_status_t translate_error(status_t err) {
-    if (err == OK) {
-        return AMEDIA_OK;
-    }
-    ALOGE("sf error code: %d", err);
-    return AMEDIA_ERROR_UNKNOWN;
-}
 
 struct AMediaMuxer {
     sp<MediaMuxer> mImpl;
@@ -81,7 +72,8 @@ EXPORT
 ssize_t AMediaMuxer_addTrack(AMediaMuxer *muxer, const AMediaFormat *format) {
     sp<AMessage> msg;
     AMediaFormat_getFormat(format, &msg);
-    return translate_error(muxer->mImpl->addTrack(msg));
+    ssize_t ret = muxer->mImpl->addTrack(msg);
+    return (ret >= 0) ? ret : translate_error(ret);
 }
 
 EXPORT

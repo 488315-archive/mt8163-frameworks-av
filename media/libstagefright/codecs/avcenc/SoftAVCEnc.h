@@ -21,7 +21,7 @@
 #include <media/stagefright/foundation/ABase.h>
 #include <utils/Vector.h>
 
-#include "SoftVideoEncoderOMXComponent.h"
+#include <media/stagefright/omx/SoftVideoEncoderOMXComponent.h>
 
 namespace android {
 
@@ -36,7 +36,7 @@ namespace android {
 #define DEFAULT_MAX_REORDER_FRM     0
 #define DEFAULT_QP_MIN              10
 #define DEFAULT_QP_MAX              40
-#define DEFAULT_MAX_BITRATE         20000000
+#define DEFAULT_MAX_BITRATE         240000000
 #define DEFAULT_MAX_SRCH_RANGE_X    256
 #define DEFAULT_MAX_SRCH_RANGE_Y    256
 #define DEFAULT_MAX_FRAMERATE       120000
@@ -95,8 +95,7 @@ namespace android {
 #define DEFAULT_SOC                 SOC_GENERIC
 #define DEFAULT_INTRA4x4            0
 #define STRLENGTH                   500
-
-
+#define DEFAULT_CONSTRAINED_INTRA   0
 
 #define MIN(a, b) ((a) < (b))? (a) : (b)
 #define MAX(a, b) ((a) > (b))? (a) : (b)
@@ -112,8 +111,8 @@ namespace android {
 
 /** Compute difference between start and end */
 #define TIME_DIFF(start, end, diff) \
-    diff = ((end.tv_sec - start.tv_sec) * 1000000) + \
-            (end.tv_usec - start.tv_usec);
+    diff = (((end).tv_sec - (start).tv_sec) * 1000000) + \
+            ((end).tv_usec - (start).tv_usec);
 
 #define ive_aligned_malloc(alignment, size) memalign(alignment, size)
 #define ive_aligned_free(buf) free(buf)
@@ -137,9 +136,17 @@ struct SoftAVC : public SoftVideoEncoderOMXComponent {
 protected:
     virtual ~SoftAVC();
 
+    virtual void onReset();
+
 private:
     enum {
         kNumBuffers = 2,
+    };
+
+    enum {
+        kUpdateBitrate            = 1 << 0,
+        kRequestKeyFrame          = 1 << 1,
+        kUpdateAIRMode            = 1 << 2,
     };
 
     // OMX input buffer's timestamp and flags
@@ -153,11 +160,7 @@ private:
     struct timeval mTimeStart;   // Time at the start of decode()
     struct timeval mTimeEnd;     // Time at the end of decode()
 
-
-    // If a request for a change it bitrate has been received.
-    bool mBitrateUpdated;
-
-    bool mKeyFrameRequested;
+    int mUpdateFlag;
 
 #ifdef FILE_DUMP_ENABLE
     char mInFile[200];
@@ -180,6 +183,7 @@ private:
     bool     mReconEnable;
     bool     mPSNREnable;
     bool     mEntropyMode;
+    bool     mConstrainedIntraFlag;
     IVE_SPEED_CONFIG     mEncSpeed;
 
     uint8_t *mConversionBuffers[MAX_CONVERSION_BUFFERS];
@@ -215,7 +219,10 @@ private:
     OMX_ERRORTYPE internalSetBitrateParams(
         const OMX_VIDEO_PARAM_BITRATETYPE *bitrate);
 
-    OMX_ERRORTYPE setConfig(
+    OMX_ERRORTYPE internalSetConfig(
+        OMX_INDEXTYPE index, const OMX_PTR _params, bool *frameConfig);
+
+    OMX_ERRORTYPE getConfig(
         OMX_INDEXTYPE index, const OMX_PTR _params);
 
     // Handles port definition changes.

@@ -1,10 +1,4 @@
 /*
-* Copyright (C) 2014 MediaTek Inc.
-* Modification based on code covered by the mentioned copyright
-* and/or permission notice(s).
-*/
-
-/*
  * Copyright (C) 2010 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -31,7 +25,7 @@
 #include <media/stagefright/foundation/ADebug.h>
 #include <media/stagefright/foundation/AMessage.h>
 #include <media/stagefright/foundation/hexdump.h>
-#include <media/stagefright/Utils.h>
+#include <media/stagefright/foundation/ByteUtils.h>
 
 namespace android {
 
@@ -40,9 +34,6 @@ AH263Assembler::AH263Assembler(const sp<AMessage> &notify)
       mAccessUnitRTPTime(0),
       mNextExpectedSeqNoValid(false),
       mNextExpectedSeqNo(0),
-#ifdef MTK_AOSP_ENHANCEMENT
-      mPReceived(false),
-#endif // #ifdef MTK_AOSP_ENHANCEMENT
       mAccessUnitDamaged(false) {
 }
 
@@ -91,11 +82,7 @@ ARTPAssembler::AssemblyStatus AH263Assembler::addPacket(
         LOG(VERBOSE) << "Not the sequence number I expected";
 #endif
 
-#ifdef MTK_AOSP_ENHANCEMENT
-        return getAssembleStatus(queue, mNextExpectedSeqNo);
-#else
         return WRONG_SEQUENCE_NUMBER;
-#endif // #ifdef MTK_AOSP_ENHANCEMENT
     }
 
     uint32_t rtpTime;
@@ -116,24 +103,9 @@ ARTPAssembler::AssemblyStatus AH263Assembler::addPacket(
     }
 
     unsigned payloadHeader = U16_AT(buffer->data());
-#ifdef MTK_AOSP_ENHANCEMENT
-    // parse PLEN, VCR, PEBIT
-    // return MALFORMED_PACKET instead of failure on RR!=0 or PEBIT!=0
-    if ((payloadHeader >> 11) || (payloadHeader & 7)) {
-        queue->erase(queue->begin());
-        ++mNextExpectedSeqNo;
-        if ((payloadHeader & 7))
-            ALOGW("AH263Assembler does not support PEBIT yet");
-        return MALFORMED_PACKET;
-    }
-#else
-    CHECK_EQ(payloadHeader >> 11, 0u);  // RR=0
-#endif
     unsigned P = (payloadHeader >> 10) & 1;
     unsigned V = (payloadHeader >> 9) & 1;
     unsigned PLEN = (payloadHeader >> 3) & 0x3f;
-
-#ifndef MTK_AOSP_ENHANCEMENT
     unsigned PEBIT = payloadHeader & 7;
 
     // V=0
@@ -159,7 +131,6 @@ ARTPAssembler::AssemblyStatus AH263Assembler::addPacket(
         ALOGW("Packet discarded (PEBIT != 0)");
         return MALFORMED_PACKET;
     }
-#endif
 
     size_t skip = V + PLEN + (P ? 0 : 2);
 
@@ -168,14 +139,6 @@ ARTPAssembler::AssemblyStatus AH263Assembler::addPacket(
     if (P) {
         buffer->data()[0] = 0x00;
         buffer->data()[1] = 0x00;
-#ifdef MTK_AOSP_ENHANCEMENT
-        mPReceived = true;
-    } else if (!mPReceived) {
-        queue->erase(queue->begin());
-        ++mNextExpectedSeqNo;
-        ALOGW("ignore packet before P");
-        return OK;
-#endif // #ifdef MTK_AOSP_ENHANCEMENT
     }
 
     mPackets.push_back(buffer);
